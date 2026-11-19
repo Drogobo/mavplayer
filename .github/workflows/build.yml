@@ -16,6 +16,7 @@ jobs:
   check:
     name: Check (Linux, system FFmpeg)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     container: archlinux:latest   # ships FFmpeg 9
     steps:
       - name: Install dependencies
@@ -23,6 +24,7 @@ jobs:
           pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf ffmpeg \
             alsa-lib libxkbcommon libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig
       - uses: actions/checkout@v7
+        timeout-minutes: 15   # a stuck fetch otherwise waits for the job limit
         with: { submodules: true }
       - run: cargo fmt --check
       - run: cargo clippy --locked -- -D warnings
@@ -31,8 +33,10 @@ jobs:
   linux:
     name: Linux (AppImage, deb, rpm)
     runs-on: ubuntu-22.04   # oldest glibc we support
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 15   # a stuck fetch otherwise waits for the job limit
         with: { submodules: true }
       - name: Install build dependencies
         run: |
@@ -71,6 +75,7 @@ jobs:
   arch:
     name: Arch Linux (pkg.tar.zst)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     container: archlinux:latest
     steps:
       - name: Install dependencies
@@ -80,6 +85,7 @@ jobs:
           useradd -m builder
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
       - uses: actions/checkout@v7
+        timeout-minutes: 15   # a stuck fetch otherwise waits for the job limit
         with: { submodules: true }
       - name: makepkg
         run: |
@@ -94,11 +100,13 @@ jobs:
   flatpak:
     name: Flatpak
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
       options: --privileged
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 15   # a stuck fetch otherwise waits for the job limit
         with: { submodules: true }
       - name: Generate cargo sources
         run: |
@@ -114,8 +122,10 @@ jobs:
   windows:
     name: Windows (zip, installer)
     runs-on: windows-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 15   # a stuck fetch otherwise waits for the job limit
         with: { submodules: true }
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -142,8 +152,10 @@ jobs:
           - { arch: arm64, runner: macos-26 }
           - { arch: x86_64, runner: macos-26-intel }
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
+        timeout-minutes: 15   # a stuck fetch otherwise waits for the job limit
         with: { submodules: true }
       - name: Install build tools
         run: brew install nasm meson ninja pkg-config autoconf automake libtool
@@ -172,6 +184,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [check, linux, arch, flatpak, windows, macos]
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: write
     steps:
