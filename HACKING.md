@@ -177,9 +177,9 @@ use the Windows GUI subsystem, so no console window opens.
 ### macOS (.dmg)
 
 ```bash
-brew install nasm meson ninja pkg-config autoconf automake libtool openssl@3
+brew install nasm meson ninja pkg-config autoconf automake libtool
 scripts/build-ffmpeg.sh
-export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig
+export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig
 scripts/package-macos.sh        # → dist/MavPlayer-<ver>-macos-<arch>.dmg
 ```
 

@@ -9,8 +9,8 @@
 #   cargo build --release --features static-ffmpeg
 #
 # Works on Linux and macOS. Needs: a C compiler, make, nasm, meson, ninja,
-# pkg-config, curl, autoconf/automake/libtool, and the OpenSSL / zlib / libva
-# development headers (see HACKING.md).
+# pkg-config, curl, autoconf/automake/libtool, and on Linux the OpenSSL / zlib
+# / libva development headers (see HACKING.md).
 set -euo pipefail
 
 FFMPEG_VERSION=9.0.2
@@ -31,11 +31,8 @@ JOBS=$( (nproc || sysctl -n hw.ncpu) 2>/dev/null || echo 4)
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig:$PREFIX/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 export CFLAGS="-O2 -fPIC ${CFLAGS:-}"
 if [ "$OS" = Darwin ]; then
+    # Everything here is built for this macOS version, so the app runs there too.
     export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-11.0}
-    # Homebrew's keg-only OpenSSL; it ships static archives, so it gets linked in.
-    for p in /opt/homebrew/opt/openssl@3 /usr/local/opt/openssl@3; do
-        [ -d "$p" ] && export PKG_CONFIG_PATH="$PKG_CONFIG_PATH:$p/lib/pkgconfig" && break
-    done
 fi
 
 fetch() { # url dir
@@ -73,13 +70,13 @@ CXX_RUNTIME=-lstdc++
     ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" --enable-static --disable-shared --with-pic \
         STL_LIBS="$CXX_RUNTIME" &&
     make -j"$JOBS" && make install)
+# zimg also calls libm, which its .pc file omits; with `--as-needed` static
+# links then fail ("DSO missing from command line"). Set both explicitly.
 ZIMG_PC=$PREFIX/lib/pkgconfig/zimg.pc
-if ! grep -q -- "^Libs.private:.*$CXX_RUNTIME" "$ZIMG_PC"; then
-    if grep -q '^Libs.private:' "$ZIMG_PC"; then
-        sed -i.bak "s|^Libs.private:.*|Libs.private: $CXX_RUNTIME -lm|" "$ZIMG_PC"
-    else
-        echo "Libs.private: $CXX_RUNTIME -lm" >> "$ZIMG_PC"
-    fi
+if grep -q '^Libs.private:' "$ZIMG_PC"; then
+    sed -i.bak "s|^Libs.private:.*|Libs.private: $CXX_RUNTIME -lm|" "$ZIMG_PC"
+else
+    echo "Libs.private: $CXX_RUNTIME -lm" >> "$ZIMG_PC"
 fi
 
 # ── libdvdread / libdvdnav: DVD-Video navigation (libdvdcss is loaded at
@@ -96,10 +93,12 @@ if [ "$OS" = Linux ]; then
     make -C "$SRC/nv-codec-headers-${NVHEADERS_VERSION#n}" PREFIX="$PREFIX" install
     # NVDEC through the dynamically loaded CUDA driver; VA-API through DRM
     # (VDPAU is left out: it needs Xlib, and VA-API covers the same GPUs).
-    HW_FLAGS=(--enable-ffnvcodec --enable-cuda --enable-nvdec)
+    HW_FLAGS=(--enable-ffnvcodec --enable-cuda --enable-nvdec --enable-openssl)
     pkg-config --exists libva libva-drm && HW_FLAGS+=(--enable-vaapi)
 elif [ "$OS" = Darwin ]; then
-    HW_FLAGS=(--enable-videotoolbox)
+    # TLS through the system's Security framework: no OpenSSL to build or
+    # bundle (Homebrew's is built for the runner's macOS, not our minimum).
+    HW_FLAGS=(--enable-videotoolbox --enable-securetransport)
 fi
 
 # ── FFmpeg: decoders, demuxers and filters only ─────────────────────────────
@@ -116,7 +115,7 @@ cd "$SRC/ffmpeg-$FFMPEG_VERSION"
     --disable-programs --disable-doc --disable-debug \
     --disable-avdevice --disable-encoders --disable-muxers --disable-outdevs --disable-indevs \
     --enable-encoder=png --enable-muxer=image2 \
-    --enable-zlib --enable-iconv --enable-openssl \
+    --enable-zlib --enable-iconv \
     --enable-libdav1d --enable-libzimg --enable-libdvdread --enable-libdvdnav \
     "${HW_FLAGS[@]}" ||
     { echo "---- ffbuild/config.log (last 80 lines) ----"; tail -80 ffbuild/config.log; exit 1; }

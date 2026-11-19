@@ -140,6 +140,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=packaging/windows/mavplayer.ico");
 
+    link_clang_runtime_on_macos();
+
     #[cfg(windows)]
     {
         let mut res = winresource::WindowsResource::new();
@@ -150,5 +152,29 @@ fn main() {
         if let Err(e) = res.compile() {
             println!("cargo:warning=could not embed Windows resources: {e}");
         }
+    }
+}
+
+/// FFmpeg's VideoToolbox code uses `@available(...)`, which compiles to calls
+/// into clang's runtime (`__isPlatformVersionAtLeast`). C programs get that
+/// library automatically, but rustc links with `-nodefaultlibs`, so a static
+/// FFmpeg needs it added by hand.
+fn link_clang_runtime_on_macos() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") || env::var_os("CARGO_FEATURE_STATIC_FFMPEG").is_none()
+    {
+        return;
+    }
+    let resource_dir = std::process::Command::new("xcrun")
+        .args(["clang", "-print-resource-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    match resource_dir.map(|d| d.join("lib/darwin")).filter(|d| d.join("libclang_rt.osx.a").exists()) {
+        Some(dir) => {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=static=clang_rt.osx");
+        }
+        None => println!("cargo:warning=libclang_rt.osx.a not found; linking a static FFmpeg may fail"),
     }
 }
