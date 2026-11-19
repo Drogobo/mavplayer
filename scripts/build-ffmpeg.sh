@@ -15,7 +15,7 @@ set -euo pipefail
 
 FFMPEG_VERSION=9.0.2
 DAV1D_VERSION=1.5.1
-ZIMG_VERSION=3.0.5
+ZIMG_VERSION=3.0.6
 DVDREAD_VERSION=7.1.1
 DVDNAV_VERSION=7.0.0
 NVHEADERS_VERSION=n13.0.19.0
@@ -63,9 +63,24 @@ meson_build "dav1d-$DAV1D_VERSION" -Denable_tools=false -Denable_tests=false
 
 # ── zimg: high quality scaling/colour conversion used for HDR tone mapping ───
 fetch "https://github.com/sekrit-twc/zimg/archive/refs/tags/release-$ZIMG_VERSION.tar.gz" "zimg-release-$ZIMG_VERSION"
+# Homebrew's libtool only installs g-prefixed tools.
+[ "$OS" = Darwin ] && export LIBTOOLIZE=glibtoolize
+# zimg is C++: its pkg-config file must name the C++ runtime (STL_LIBS) or
+# static links against it fail (FFmpeg's configure reports "zimg not found").
+CXX_RUNTIME=-lstdc++
+[ "$OS" = Darwin ] && CXX_RUNTIME=-lc++
 (cd "$SRC/zimg-release-$ZIMG_VERSION" && { [ -f configure ] || ./autogen.sh; } &&
-    ./configure --prefix="$PREFIX" --enable-static --disable-shared --with-pic &&
+    ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" --enable-static --disable-shared --with-pic \
+        STL_LIBS="$CXX_RUNTIME" &&
     make -j"$JOBS" && make install)
+ZIMG_PC=$PREFIX/lib/pkgconfig/zimg.pc
+if ! grep -q -- "^Libs.private:.*$CXX_RUNTIME" "$ZIMG_PC"; then
+    if grep -q '^Libs.private:' "$ZIMG_PC"; then
+        sed -i.bak "s|^Libs.private:.*|Libs.private: $CXX_RUNTIME -lm|" "$ZIMG_PC"
+    else
+        echo "Libs.private: $CXX_RUNTIME -lm" >> "$ZIMG_PC"
+    fi
+fi
 
 # ── libdvdread / libdvdnav: DVD-Video navigation (libdvdcss is loaded at
 #    runtime if the user has it installed, for encrypted discs) ─────────────
@@ -79,11 +94,12 @@ HW_FLAGS=()
 if [ "$OS" = Linux ]; then
     fetch "https://github.com/FFmpeg/nv-codec-headers/releases/download/$NVHEADERS_VERSION/nv-codec-headers-${NVHEADERS_VERSION#n}.tar.gz" "nv-codec-headers-${NVHEADERS_VERSION#n}"
     make -C "$SRC/nv-codec-headers-${NVHEADERS_VERSION#n}" PREFIX="$PREFIX" install
-    HW_FLAGS=(--enable-ffnvcodec --enable-nvdec --enable-cuvid)
-    pkg-config --exists libva && HW_FLAGS+=(--enable-vaapi)
-    pkg-config --exists vdpau && HW_FLAGS+=(--enable-vdpau)
+    # NVDEC through the dynamically loaded CUDA driver; VA-API through DRM
+    # (VDPAU is left out: it needs Xlib, and VA-API covers the same GPUs).
+    HW_FLAGS=(--enable-ffnvcodec --enable-cuda --enable-nvdec)
+    pkg-config --exists libva libva-drm && HW_FLAGS+=(--enable-vaapi)
 elif [ "$OS" = Darwin ]; then
-    HW_FLAGS=(--enable-videotoolbox --enable-audiotoolbox)
+    HW_FLAGS=(--enable-videotoolbox)
 fi
 
 # ── FFmpeg: decoders, demuxers and filters only ─────────────────────────────
@@ -102,7 +118,8 @@ cd "$SRC/ffmpeg-$FFMPEG_VERSION"
     --enable-encoder=png --enable-muxer=image2 \
     --enable-zlib --enable-iconv --enable-openssl \
     --enable-libdav1d --enable-libzimg --enable-libdvdread --enable-libdvdnav \
-    "${HW_FLAGS[@]}"
+    "${HW_FLAGS[@]}" ||
+    { echo "---- ffbuild/config.log (last 80 lines) ----"; tail -80 ffbuild/config.log; exit 1; }
 make -j"$JOBS"
 make install
 echo

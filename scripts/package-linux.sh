@@ -55,7 +55,7 @@ if want appimage; then
     rm -rf "$APPDIR"
     install -Dm755 "$BIN" "$APPDIR/usr/bin/mavplayer"
     install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml \
-        "$APPDIR/usr/share/metainfo/io.github.drogobo.MavPlayer.appdata.xml"
+        "$APPDIR/usr/share/metainfo/io.github.drogobo.MavPlayer.metainfo.xml"
     for s in 16 32 48 64 128 256 512; do
         install -Dm644 "packaging/icons/mavplayer-$s.png" \
             "$APPDIR/usr/share/icons/hicolor/${s}x${s}/apps/io.github.drogobo.MavPlayer.png"

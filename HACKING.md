@@ -80,7 +80,7 @@ it together with dav1d (AV1), zimg (HDR tone mapping), libdvdread/libdvdnav
 ```bash
 # Debian/Ubuntu build dependencies:
 sudo apt install nasm meson ninja-build autoconf automake libtool curl \
-    libssl-dev zlib1g-dev libva-dev libvdpau-dev
+    libssl-dev zlib1g-dev libva-dev
 scripts/build-ffmpeg.sh                       # → ffmpeg-build/prefix
 export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig
 cargo build --release --features static-ffmpeg
