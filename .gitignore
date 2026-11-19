@@ -1,0 +1,6 @@
+/target
+/ffmpeg-build
+/dist
+/.flatpak-builder
+/packaging/flatpak/cargo-sources.json
+*.AppImage

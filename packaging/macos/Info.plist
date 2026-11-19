@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleExecutable</key><string>mavplayer</string>
+  <key>CFBundleIdentifier</key><string>io.github.drogobo.MavPlayer</string>
+  <key>CFBundleName</key><string>MavPlayer</string>
+  <key>CFBundleDisplayName</key><string>MavPlayer</string>
+  <key>CFBundleIconFile</key><string>MavPlayer</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+  <key>CFBundleVersion</key><string>@VERSION@</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>LSMinimumSystemVersion</key><string>11.0</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.entertainment</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSHumanReadableCopyright</key><string>MavPlayer contributors. GNU GPL v3 or later.</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Video</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.movie</string>
+        <string>public.video</string>
+        <string>public.mpeg-4</string>
+        <string>com.apple.quicktime-movie</string>
+        <string>public.avi</string>
+        <string>public.mpeg</string>
+        <string>public.mpeg-2-transport-stream</string>
+        <string>org.matroska.mkv</string>
+        <string>org.webmproject.webm</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Audio</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.audio</string>
+        <string>public.mp3</string>
+        <string>public.mpeg-4-audio</string>
+        <string>org.xiph.flac</string>
+        <string>com.microsoft.waveform-audio</string>
+        <string>public.aiff-audio</string>
+      </array>
+    </dict>
+    <dict>
+      <key>CFBundleTypeName</key><string>Media file</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>mkv</string><string>mka</string><string>webm</string><string>ogg</string><string>ogv</string>
+        <string>opus</string><string>flac</string><string>vob</string><string>ts</string><string>m2ts</string>
+        <string>flv</string><string>wmv</string><string>wma</string><string>m3u</string><string>m3u8</string>
+        <string>pls</string><string>iso</string>
+      </array>
+    </dict>
+  </array>
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>DVD</string>
+      <key>CFBundleURLSchemes</key><array><string>dvd</string></array>
+    </dict>
+  </array>
+</dict>
+</plist>

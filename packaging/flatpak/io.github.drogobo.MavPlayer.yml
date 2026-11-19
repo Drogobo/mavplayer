@@ -1,0 +1,108 @@
+# Flatpak manifest.
+#
+#   python3 flatpak-cargo-generator.py ../../Cargo.lock -o cargo-sources.json
+#   flatpak-builder --user --install --force-clean build io.github.drogobo.MavPlayer.yml
+#
+# flatpak-cargo-generator.py comes from https://github.com/flatpak/flatpak-builder-tools
+# (see HACKING.md). The papirus-icon-theme submodule must be checked out.
+app-id: io.github.drogobo.MavPlayer
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm20
+command: mavplayer
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=all            # GPU decoding and optical drives
+  - --socket=pulseaudio
+  - --share=network         # network streams
+  - --filesystem=host:ro    # open files, sidecar subtitles, DVD folders
+  - --filesystem=xdg-pictures/MavPlayer:create   # screenshots
+  - --filesystem=xdg-music:ro
+  - --filesystem=xdg-videos:ro
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+  prepend-ld-library-path: /usr/lib/sdk/llvm20/lib
+  env:
+    CARGO_HOME: /run/build/mavplayer/cargo
+    LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/doc
+  - '*.a'
+  - '*.la'
+
+modules:
+  - name: libdvdread
+    buildsystem: meson
+    config-opts: [-Dbuildtype=release]
+    sources:
+      - type: git
+        url: https://code.videolan.org/videolan/libdvdread.git
+        tag: 7.1.1
+  - name: libdvdnav
+    buildsystem: meson
+    config-opts: [-Dbuildtype=release]
+    sources:
+      - type: git
+        url: https://code.videolan.org/videolan/libdvdnav.git
+        tag: 7.0.0
+  - name: zimg
+    config-opts: [--disable-static]
+    # flatpak-builder runs zimg's ./autogen.sh itself (no configure in git)
+    sources:
+      - type: git
+        url: https://github.com/sekrit-twc/zimg.git
+        tag: release-3.0.5
+
+  - name: ffmpeg
+    config-opts:
+      - --enable-shared
+      - --disable-static
+      - --enable-gpl
+      - --enable-version3
+      - --disable-programs
+      - --disable-doc
+      - --disable-debug
+      - --disable-avdevice
+      - --disable-encoders
+      - --disable-muxers
+      - --enable-encoder=png
+      - --enable-muxer=image2
+      - --enable-openssl
+      - --enable-libdav1d
+      - --enable-libzimg
+      - --enable-libdvdread
+      - --enable-libdvdnav
+      - --enable-vaapi
+      - --enable-vdpau
+    cleanup: [/share/ffmpeg]
+    sources:
+      - type: git
+        url: https://git.ffmpeg.org/ffmpeg.git
+        tag: n9.0.2
+  - name: mavplayer
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_NET_OFFLINE: 'true'
+        PKG_CONFIG_PATH: /app/lib/pkgconfig
+    build-commands:
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/mavplayer /app/bin/mavplayer
+      - install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.desktop /app/share/applications/io.github.drogobo.MavPlayer.desktop
+      - install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml /app/share/metainfo/io.github.drogobo.MavPlayer.metainfo.xml
+      - install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.svg /app/share/icons/hicolor/scalable/apps/io.github.drogobo.MavPlayer.svg
+      - for s in 16 32 48 64 128 256 512; do install -Dm644 packaging/icons/mavplayer-$s.png /app/share/icons/hicolor/${s}x${s}/apps/io.github.drogobo.MavPlayer.png; done
+    sources:
+      - type: dir
+        path: ../..
+        skip: [target, ffmpeg-build, dist, .flatpak-builder, packaging/flatpak/build]
+      - cargo-sources.json

@@ -1,0 +1,4 @@
+[submodule "third_party/papirus-icon-theme"]
+	path = third_party/papirus-icon-theme
+	url = https://github.com/PapirusDevelopmentTeam/papirus-icon-theme.git
+	shallow = true

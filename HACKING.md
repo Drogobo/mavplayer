@@ -1,0 +1,343 @@
+# Hacking on MavPlayer
+
+This document explains how to build MavPlayer, how to produce each release
+package, and how the code is organised so you can change it.
+
+- [Getting the source](#getting-the-source)
+- [Development build](#development-build)
+- [Release packages](#release-packages)
+- [How the code is organised](#how-the-code-is-organised)
+- [Common changes](#common-changes)
+- [Debugging and testing](#debugging-and-testing)
+
+## Getting the source
+
+```bash
+git clone --recurse-submodules https://github.com/Drogobo/mavplayer.git
+```
+
+The [Papirus icon theme](https://github.com/PapirusDevelopmentTeam/papirus-icon-theme)
+is a git submodule (`third_party/papirus-icon-theme`, shallow). `build.rs` compiles
+the ~55 icons the UI uses into the binary, so neither the repository nor the user
+needs Papirus installed. If you cloned without `--recurse-submodules`:
+
+```bash
+git submodule update --init --depth 1
+```
+
+You can also point the build at any Papirus checkout with
+`MAVPLAYER_PAPIRUS_DIR=/path/to/papirus-icon-theme`.
+
+## Development build
+
+You need:
+
+- **Rust** 1.88 or newer (`rustup`, stable toolchain).
+- **FFmpeg 9** libraries and headers: libavcodec, libavformat, libavfilter,
+  libswscale, libswresample, libavutil. The bindings are generated with bindgen,
+  so **clang/libclang** is needed too.
+- The libraries GPUI needs on Linux.
+
+| System | Install |
+| --- | --- |
+| Arch / CachyOS / Manjaro | `sudo pacman -S rust clang pkgconf ffmpeg alsa-lib libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig` |
+| Fedora (RPM Fusion for FFmpeg 9) | `sudo dnf install rust cargo clang pkgconf ffmpeg-devel alsa-lib-devel libxkbcommon-x11-devel libxcb-devel wayland-devel vulkan-loader-devel fontconfig-devel` |
+| Debian / Ubuntu | `sudo apt install build-essential clang pkg-config libasound2-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev libfontconfig1-dev`, then build FFmpeg 9 with `scripts/build-ffmpeg.sh` (distribution FFmpeg is usually older) |
+| macOS | `xcode-select --install`, `brew install ffmpeg pkg-config` |
+| Windows | Rust (MSVC), [LLVM](https://github.com/llvm/llvm-project/releases) (set `LIBCLANG_PATH`), and an FFmpeg 9 "shared" build such as BtbN's `ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip` with `FFMPEG_DIR` pointing at it; put its `bin` folder on `PATH` to run |
+
+Then:
+
+```bash
+cargo run -- path/to/video.mkv           # debug build (opt-level 1, deps at 2)
+cargo run --release -- path/to/video.mkv # what users get
+cargo test
+cargo clippy -- -D warnings              # CI enforces this
+cargo fmt                                # CI checks formatting
+```
+
+If FFmpeg is installed somewhere `pkg-config` can't see, set
+`PKG_CONFIG_PATH=/prefix/lib/pkgconfig` or `FFMPEG_DIR=/prefix`.
+
+## Release packages
+
+All packages are built by [`.github/workflows/build.yml`](.github/workflows/build.yml)
+on every push. Pushing a tag such as `v0.2.0` also publishes a GitHub release with
+everything attached. To release: bump `version` in `Cargo.toml`,
+`packaging/arch/PKGBUILD` and the `<releases>` list in
+`packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml`, commit, then tag.
+
+You can build each package locally.
+
+### Statically linked FFmpeg (AppImage, deb, rpm, macOS)
+
+Distribution FFmpeg versions vary a lot, so the portable packages link a
+decode-only FFmpeg 9 statically. This also makes them smaller and keeps startup
+fast. [`scripts/build-ffmpeg.sh`](scripts/build-ffmpeg.sh) downloads and builds
+it together with dav1d (AV1), zimg (HDR tone mapping), libdvdread/libdvdnav
+(DVD) and the NVIDIA decode headers:
+
+```bash
+# Debian/Ubuntu build dependencies:
+sudo apt install nasm meson ninja-build autoconf automake libtool curl \
+    libssl-dev zlib1g-dev libva-dev libvdpau-dev
+scripts/build-ffmpeg.sh                       # → ffmpeg-build/prefix
+export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig
+cargo build --release --features static-ffmpeg
+```
+
+The `static-ffmpeg` feature turns on `ffmpeg-sys-next/static`, which links
+everything `pkg-config --static` lists. OpenSSL, zlib and libva stay dynamic on
+Linux, because every distribution ships them.
+
+### AppImage, .deb and .rpm
+
+```bash
+cargo install cargo-deb cargo-generate-rpm
+export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig
+scripts/package-linux.sh            # all three, into dist/
+scripts/package-linux.sh appimage   # or just one: deb | rpm | appimage
+```
+
+- **deb** and **rpm** come from `[package.metadata.deb]` and
+  `[package.metadata.generate-rpm]` in `Cargo.toml`. Library dependencies are
+  detected from the binary.
+- The **AppImage** is assembled by
+  [linuxdeploy](https://github.com/linuxdeploy/linuxdeploy), which is downloaded
+  if it isn't installed. linuxdeploy bundles the shared libraries that aren't
+  guaranteed on every system. The entry point is `packaging/appimage/AppRun`.
+  Build on the oldest distribution you want to support (CI uses Ubuntu 22.04),
+  because the AppImage needs a glibc at least as new as the build machine's.
+- `MAVPLAYER_DYNAMIC_FFMPEG=1 scripts/package-linux.sh` links the system FFmpeg
+  instead (for distribution-specific packages).
+
+**AppImage desktop integration** lives in the app itself, in
+[`src/integration.rs`](src/integration.rs). When the app runs from an AppImage
+(the runtime sets `$APPIMAGE`), it offers on first launch to write
+`~/.local/share/applications/io.github.drogobo.MavPlayer.desktop` and icons that
+point at the AppImage file. The same is available from the Media menu,
+Preferences ▸ Interface, and `--integrate` / `--remove-integration`.
+
+**Window icon on Wayland**: compositors find a window's icon through the
+`.desktop` file named after its app ID (`io.github.drogobo.MavPlayer`). Packages
+install one. For unpackaged runs (`cargo run`, a non-integrated AppImage),
+`integration::ensure_window_icon()` writes a hidden (`NoDisplay=true`), icon-only
+entry with no MIME types to `~/.local/share/applications` at startup.
+
+### Arch Linux (.pkg.tar.zst)
+
+[`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD) builds the checkout it lives
+in, against Arch's FFmpeg:
+
+```bash
+cd packaging/arch
+makepkg -s                       # → mavplayer-<ver>-1-x86_64.pkg.tar.zst
+_from_git=1 makepkg -s           # build the tagged release from GitHub instead
+```
+
+### Flatpak
+
+[`packaging/flatpak/io.github.drogobo.MavPlayer.yml`](packaging/flatpak/io.github.drogobo.MavPlayer.yml)
+builds libdvdread, libdvdnav, zimg and FFmpeg 9 as modules on the freedesktop
+25.08 runtime, which already provides dav1d and VA-API. Cargo dependencies must be
+vendored for the offline build:
+
+```bash
+curl -O https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+pip install aiohttp toml tomlkit
+python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
+flatpak install --user flathub org.freedesktop.Sdk//25.08 \
+    org.freedesktop.Sdk.Extension.rust-stable//25.08 org.freedesktop.Sdk.Extension.llvm20//25.08
+cd packaging/flatpak
+flatpak-builder --user --install --force-clean build io.github.drogobo.MavPlayer.yml
+flatpak run io.github.drogobo.MavPlayer
+# single-file bundle:
+flatpak build-bundle ~/.local/share/flatpak/repo MavPlayer.flatpak io.github.drogobo.MavPlayer
+```
+
+Regenerate `cargo-sources.json` whenever `Cargo.lock` changes.
+
+### Windows (.zip and installer)
+
+From PowerShell, with Rust, LLVM and (for the installer)
+[Inno Setup 6](https://jrsoftware.org/isinfo.php) installed:
+
+```powershell
+$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+scripts\package-windows.ps1     # downloads FFmpeg unless -FfmpegDir / $env:FFMPEG_DIR is given
+```
+
+This produces a portable `dist\MavPlayer-<ver>-windows-x64.zip` (the exe plus
+FFmpeg DLLs) and `dist\MavPlayer-<ver>-windows-x64-setup.exe`. The installer
+script is [`packaging/windows/mavplayer.iss`](packaging/windows/mavplayer.iss);
+it adds Start-menu and optional desktop shortcuts and "Open with" entries. The
+exe gets its icon and version info from `build.rs` (winresource). Release builds
+use the Windows GUI subsystem, so no console window opens.
+
+### macOS (.dmg)
+
+```bash
+brew install nasm meson ninja pkg-config autoconf automake libtool openssl@3
+scripts/build-ffmpeg.sh
+export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig
+scripts/package-macos.sh        # → dist/MavPlayer-<ver>-macos-<arch>.dmg
+```
+
+The script builds `MavPlayer.app` from `packaging/macos/Info.plist` and
+`MavPlayer.icns`. It checks that only system libraries are linked dynamically,
+signs the app (ad-hoc, or with `CODESIGN_IDENTITY="Developer ID Application: …"`)
+and wraps it in a DMG. Notarization (`xcrun notarytool`) is needed for
+distribution without Gatekeeper warnings.
+
+### Icons
+
+`assets/app-icon.svg` is the application icon. After editing it, run
+`scripts/gen-icons.sh` (needs `rsvg-convert` and Python Pillow) to regenerate
+`packaging/icons/*.png`, `packaging/windows/mavplayer.ico` and
+`packaging/macos/MavPlayer.icns`. Copy the SVG to
+`packaging/linux/io.github.drogobo.MavPlayer.svg` too.
+
+## How the code is organised
+
+```
+src/
+  main.rs            CLI parsing, logger, GPUI app and window setup
+  settings.rs        Settings (settings.json) and resume positions (resume.json)
+  playlist.rs        Playlist model, file-type lists, M3U/PLS, argument parsing
+  icons.rs           Icon enum; desktop icon-theme lookup; bundled Papirus fallback
+  integration.rs     Linux .desktop integration (AppImage, Wayland window icon)
+  engine/            Playback engine; no UI code
+  ui/                GPUI interface
+build.rs             Embeds Papirus icons; Windows exe resources
+```
+
+### The engine (`src/engine`)
+
+The engine follows the design of FFmpeg's `ffplay`, with threads connected by
+queues. One playback session (`SessionCtx` in `engine/mod.rs`) runs these
+threads:
+
+```
+                ┌──────────── video packets ──► video.rs  decode → libavfilter → FrameQueue
+demux.rs  ──────┼──────────── audio packets ──► audio.rs  decode → libavfilter → AudioBuffer
+ (read, seek)   └──────────── subtitle pkts ──► subs.rs   decode → SubStore
+                                                    │
+present.rs: picks the frame due now (relative to the master clock), converts it
+            to BGRA with swscale at display size, hands it to the UI.
+audio.rs:   cpal output callback pulls samples and drives the master clock.
+```
+
+- **`types.rs`**: public data types (`MediaSource`, `MediaInfo`, `Track`,
+  `PlaybackState`, `EngineConfig`, effect settings, events).
+- **`av.rs`**: thin RAII wrappers over the FFmpeg C API (`Packet`, `Frame`,
+  `CodecCtx`, `FormatCtx`, …) and helpers. All `unsafe` FFI is kept close to
+  these wrappers.
+- **`sync.rs`**: `PacketQueue` and `FrameQueue`, and `Clock`. Every queue item
+  carries a *serial*; a seek increments it, so stale data is recognised and
+  dropped everywhere without locks between stages.
+- **`demux.rs`**: opens inputs (files, URLs with reconnect options, DVDs through
+  FFmpeg's `dvdvideo` demuxer), picks tracks by language preference, and runs the
+  read loop: seeks, track switches, pause, back-pressure, EOF.
+- **`decoder.rs`**: opens codecs, including hardware decoding through a
+  `get_format` callback with software fallback, and runs the send/receive loop.
+- **`video.rs` / `audio.rs` / `filters.rs`**: build libavfilter chains from the
+  current settings. These do deinterlacing, tone mapping, crop, rotation, colour
+  adjustment, the equalizer, normalization, tempo, and format conversion. The
+  decoder threads rebuild the graph when a setting changes.
+- **`present.rs`**: frame timing (`compute_target_delay`), frame dropping,
+  stepping, colour conversion, screenshots.
+- **`subs.rs`**: subtitle decoding (text, ASS, bitmap), external file loading
+  with charset detection, sidecar discovery.
+- **`disc.rs` / `probe.rs`**: DVD folder/ISO/drive detection and title probing,
+  plus quick metadata probes for playlist entries.
+
+The UI talks to the engine only through `engine::Player`: `load`, `seek`,
+`set_paused`, `set_volume`, `select_track`, `set_config`, `take_frame`,
+`state`, `drain_events`, and so on. The engine wakes the UI through a callback
+whenever a new frame or event is ready.
+
+**Audio is the master clock** when there is audio. The device is opened on the
+audio thread, so video never waits for it to show the first frame. Playback
+itself starts once the device is ready, so audio and video begin together. If
+no device is available, it doesn't open within 3 s, or it stops consuming
+samples, `audio.rs` switches to a silent sink that consumes audio in real time.
+Playback then keeps going at the right speed.
+
+### The interface (`src/ui`)
+
+All UI state lives in one GPUI view, `PlayerView`. Its methods are split across
+files:
+
+| File | Contents |
+| --- | --- |
+| `player.rs` | `PlayerView` struct, engine plumbing (wake loop, 200 ms tick), opening media, playlist logic, action handlers (`register_actions`) |
+| `render.rs` | `impl Render`: video canvas, subtitles, OSD, seek bar, control bar, playlist panel, titlebar for client-side decorations |
+| `menus.rs` | Contents of the menu bar menus, context menu and control-bar popups |
+| `menu.rs` | The in-window popup menu widget (`MenuItem`, submenus) |
+| `dialogs.rs` | Preferences, Effects & Filters, Media Info, Open URL/Disc, Jump to Time, About, Shortcuts, Integration |
+| `actions.rs` | GPUI actions, key bindings, the shortcut list, the macOS native menu |
+| `theme.rs` | Light/dark palettes |
+| `widgets.rs` | Small helpers: `icon()`, tooltips, time formatting/parsing |
+| `text_input.rs` | Single-line text field |
+
+Video frames reach GPUI as `RenderImage`s. Old textures are released a few frames
+later with `window.drop_image`, because GPUI frees atlas textures immediately.
+
+## Common changes
+
+**Add a keyboard shortcut / action**
+1. Add the action name to `actions!(…)` in `ui/actions.rs`.
+2. Bind it in `bind_keys` (`"secondary-x"` means Ctrl on Linux/Windows and ⌘ on
+   macOS) and add a row to `SHORTCUTS`.
+3. Handle it in `PlayerView::register_actions` in `ui/player.rs`.
+4. Optionally add it to a menu in `ui/menus.rs` with `act("Label", MyAction)`,
+   which shows the shortcut automatically.
+
+**Add a setting**
+1. Add a field to `Settings` in `settings.rs` and give it a default in
+   `impl Default`. Fields are `#[serde(default)]`, so old settings files keep
+   working.
+2. If the engine needs it, map it in `Settings::engine_config()` and add it to
+   `EngineConfig`.
+3. Add a control in `ui/dialogs.rs` → `settings_dialog` using the `toggle_row`,
+   `choice`, `stepper` or `input_box` helpers. These save and apply the change
+   for you.
+
+**Add a video or audio filter**
+Extend `build_chain` in `engine/video.rs` or `fx_chain` in `engine/audio.rs` with
+the libavfilter string, and add the setting to `VideoAdjust` / `AudioFx` in
+`engine/types.rs`. The decoder threads compare a settings generation counter and
+rebuild the graph automatically. Use `av::filter_available("name")` for filters
+an FFmpeg build might lack.
+
+**Add an icon**
+Add a variant to `Icon` in `icons.rs` with its freedesktop name, and add the
+Papirus `*-symbolic.svg` name to `ICONS` in `build.rs`. On Linux the user's
+icon theme is tried first, and the bundled Papirus icon is the fallback.
+
+**Support another file type**
+Add the extension to `VIDEO_EXTS` / `AUDIO_EXTS` in `playlist.rs`, its MIME type
+to `MIME_TYPES` in `integration.rs` *and* the static `.desktop` file (keep the two
+lists identical), and to the Windows and macOS file associations if relevant.
+
+## Debugging and testing
+
+- `mavplayer -v` (or `MAVPLAYER_DEBUG=1`) prints engine diagnostics and FFmpeg
+  warnings to stderr, including the time to the first video frame.
+- **View ▸ Media Information** (<kbd>I</kbd>) shows the decoder in use, hardware
+  decoding status, pixel format, dropped frames and buffer level.
+- `MAVPLAYER_CONFIG_DIR=/tmp/mp` runs with a throwaway settings folder.
+- `MAVPLAYER_TEST_AUDIO_DELAY_MS=5000` (debug builds only) delays opening the
+  audio device, to test slow or hanging sound servers. Video shows its first
+  frame immediately; playback starts when audio is ready, or without sound
+  after 3 s.
+- `MAVPLAYER_ICON_THEME=Adwaita` overrides the detected Linux icon theme.
+- To try the UI without disturbing your desktop on KDE Plasma, run it in a
+  nested, invisible KWin:
+  ```bash
+  kwin_wayland --virtual --width 1280 --height 800 --socket mavtest &
+  WAYLAND_DISPLAY=mavtest cargo run -- video.mkv
+  WAYLAND_DISPLAY=mavtest spectacle -b -n -f -o shot.png   # screenshot
+  ```
+- Generate test media of any format with the `ffmpeg` CLI, for example
+  `ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine -t 20 -c:v libx264 -c:a aac test.mp4`.

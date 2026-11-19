@@ -1,0 +1,7 @@
+#!/bin/sh
+# AppImage entry point. $APPDIR is set by the AppImage runtime.
+HERE="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+export PATH="$HERE/usr/bin:$PATH"
+# Libraries bundled by linuxdeploy live in usr/lib and are found through the
+# binary's RPATH, so the host's libraries are never overridden for children.
+exec "$HERE/usr/bin/mavplayer" "$@"

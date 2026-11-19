@@ -1,0 +1,107 @@
+[package]
+name = "mavplayer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A fast, native media player for video, music, streams and DVDs"
+license = "GPL-3.0-or-later"
+authors = ["Drogobo"]
+repository = "https://github.com/Drogobo/mavplayer"
+readme = "README.md"
+keywords = ["media-player", "video", "audio", "dvd", "ffmpeg"]
+categories = ["multimedia::video", "multimedia::audio"]
+
+[features]
+default = []
+# Link FFmpeg statically (release builds; see scripts/build-ffmpeg.sh).
+static-ffmpeg = ["ffmpeg-sys-next/static"]
+
+[dependencies]
+gpui = "0.2.2"
+ffmpeg-sys-next = { version = "9.1", default-features = false, features = ["avcodec", "avformat", "avfilter", "swscale", "swresample"] }
+cpal = "0.18"
+anyhow = "1"
+log = "0.4"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
+unicode-segmentation = "1"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[patch.crates-io]
+# xattr 0.2.3 (pulled in by gpui's http client) references libc::ENOATTR,
+# which recent libc releases removed on Linux. See third_party/xattr.
+xattr = { path = "third_party/xattr" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
+panic = "unwind"
+
+# ── Linux packages ──────────────────────────────────────────────────────────
+# `cargo deb` (cargo install cargo-deb) and `cargo generate-rpm`
+# (cargo install cargo-generate-rpm); see HACKING.md / scripts/package-linux.sh.
+
+[package.metadata.deb]
+name = "mavplayer"
+maintainer = "Drogobo <https://github.com/Drogobo>"
+copyright = "MavPlayer contributors"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+MavPlayer plays almost any video or audio file, network streams and DVDs. \
+It has a native GPU-accelerated interface, hardware video decoding, \
+subtitles, an equalizer, video adjustments and resume support."""
+section = "video"
+priority = "optional"
+# FFmpeg is linked statically; the rest is detected from the binary.
+depends = "$auto"
+recommends = "libdvdcss2"
+assets = [
+    ["target/release/mavplayer", "usr/bin/", "755"],
+    ["packaging/linux/io.github.drogobo.MavPlayer.desktop", "usr/share/applications/", "644"],
+    ["packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["packaging/linux/io.github.drogobo.MavPlayer.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
+    ["packaging/icons/mavplayer-16.png", "usr/share/icons/hicolor/16x16/apps/io.github.drogobo.MavPlayer.png", "644"],
+    ["packaging/icons/mavplayer-32.png", "usr/share/icons/hicolor/32x32/apps/io.github.drogobo.MavPlayer.png", "644"],
+    ["packaging/icons/mavplayer-48.png", "usr/share/icons/hicolor/48x48/apps/io.github.drogobo.MavPlayer.png", "644"],
+    ["packaging/icons/mavplayer-64.png", "usr/share/icons/hicolor/64x64/apps/io.github.drogobo.MavPlayer.png", "644"],
+    ["packaging/icons/mavplayer-128.png", "usr/share/icons/hicolor/128x128/apps/io.github.drogobo.MavPlayer.png", "644"],
+    ["packaging/icons/mavplayer-256.png", "usr/share/icons/hicolor/256x256/apps/io.github.drogobo.MavPlayer.png", "644"],
+    ["packaging/icons/mavplayer-512.png", "usr/share/icons/hicolor/512x512/apps/io.github.drogobo.MavPlayer.png", "644"],
+    ["README.md", "usr/share/doc/mavplayer/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "mavplayer"
+license = "GPL-3.0-or-later"
+summary = "Fast, native media player for video, music, streams and DVDs"
+url = "https://github.com/Drogobo/mavplayer"
+assets = [
+    { source = "target/release/mavplayer", dest = "/usr/bin/mavplayer", mode = "755" },
+    { source = "packaging/linux/io.github.drogobo.MavPlayer.desktop", dest = "/usr/share/applications/io.github.drogobo.MavPlayer.desktop", mode = "644" },
+    { source = "packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml", dest = "/usr/share/metainfo/io.github.drogobo.MavPlayer.metainfo.xml", mode = "644" },
+    { source = "packaging/linux/io.github.drogobo.MavPlayer.svg", dest = "/usr/share/icons/hicolor/scalable/apps/io.github.drogobo.MavPlayer.svg", mode = "644" },
+    { source = "packaging/icons/mavplayer-256.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.drogobo.MavPlayer.png", mode = "644" },
+    { source = "packaging/icons/mavplayer-128.png", dest = "/usr/share/icons/hicolor/128x128/apps/io.github.drogobo.MavPlayer.png", mode = "644" },
+    { source = "packaging/icons/mavplayer-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.drogobo.MavPlayer.png", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/mavplayer/LICENSE", mode = "644", doc = true },
+    { source = "README.md", dest = "/usr/share/doc/mavplayer/README.md", mode = "644", doc = true },
+]
+auto-req = "auto"
+
+[package.metadata.generate-rpm.recommends]
+libdvdcss = "*"

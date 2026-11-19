@@ -1,0 +1,69 @@
+# Maintainer: Drogobo <https://github.com/Drogobo>
+#
+# In-tree PKGBUILD: builds the checkout this file lives in.
+#   cd packaging/arch && makepkg -s        → mavplayer-<ver>-1-x86_64.pkg.tar.zst
+# (For an AUR-style build from a release tag, set _from_git=1.)
+
+pkgname=mavplayer
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Fast, native media player for video, music, streams and DVDs"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Drogobo/mavplayer"
+license=('GPL-3.0-or-later')
+depends=('ffmpeg>=2:9' 'alsa-lib' 'libxkbcommon' 'libxkbcommon-x11' 'libxcb' 'vulkan-icd-loader'
+         'fontconfig' 'freetype2' 'wayland' 'hicolor-icon-theme')
+makedepends=('cargo' 'clang' 'git' 'pkgconf')
+optdepends=('libdvdcss: play encrypted DVDs'
+            'papirus-icon-theme: not required — icons are built in')
+options=('!lto' '!debug')
+
+_from_git=${_from_git:-0}
+if [ "$_from_git" = 1 ]; then
+    source=("$pkgname::git+$url.git#tag=v$pkgver"
+            "papirus::git+https://github.com/PapirusDevelopmentTeam/papirus-icon-theme.git")
+    sha256sums=('SKIP' 'SKIP')
+fi
+
+_srcroot() {
+    if [ "$_from_git" = 1 ]; then echo "$srcdir/$pkgname"; else echo "$startdir/../.."; fi
+}
+
+prepare() {
+    cd "$(_srcroot)"
+    if [ "$_from_git" = 1 ]; then
+        git submodule init
+        git config submodule.third_party/papirus-icon-theme.url "$srcdir/papirus"
+        git -c protocol.file.allow=always submodule update
+    fi
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$(_srcroot)"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$(_srcroot)/target}"
+    cargo build --frozen --release
+}
+
+check() {
+    cd "$(_srcroot)"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen --release
+}
+
+package() {
+    cd "$(_srcroot)"
+    local target="${CARGO_TARGET_DIR:-$(_srcroot)/target}"
+    install -Dm755 "$target/release/mavplayer" "$pkgdir/usr/bin/mavplayer"
+    install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.desktop -t "$pkgdir/usr/share/applications/"
+    install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml -t "$pkgdir/usr/share/metainfo/"
+    install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.svg -t "$pkgdir/usr/share/icons/hicolor/scalable/apps/"
+    for s in 16 32 48 64 128 256 512; do
+        install -Dm644 "packaging/icons/mavplayer-$s.png" \
+            "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/io.github.drogobo.MavPlayer.png"
+    done
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}

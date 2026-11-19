@@ -1,0 +1,181 @@
+# Builds every release package. Runs on pushes, pull requests and tags;
+# a `v*` tag also publishes a GitHub release with all artifacts attached.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (Linux, system FFmpeg)
+    runs-on: ubuntu-latest
+    container: archlinux:latest   # ships FFmpeg 9
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf ffmpeg \
+            alsa-lib libxkbcommon libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - run: cargo fmt --check
+      - run: cargo clippy --locked -- -D warnings
+      - run: cargo test --locked
+
+  linux:
+    name: Linux (AppImage, deb, rpm)
+    runs-on: ubuntu-22.04   # oldest glibc we support
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang nasm meson ninja-build pkg-config \
+            autoconf automake libtool curl file \
+            libssl-dev zlib1g-dev libva-dev libvdpau-dev libasound2-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev \
+            libfontconfig1-dev libfreetype-dev libvulkan-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-build/prefix
+          key: ffmpeg-linux-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg.sh
+      - name: Install packaging tools
+        run: cargo install --locked cargo-deb cargo-generate-rpm
+      - name: Package
+        run: |
+          export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig
+          scripts/package-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+            dist/*.zsync
+
+  arch:
+    name: Arch Linux (pkg.tar.zst)
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf ffmpeg sudo \
+            alsa-lib libxkbcommon libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig freetype2 hicolor-icon-theme
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - name: makepkg
+        run: |
+          chown -R builder .
+          sudo -u builder bash -c 'cd packaging/arch && PKGDEST=$PWD/../../dist makepkg -s --noconfirm'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: dist/*.pkg.tar.zst
+
+  flatpak:
+    name: Flatpak
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - name: Generate cargo sources
+        run: |
+          pip install --break-system-packages aiohttp toml tomlkit 2>/dev/null || pip install aiohttp toml tomlkit
+          curl -fsSLO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
+          python3 flatpak-cargo-generator.py Cargo.lock -o packaging/flatpak/cargo-sources.json
+      - uses: flathub-infra/flatpak-github-actions/flatpak-builder@master
+        with:
+          bundle: MavPlayer.flatpak
+          manifest-path: packaging/flatpak/io.github.drogobo.MavPlayer.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+
+  windows:
+    name: Windows (zip, installer)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Package
+        shell: pwsh
+        run: |
+          $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+          scripts\package-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-packages
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - { arch: arm64, runner: macos-14 }
+          - { arch: x86_64, runner: macos-13 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+      - name: Install build tools
+        run: brew install nasm meson ninja pkg-config autoconf automake libtool openssl@3
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-build/prefix
+          key: ffmpeg-macos-${{ matrix.arch }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg.sh
+      - name: Package
+        run: |
+          export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig
+          scripts/package-macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/*.dmg
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, linux, arch, flatpak, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

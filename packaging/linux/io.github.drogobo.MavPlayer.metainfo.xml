@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.drogobo.MavPlayer</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>MavPlayer</name>
+  <summary>Play videos, music, streams and DVDs</summary>
+  <developer id="io.github.drogobo">
+    <name>Drogobo</name>
+  </developer>
+  <description>
+    <p>
+      MavPlayer is a fast, native media player. It opens almost any video or
+      audio format, plays network streams and DVDs, and starts in a fraction
+      of a second.
+    </p>
+    <ul>
+      <li>Hardware-accelerated decoding with automatic software fallback</li>
+      <li>HDR to SDR tone mapping, deinterlacing, aspect ratio, crop, zoom and rotation</li>
+      <li>Embedded and external subtitles, with automatic loading of matching files</li>
+      <li>DVD playback with title and chapter navigation</li>
+      <li>10-band equalizer, volume normalization, night mode and pitch-preserving speed control</li>
+      <li>Playlists, shuffle, repeat, A-B loop and resume where you left off</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.drogobo.MavPlayer.desktop</launchable>
+  <url type="homepage">https://github.com/Drogobo/mavplayer</url>
+  <url type="bugtracker">https://github.com/Drogobo/mavplayer/issues</url>
+  <url type="vcs-browser">https://github.com/Drogobo/mavplayer</url>
+  <content_rating type="oars-1.1"/>
+  <provides>
+    <binary>mavplayer</binary>
+  </provides>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Player</category>
+  </categories>
+  <keywords>
+    <keyword>video</keyword>
+    <keyword>music</keyword>
+    <keyword>dvd</keyword>
+    <keyword>player</keyword>
+  </keywords>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <releases>
+    <release version="0.1.0" date="2026-11-19">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>
