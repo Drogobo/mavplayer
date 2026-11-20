@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds the FFmpeg that release builds of MavPlayer link statically, plus the
-# libraries it needs (dav1d, zimg, libdvdread, libdvdnav, nv-codec-headers).
+# libraries it needs (dav1d, zimg, libdvdread, libdvdnav, nv-codec-headers, and
+# on Linux libplacebo with glslang for the GPU upscalers).
 #
 # Usage: scripts/build-ffmpeg.sh [PREFIX]          (default: ./ffmpeg-build/prefix)
 #
@@ -9,8 +10,9 @@
 #   cargo build --release --features static-ffmpeg
 #
 # Works on Linux and macOS. Needs: a C compiler, make, nasm, meson, ninja,
-# pkg-config, curl, autoconf/automake/libtool, and on Linux the OpenSSL / zlib
-# / libva development headers (see HACKING.md).
+# pkg-config, curl, autoconf/automake/libtool, and on Linux also a C++20
+# compiler, git, cmake, python3, meson >= 1.3 and the OpenSSL / zlib / libva
+# development headers (see HACKING.md).
 set -euo pipefail
 
 FFMPEG_VERSION=9.0.2
@@ -19,6 +21,8 @@ ZIMG_VERSION=3.0.6
 DVDREAD_VERSION=7.1.1
 DVDNAV_VERSION=7.0.0
 NVHEADERS_VERSION=n13.0.19.0
+LIBPLACEBO_VERSION=7.387.0
+GLSLANG_VERSION=vulkan-sdk-1.4.363.0
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${FFMPEG_WORK_DIR:-$ROOT/ffmpeg-build}
@@ -42,6 +46,16 @@ fetch() { # url dir
     echo ">> downloading $url"
     curl -fL --retry 3 -o "$file" "$url"
     tar -xf "$file" -C "$SRC"
+}
+
+git_fetch() { # url tag dir [submodule paths...]
+    local url=$1 tag=$2 dir=$3; shift 3
+    [ -d "$SRC/$dir" ] && return
+    echo ">> cloning $url ($tag)"
+    rm -rf "$SRC/$dir.tmp"
+    git -c advice.detachedHead=false clone --depth 1 --branch "$tag" "$url" "$SRC/$dir.tmp"
+    [ $# -gt 0 ] && git -C "$SRC/$dir.tmp" submodule update --init --depth 1 "$@"
+    mv "$SRC/$dir.tmp" "$SRC/$dir"
 }
 
 meson_build() { # dir [meson options...]
@@ -95,6 +109,43 @@ if [ "$OS" = Linux ]; then
     # (VDPAU is left out: it needs Xlib, and VA-API covers the same GPUs).
     HW_FLAGS=(--enable-ffnvcodec --enable-cuda --enable-nvdec --enable-openssl)
     pkg-config --exists libva libva-drm && HW_FLAGS+=(--enable-vaapi)
+
+    # ── glslang + libplacebo: FFmpeg's libplacebo filter (Vulkan), which runs
+    #    the GPU upscalers. Both are linked statically; the Vulkan loader is
+    #    not linked at all: FFmpeg dlopens the system's libvulkan.so.1 and
+    #    hands libplacebo its vkGetInstanceProcAddr (hence vk-proc-addr off).
+    #    macOS is left out: it would need MoltenVK bundled. ───────────────
+    fetch "https://github.com/KhronosGroup/glslang/archive/refs/tags/$GLSLANG_VERSION.tar.gz" "glslang-$GLSLANG_VERSION"
+    # The optimizer (SPIRV-Tools) is off: libplacebo doesn't need it.
+    cmake -S "$SRC/glslang-$GLSLANG_VERSION" -B "$SRC/glslang-$GLSLANG_VERSION/build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
+        -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DENABLE_OPT=OFF -DENABLE_HLSL=OFF -DENABLE_GLSLANG_BINARIES=OFF -DGLSLANG_TESTS=OFF
+    ninja -C "$SRC/glslang-$GLSLANG_VERSION/build" install
+
+    # Its git submodules carry the Vulkan headers and the code generators.
+    git_fetch https://code.videolan.org/videolan/libplacebo.git "v$LIBPLACEBO_VERSION" "libplacebo-$LIBPLACEBO_VERSION" \
+        3rdparty/Vulkan-Headers 3rdparty/glad 3rdparty/jinja 3rdparty/markupsafe 3rdparty/fast_float
+    # libplacebo finds glslang with find_library/has_header, not pkg-config.
+    (export CPATH="$PREFIX/include" LIBRARY_PATH="$PREFIX/lib" &&
+        meson_build "libplacebo-$LIBPLACEBO_VERSION" -Dprefer_static=true -Dvulkan-sdk="$PREFIX" \
+            -Dvulkan=enabled -Dvk-proc-addr=disabled -Dglslang=enabled -Dshaderc=disabled \
+            -Dopengl=disabled -Dd3d11=disabled -Dlcms=disabled -Dlibdovi=disabled \
+            -Dxxhash=disabled -Dunwind=disabled -Ddemos=false -Dtests=false)
+    # Its .pc file lists glslang as absolute .a paths, which FFmpeg's configure
+    # moves in front of -lplacebo, and leaves out the C++ runtime. Rewrite it
+    # in link order.
+    PLACEBO_PC=$PREFIX/lib/pkgconfig/libplacebo.pc
+    sed -i.bak -e 's|^Libs:.*|Libs: -L${libdir} -lplacebo|' -e '/^Libs.private:/d' "$PLACEBO_PC"
+    echo "Libs.private: -lglslang-default-resource-limits -lSPIRV -lglslang -lMachineIndependent" \
+        "-lOSDependent -lGenericCodeGen -lstdc++ -lm -pthread" >> "$PLACEBO_PC"
+    # FFmpeg's Vulkan code needs headers newer than most distributions ship.
+    # (C headers only; the C++ ones are 20 MB.)
+    VK_INC=$SRC/libplacebo-$LIBPLACEBO_VERSION/3rdparty/Vulkan-Headers/include
+    mkdir -p "$PREFIX/include/vulkan"
+    cp "$VK_INC"/vulkan/*.h "$PREFIX/include/vulkan/"
+    cp -R "$VK_INC/vk_video" "$PREFIX/include/"
+    HW_FLAGS+=(--enable-vulkan --enable-libplacebo)
 elif [ "$OS" = Darwin ]; then
     # TLS through the system's Security framework: no OpenSSL to build or
     # bundle (Homebrew's is built for the runner's macOS, not our minimum).

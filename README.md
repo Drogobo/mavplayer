@@ -164,7 +164,12 @@ later version.
 Release builds also contain these components, under GPL-3.0-compatible licenses:
 
 - **FFmpeg** (GPL, configured with `--enable-gpl --enable-version3`), built
-  with libdvdread and libdvdnav (GPL), dav1d (BSD) and zimg (WTFPL).
+  with libdvdread and libdvdnav (GPL), dav1d (BSD) and zimg (WTFPL). On Linux
+  also with libplacebo (LGPL-2.1-or-later) and the glslang shader compiler
+  (BSD-3-Clause, BSD-2-Clause, MIT, Apache-2.0, and GPL-3.0 with the Bison
+  exception for its generated parser); the Flatpak's libplacebo
+  uses the runtime's shaderc (Apache-2.0). The Windows packages ship BtbN's
+  GPL FFmpeg build, which includes libplacebo too.
 - **Papirus icons** (GPL-3.0), compiled into the binary as fallback icons.
 - **GPUI** (Apache-2.0) and Rust crates under MIT/Apache-2.0.
 

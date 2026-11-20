@@ -62,6 +62,18 @@ modules:
       - type: git
         url: https://github.com/sekrit-twc/zimg.git
         tag: release-3.0.5
+  # FFmpeg's libplacebo filter runs the GPU upscalers. The SDK provides the
+  # Vulkan headers and loader, shaderc and lcms2; libplacebo's own git
+  # submodules bring the code generators.
+  - name: libplacebo
+    buildsystem: meson
+    config-opts: [-Dbuildtype=release, -Dvulkan=enabled, -Dopengl=disabled, -Dd3d11=disabled,
+                  -Ddemos=false, -Dtests=false]
+    sources:
+      - type: git
+        url: https://code.videolan.org/videolan/libplacebo.git
+        tag: v7.387.0
+        commit: 275f7dea27924cdd34ab2e6c20e448b6bc4fab65
 
   - name: ffmpeg
     config-opts:
@@ -84,6 +96,8 @@ modules:
       - --enable-libdvdnav
       - --enable-vaapi
       - --enable-vdpau
+      - --enable-vulkan
+      - --enable-libplacebo
     cleanup: [/share/ffmpeg]
     sources:
       - type: git

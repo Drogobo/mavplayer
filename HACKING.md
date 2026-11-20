@@ -75,11 +75,14 @@ Distribution FFmpeg versions vary a lot, so the portable packages link a
 decode-only FFmpeg 9 statically. This also makes them smaller and keeps startup
 fast. [`scripts/build-ffmpeg.sh`](scripts/build-ffmpeg.sh) downloads and builds
 it together with dav1d (AV1), zimg (HDR tone mapping), libdvdread/libdvdnav
-(DVD) and the NVIDIA decode headers:
+(DVD) and the NVIDIA decode headers. On Linux it also builds glslang and
+libplacebo and enables FFmpeg's Vulkan support and `libplacebo` filter, which run
+the GPU upscalers:
 
 ```bash
-# Debian/Ubuntu build dependencies:
-sudo apt install nasm meson ninja-build autoconf automake libtool curl \
+# Debian/Ubuntu build dependencies (libplacebo needs meson >= 1.3; on older
+# releases use `pip install meson`):
+sudo apt install nasm meson ninja-build cmake git python3 autoconf automake libtool curl \
     libssl-dev zlib1g-dev libva-dev
 scripts/build-ffmpeg.sh                       # → ffmpeg-build/prefix
 export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig
@@ -89,6 +92,16 @@ cargo build --release --features static-ffmpeg
 The `static-ffmpeg` feature turns on `ffmpeg-sys-next/static`, which links
 everything `pkg-config --static` lists. OpenSSL, zlib and libva stay dynamic on
 Linux, because every distribution ships them.
+
+libplacebo and glslang (without its SPIR-V optimizer) are linked statically too,
+but the Vulkan loader is never linked: FFmpeg `dlopen`s the system's
+`libvulkan.so.1` when the first upscaler starts and passes libplacebo its
+`vkGetInstanceProcAddr` (libplacebo is built with `-Dvk-proc-addr=disabled`).
+Without a Vulkan driver the upscalers simply fail to start and MavPlayer falls
+back to bilinear. FFmpeg's newer Vulkan headers come from libplacebo's
+`3rdparty/Vulkan-Headers` submodule and are copied into the prefix. macOS builds
+skip libplacebo, since it would need MoltenVK bundled in the app, so they offer
+only Bilinear and Nearest.
 
 ### AppImage, .deb and .rpm
 
@@ -138,8 +151,9 @@ _from_git=1 makepkg -s           # build the tagged release from GitHub instead
 ### Flatpak
 
 [`packaging/flatpak/io.github.drogobo.MavPlayer.yml`](packaging/flatpak/io.github.drogobo.MavPlayer.yml)
-builds libdvdread, libdvdnav, zimg and FFmpeg 9 as modules on the freedesktop
-25.08 runtime, which already provides dav1d and VA-API. Cargo dependencies must be
+builds libdvdread, libdvdnav, zimg, libplacebo and FFmpeg 9 as modules on the
+freedesktop 25.08 runtime, which already provides dav1d, VA-API, and the Vulkan
+loader and headers, shaderc and lcms2 that libplacebo uses. Cargo dependencies must be
 vendored for the offline build:
 
 ```bash

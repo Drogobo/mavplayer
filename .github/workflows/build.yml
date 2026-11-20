@@ -41,11 +41,14 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang nasm meson ninja-build pkg-config \
-            autoconf automake libtool curl file \
+          sudo apt-get install -y build-essential clang nasm ninja-build pkg-config \
+            autoconf automake libtool curl file cmake git python3-pip \
             libssl-dev zlib1g-dev libva-dev libasound2-dev libpipewire-0.3-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev \
             libfontconfig1-dev libfreetype-dev libvulkan-dev
+          # libplacebo needs meson >= 1.3; Ubuntu 22.04 ships 0.61.
+          pip3 install --user 'meson>=1.3'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Cache FFmpeg
