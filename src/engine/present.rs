@@ -34,7 +34,8 @@ impl Converter {
     pub fn convert(&mut self, f: &Frame, dw: u32, dh: u32, quality: ScaleQuality) -> Option<Vec<u8>> {
         let r = f.raw();
         let flags = match quality {
-            ScaleQuality::Fast => ff::SwsFlags::SWS_BILINEAR,
+            ScaleQuality::Nearest => ff::SwsFlags::SWS_POINT,
+            ScaleQuality::Linear => ff::SwsFlags::SWS_BILINEAR,
             ScaleQuality::Good => ff::SwsFlags::SWS_BICUBIC,
             ScaleQuality::Best => ff::SwsFlags::SWS_LANCZOS,
         } as c_int
@@ -138,13 +139,15 @@ impl Drop for Converter {
     }
 }
 
-/// Output size: square pixels, never larger than the target (or the source).
-pub fn output_size(w: i32, h: i32, sar: f64, target: (u32, u32)) -> (u32, u32) {
+/// Output size: square pixels, fitted inside the target. Never larger than
+/// the source unless `enlarge` is set (otherwise the GPU does the enlarging).
+pub fn output_size(w: i32, h: i32, sar: f64, target: (u32, u32), enlarge: bool) -> (u32, u32) {
     let sar = if sar.is_finite() && sar > 0.0 { sar } else { 1.0 };
     let (mut dw, mut dh) =
         if sar >= 1.0 { ((w as f64 * sar).round(), h as f64) } else { (w as f64, (h as f64 / sar).round()) };
     let (tw, th) = (target.0.max(16) as f64, target.1.max(16) as f64);
-    let scale = (tw / dw).min(th / dh).min(1.0);
+    let fit = (tw / dw).min(th / dh);
+    let scale = if enlarge { fit } else { fit.min(1.0) };
     dw = (dw * scale).round().max(2.0);
     dh = (dh * scale).round().max(2.0);
     (dw as u32, dh as u32)
@@ -299,8 +302,10 @@ fn prepare(ctx: &SessionCtx, conv: &mut Converter, vf: &VideoFrame) -> Option<Pr
         return None;
     }
     let target = ctx.controls.target_size();
-    let (dw, dh) = output_size(w, h, vf.sar, target);
     let quality = ctx.controls.config.lock().scale_quality;
+    // The GPU enlarges with bilinear filtering, which would blur away the
+    // hard edges nearest-neighbour is chosen for; enlarge here instead.
+    let (dw, dh) = output_size(w, h, vf.sar, target, quality == ScaleQuality::Nearest);
     let bgra = conv.convert(&vf.frame, dw, dh, quality)?;
     ctx.sub_canvas.store(((w as u64) << 32) | h as u64, Ordering::Relaxed);
     Some(PresentedFrame { width: dw, height: dh, bgra })
@@ -338,7 +343,7 @@ pub fn screenshot_async(ctx: Arc<SessionCtx>, path: PathBuf) {
     };
     std::thread::spawn(move || {
         let mut conv = Converter::new();
-        let (w, h) = output_size(frame.width(), frame.height(), sar, (u32::MAX / 2, u32::MAX / 2));
+        let (w, h) = output_size(frame.width(), frame.height(), sar, (u32::MAX / 2, u32::MAX / 2), false);
         let Some(mut bgra) = conv.convert(&frame, w, h, ScaleQuality::Best) else {
             ctx.emit(PlayerEvent::Warning("Screenshot failed".into()));
             return;
@@ -355,4 +360,29 @@ pub fn screenshot_async(ctx: Arc<SessionCtx>, path: PathBuf) {
             None => ctx.emit(PlayerEvent::Warning("Screenshot failed".into())),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_size_shrinks_but_only_enlarges_when_asked() {
+        // 1080p into a 960x540 area: halved either way.
+        assert_eq!(output_size(1920, 1080, 1.0, (960, 540), false), (960, 540));
+        assert_eq!(output_size(1920, 1080, 1.0, (960, 540), true), (960, 540));
+        // 320x240 into 1280x960: left to the GPU, or enlarged 4x here.
+        assert_eq!(output_size(320, 240, 1.0, (1280, 960), false), (320, 240));
+        assert_eq!(output_size(320, 240, 1.0, (1280, 960), true), (1280, 960));
+        // Anamorphic 720x480 (32:27 SAR) keeps its shape when enlarged.
+        assert_eq!(output_size(720, 480, 32.0 / 27.0, (1706, 960), true), (1706, 960));
+    }
+
+    #[test]
+    fn old_fast_scaling_setting_still_loads() {
+        let q: ScaleQuality = serde_json::from_str("\"Fast\"").unwrap();
+        assert_eq!(q, ScaleQuality::Linear);
+        let q: ScaleQuality = serde_json::from_str("\"Nearest\"").unwrap();
+        assert_eq!(q, ScaleQuality::Nearest);
+    }
 }

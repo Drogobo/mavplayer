@@ -125,6 +125,12 @@ pub struct PlayerView {
     pub inputs: HashMap<&'static str, Entity<TextInput>>,
     pub audio_devices: Vec<String>,
     pub dropping: bool,
+    /// Insertion point (0..=len) shown while something is dragged over the playlist.
+    pub pl_drop: Option<usize>,
+    pub pl_scroll: gpui::UniformListScrollHandle,
+    /// The volume percentage is being edited as text.
+    pub editing_volume: bool,
+    volume_blur: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
 
@@ -134,14 +140,37 @@ impl Focusable for PlayerView {
     }
 }
 
-impl PlayerView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, initial: Vec<MediaSource>) -> Self {
+/// Everything that can start before the window exists. `main` creates this
+/// before GPUI sets up the GPU (which takes 100–200 ms on some drivers), so
+/// the first file is already opening, decoding and finding its audio device
+/// by the time the window appears.
+pub struct Boot {
+    pub settings: Settings,
+    player: Player,
+    wake_pending: Arc<AtomicBool>,
+    wake_rx: futures::channel::mpsc::UnboundedReceiver<()>,
+    icons_rx: futures::channel::mpsc::UnboundedReceiver<()>,
+    resume: ResumeStore,
+    sources: Vec<MediaSource>,
+    /// `sources[0]` is already loading.
+    started: bool,
+}
+
+impl Boot {
+    pub fn start(sources: Vec<MediaSource>) -> Self {
         let settings = Settings::load();
         icons::set_use_system_theme(settings.icon_theme == crate::settings::IconTheme::System);
+        // Icons from the desktop theme are resolved off the UI thread.
+        let (itx, icons_rx) = futures::channel::mpsc::unbounded::<()>();
+        icons::init_system_icons(move || {
+            let _ = itx.unbounded_send(());
+        });
+
         let wake_pending = Arc::new(AtomicBool::new(false));
-        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        let (tx, wake_rx) = futures::channel::mpsc::unbounded::<()>();
         let wp = wake_pending.clone();
-        let player = Player::new(settings.engine_config(), move || {
+        // Wake-ups sent before the view exists queue up in the channel.
+        let mut player = Player::new(settings.engine_config(), move || {
             if !wp.swap(true, Ordering::AcqRel) {
                 let _ = tx.unbounded_send(());
             }
@@ -149,7 +178,28 @@ impl PlayerView {
         player.set_volume(settings.volume);
         player.set_muted(settings.muted);
         player.set_audio_fx(settings.audio_fx.clone());
+        let resume = ResumeStore::load();
+        // A whole DVD (title 0) needs its titles probed first; that runs in the view.
+        let started = match sources.first() {
+            Some(MediaSource::Dvd { title: 0, .. }) | None => false,
+            Some(src) => {
+                let start_at = if settings.resume_playback { resume.get(&src.key()) } else { None };
+                // Paused until the window exists, so sound doesn't start
+                // before there is anything to see.
+                player.load(src.clone(), LoadOptions { start_at, start_paused: true, ..Default::default() });
+                log::debug!("startup: first file loading at {:.0} ms", crate::ms_since_start());
+                true
+            }
+        };
+        Self { settings, player, wake_pending, wake_rx, icons_rx, resume, sources, started }
+    }
+}
 
+impl PlayerView {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, boot: Boot) -> Self {
+        let Boot { settings, player, wake_pending, wake_rx: mut rx, icons_rx: mut irx, resume, sources, started } =
+            boot;
+        log::debug!("startup: creating player view at {:.0} ms", crate::ms_since_start());
         // Engine → UI wake-ups.
         cx.spawn_in(window, async move |this, cx| {
             while rx.next().await.is_some() {
@@ -180,11 +230,7 @@ impl PlayerView {
             async {}
         }));
 
-        // Icons from the desktop theme are resolved off the UI thread.
-        let (itx, mut irx) = futures::channel::mpsc::unbounded::<()>();
-        icons::init_system_icons(move || {
-            let _ = itx.unbounded_send(());
-        });
+        // Repaint once the desktop icon theme has been resolved.
         cx.spawn_in(window, async move |this, cx| {
             if irx.next().await.is_some() {
                 let _ = this.update(cx, |_, cx| cx.notify());
@@ -199,7 +245,7 @@ impl PlayerView {
             playlist: Playlist::new(settings.repeat, settings.shuffle),
             show_playlist: settings.show_playlist,
             player,
-            resume: ResumeStore::load(),
+            resume,
             theme,
             focus,
             wake_pending,
@@ -236,14 +282,21 @@ impl PlayerView {
             inputs: HashMap::new(),
             audio_devices: Vec::new(),
             dropping: false,
+            pl_drop: None,
+            pl_scroll: gpui::UniformListScrollHandle::new(),
+            editing_volume: false,
+            volume_blur: None,
             settings,
             _subs: subs,
         };
         window.set_window_title("MavPlayer");
-        if !initial.is_empty() {
-            v.playlist.add(initial);
+        if !sources.is_empty() {
+            v.playlist.add(sources);
             v.probe_playlist(cx);
-            v.play_index(0, window, cx);
+            v.start_item(0, !started, window, cx);
+            if started {
+                v.player.set_paused(false);
+            }
         }
         if v.settings.start_fullscreen && !window.is_fullscreen() {
             window.toggle_fullscreen();
@@ -475,6 +528,12 @@ impl PlayerView {
     }
 
     pub fn play_index(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_item(idx, true, window, cx);
+    }
+
+    /// Makes `idx` the current item. With `load` false the engine is
+    /// already playing it (started early by [`Boot`]).
+    fn start_item(&mut self, idx: usize, load: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.playlist.items.get(idx).cloned() else { return };
         self.save_current_position();
         self.playlist.current = Some(idx);
@@ -487,9 +546,11 @@ impl PlayerView {
             self.open_dvd_auto(path.clone(), window, cx);
             return;
         }
-        let start_at = if self.settings.resume_playback { self.resume.get(&item.source.key()) } else { None };
         self.load_counter += 1;
-        self.player.load(item.source.clone(), LoadOptions { start_at, ..Default::default() });
+        if load {
+            let start_at = if self.settings.resume_playback { self.resume.get(&item.source.key()) } else { None };
+            self.player.load(item.source.clone(), LoadOptions { start_at, ..Default::default() });
+        }
         self.settings.add_recent(&item.source);
         window.set_window_title(&format!("{} — MavPlayer", item.display_title()));
         if let MediaSource::Dvd { path, .. } = &item.source
@@ -529,9 +590,24 @@ impl PlayerView {
 
     /// Adds without interrupting playback.
     pub fn enqueue(&mut self, sources: Vec<MediaSource>, window: &mut Window, cx: &mut Context<Self>) {
+        self.enqueue_at(self.playlist.items.len(), sources, window, cx);
+    }
+
+    /// Inserts into the playlist before index `at` without interrupting
+    /// playback (starts playing if nothing is).
+    pub fn enqueue_at(&mut self, at: usize, sources: Vec<MediaSource>, window: &mut Window, cx: &mut Context<Self>) {
+        if sources.is_empty() {
+            return;
+        }
         let was_empty = self.playlist.items.is_empty();
         let n = sources.len();
-        let range = self.playlist.add(sources);
+        let range = self.playlist.insert(at, sources);
+        // Keep the selection on the same item.
+        if let Some(sel) = self.playlist_selected.as_mut()
+            && *sel >= range.start
+        {
+            *sel += n;
+        }
         self.probe_playlist(cx);
         if was_empty || !self.player.is_active() {
             self.play_index(range.start, window, cx);
@@ -741,12 +817,49 @@ impl PlayerView {
         let e = cx.new(|cx| TextInput::new(cx, ph));
         let sub = cx.subscribe_in(&e, window, move |this, _, ev: &InputEvent, window, cx| match ev {
             InputEvent::Submit => this.on_input_submit(key, window, cx),
+            InputEvent::Cancel if key == "volume" => this.finish_volume_edit(false, window, cx),
             InputEvent::Cancel => this.close_dialog(window, cx),
             InputEvent::Changed => this.on_input_changed(key, cx),
         });
         self._subs.push(sub);
         self.inputs.insert(key, e.clone());
         e
+    }
+
+    /// Swaps the volume percentage for a text field (double-click on it).
+    pub fn start_volume_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.input("volume", "%", window, cx);
+        let t = self.theme;
+        let pct = format!("{:.0}", self.player.volume() * 100.0);
+        input.update(cx, |i, cx| {
+            i.colors = (t.text, t.text_disabled, t.accent_soft, t.accent);
+            i.set_text(pct, cx);
+        });
+        let fh = input.focus_handle(cx);
+        window.focus(&fh);
+        self.editing_volume = true;
+        // Clicking elsewhere applies what was typed.
+        self.volume_blur = Some(cx.on_blur(&fh, window, |this, window, cx| this.finish_volume_edit(true, window, cx)));
+        cx.notify();
+    }
+
+    /// Ends volume editing; `apply` sets the typed percentage (Enter / blur),
+    /// otherwise it is discarded (Escape).
+    pub fn finish_volume_edit(&mut self, apply: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing_volume {
+            return;
+        }
+        self.editing_volume = false;
+        self.volume_blur = None;
+        if apply {
+            let text = self.inputs.get("volume").map(|i| i.read(cx).text()).unwrap_or_default();
+            match parse_volume(&text) {
+                Some(pct) => self.set_volume(pct / 100.0, cx),
+                None => self.osd("Type a volume like 80 or 80%", cx),
+            }
+        }
+        window.focus(&self.focus);
+        cx.notify();
     }
 
     pub fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1136,4 +1249,25 @@ impl PlayerView {
 
 fn engine_sub_ext(ext: &str) -> bool {
     matches!(ext, "srt" | "ass" | "ssa" | "vtt" | "sub" | "idx" | "smi" | "sup" | "ttml" | "lrc")
+}
+
+/// Parses a typed volume percentage: "80", "80%", " 72.5 % ".
+pub fn parse_volume(text: &str) -> Option<f64> {
+    let n: f64 = text.trim().trim_end_matches('%').trim().parse().ok()?;
+    (n.is_finite() && n >= 0.0).then_some(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_volume;
+
+    #[test]
+    fn volume_parsing() {
+        assert_eq!(parse_volume("80"), Some(80.0));
+        assert_eq!(parse_volume(" 72.5 % "), Some(72.5));
+        assert_eq!(parse_volume("120%"), Some(120.0));
+        assert_eq!(parse_volume("-5"), None);
+        assert_eq!(parse_volume("loud"), None);
+        assert_eq!(parse_volume(""), None);
+    }
 }

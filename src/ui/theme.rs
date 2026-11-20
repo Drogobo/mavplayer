@@ -1,7 +1,10 @@
 //! Colours. Follows the system light/dark preference unless overridden.
+//!
+//! The palette follows the app icon: neutral charcoal like its disc, and its
+//! orange-to-lavender gradient for the accent.
 
 use crate::settings::ThemeMode;
-use gpui::{Hsla, Window, WindowAppearance, rgb, rgba};
+use gpui::{Background, Hsla, Window, WindowAppearance, linear_color_stop, linear_gradient, rgb, rgba};
 
 #[derive(Clone, Copy)]
 pub struct Theme {
@@ -15,7 +18,10 @@ pub struct Theme {
     pub text: Hsla,
     pub text_dim: Hsla,
     pub text_disabled: Hsla,
+    /// The icon's orange: solid accents (toggles, checks, focus rings).
     pub accent: Hsla,
+    /// The icon's lavender, where the brand gradient ends.
+    pub accent_end: Hsla,
     pub accent_soft: Hsla,
     pub on_accent: Hsla,
     pub hover: Hsla,
@@ -30,50 +36,58 @@ pub struct Theme {
 impl Theme {
     pub fn dark() -> Self {
         Self {
-            chrome: rgb(0x1b1c20).into(),
-            chrome_border: rgb(0x2a2c32).into(),
-            surface: rgb(0x23252b).into(),
-            surface_alt: rgb(0x2b2e35).into(),
-            popup: rgb(0x26282e).into(),
-            border: rgb(0x3a3d45).into(),
-            text: rgb(0xe9eaee).into(),
-            text_dim: rgb(0xa3a7b1).into(),
-            text_disabled: rgb(0x6b6f78).into(),
-            accent: rgb(0x6d7cff).into(),
-            accent_soft: rgba(0x6d7cff33).into(),
+            chrome: rgb(0x1c1b1c).into(),
+            chrome_border: rgb(0x2d2b2d).into(),
+            surface: rgb(0x242324).into(),
+            surface_alt: rgb(0x2e2c2e).into(),
+            popup: rgb(0x292729).into(),
+            border: rgb(0x3e3b3e).into(),
+            text: rgb(0xefeced).into(),
+            text_dim: rgb(0xaba6a9).into(),
+            text_disabled: rgb(0x6f6a6d).into(),
+            accent: rgb(0xf4682a).into(),
+            accent_end: rgb(0xa08cff).into(),
+            accent_soft: rgba(0xf4682a33).into(),
             on_accent: rgb(0xffffff).into(),
             hover: rgba(0xffffff14).into(),
             pressed: rgba(0xffffff22).into(),
             track: rgba(0xffffff2e).into(),
             backdrop: rgba(0x0000008c).into(),
             video_bg: rgb(0x000000).into(),
-            osd_bg: rgba(0x101114d0).into(),
-            danger: rgb(0xff6b6b).into(),
+            osd_bg: rgba(0x141314d0).into(),
+            danger: rgb(0xff5d6e).into(),
         }
     }
 
     pub fn light() -> Self {
         Self {
-            chrome: rgb(0xf3f4f7).into(),
-            chrome_border: rgb(0xdcdfe5).into(),
+            chrome: rgb(0xf6f3f2).into(),
+            chrome_border: rgb(0xe3dedc).into(),
             surface: rgb(0xffffff).into(),
-            surface_alt: rgb(0xf0f1f4).into(),
+            surface_alt: rgb(0xf2eeed).into(),
             popup: rgb(0xffffff).into(),
-            border: rgb(0xd3d6dd).into(),
-            text: rgb(0x1d1f24).into(),
-            text_dim: rgb(0x5d626d).into(),
-            text_disabled: rgb(0xa2a6ae).into(),
-            accent: rgb(0x4f5ee8).into(),
-            accent_soft: rgba(0x4f5ee826).into(),
+            border: rgb(0xd9d3d1).into(),
+            text: rgb(0x221e20).into(),
+            text_dim: rgb(0x625b5e).into(),
+            text_disabled: rgb(0xa9a2a5).into(),
+            accent: rgb(0xdf520e).into(),
+            accent_end: rgb(0x8670ee).into(),
+            accent_soft: rgba(0xdf520e24).into(),
             on_accent: rgb(0xffffff).into(),
             hover: rgba(0x0000000f).into(),
             pressed: rgba(0x0000001c).into(),
             track: rgba(0x00000024).into(),
             backdrop: rgba(0x00000066).into(),
             video_bg: rgb(0x000000).into(),
-            osd_bg: rgba(0x101114d0).into(),
-            danger: rgb(0xd93636).into(),
+            osd_bg: rgba(0x141314d0).into(),
+            danger: rgb(0xd42f45).into(),
         }
+    }
+
+    /// The icon's orange → lavender gradient. `angle` follows CSS: 180° runs
+    /// top to bottom (as on the icon), 90° left to right.
+    pub fn brand(&self, angle: f32) -> Background {
+        linear_gradient(angle, linear_color_stop(self.accent, 0.), linear_color_stop(self.accent_end, 1.))
     }
 
     pub fn resolve(mode: ThemeMode, window: &Window) -> Self {
@@ -90,6 +104,7 @@ impl Theme {
 pub fn overlay_theme(base: &Theme) -> Theme {
     let mut t = Theme::dark();
     t.accent = base.accent;
+    t.accent_end = base.accent_end;
     t.accent_soft = base.accent_soft;
     t.chrome = rgba(0x00000000).into();
     t

@@ -88,6 +88,9 @@ pub fn open_input(source: &MediaSource, cfg: &EngineConfig, ctx: Option<&Session
         }
         let fctx = FormatCtx(ic);
         let r = ff::avformat_find_stream_info(ic, ptr::null_mut());
+        if ctx.is_some() {
+            log::debug!("startup: media opened at {:.0} ms", crate::ms_since_start());
+        }
         if r < 0 {
             log::warn!("could not find stream info: {}", av::err_str(r));
         }
@@ -288,6 +291,7 @@ fn start_component(
             let (c, s, cfg) = (ctx.clone(), stop.clone(), cfg.clone());
             threads.push(spawn("audio-dec", move || {
                 let pending = PendingAudio(&c, token);
+                log::debug!("startup: opening audio device at {:.0} ms", crate::ms_since_start());
                 match audio::open_output(c.clone(), s.clone(), &cfg, media_channels) {
                     Ok((out_thread, fmt)) => {
                         log::info!("audio output ready: {} ({} Hz, {} ch)", fmt.device, fmt.rate, fmt.channels);
@@ -373,7 +377,10 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
 
     if let Some(i) = stream_index(selected.audio) {
         match start_component(&ctx, &ic, TrackKind::Audio, i, &cfg) {
-            Ok(c) => audio_c = Some(c),
+            Ok(c) => {
+                log::debug!("startup: audio decoder ready at {:.0} ms", crate::ms_since_start());
+                audio_c = Some(c)
+            }
             Err(e) => {
                 log::warn!("audio: {e}");
                 selected.audio = None;
@@ -382,7 +389,10 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     }
     if let Some(i) = stream_index(selected.video) {
         match start_component(&ctx, &ic, TrackKind::Video, i, &cfg) {
-            Ok(c) => video_c = Some(c),
+            Ok(c) => {
+                log::debug!("startup: video decoder ready at {:.0} ms", crate::ms_since_start());
+                video_c = Some(c)
+            }
             Err(e) => {
                 ctx.emit(PlayerEvent::Warning(format!("Video: {e}")));
                 selected.video = None;

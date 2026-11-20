@@ -100,21 +100,30 @@ impl Playlist {
     }
 
     pub fn add(&mut self, sources: Vec<MediaSource>) -> std::ops::Range<usize> {
-        let start = self.items.len();
-        for s in sources {
-            self.items.push(PlaylistItem {
-                id: self.next_id,
-                source: s,
-                title: None,
-                artist: None,
-                duration: None,
-                probed: false,
-                failed: false,
-            });
-            self.next_id += 1;
-        }
-        let end = self.items.len();
+        self.insert(self.items.len(), sources)
+    }
+
+    /// Inserts `sources` before index `at` (clamped to the end) and returns
+    /// the indices they now occupy.
+    pub fn insert(&mut self, at: usize, sources: Vec<MediaSource>) -> std::ops::Range<usize> {
+        let start = at.min(self.items.len());
+        let new: Vec<PlaylistItem> = sources
+            .into_iter()
+            .map(|s| {
+                let id = self.next_id;
+                self.next_id += 1;
+                PlaylistItem { id, source: s, title: None, artist: None, duration: None, probed: false, failed: false }
+            })
+            .collect();
+        let n = new.len();
+        let end = start + n;
+        self.items.splice(start..start, new);
+        let shift = |i: usize| if i >= start { i + n } else { i };
+        self.current = self.current.map(shift);
         if self.shuffle {
+            for x in self.order.iter_mut() {
+                *x = shift(*x);
+            }
             // Insert the new items at random positions after the current one.
             let cur_pos =
                 self.current.and_then(|c| self.order.iter().position(|&x| x == c)).map(|p| p + 1).unwrap_or(0);
@@ -124,7 +133,7 @@ impl Playlist {
                 self.order.insert(at.min(self.order.len()), i);
             }
         } else {
-            self.order.extend(start..end);
+            self.order = (0..self.items.len()).collect();
         }
         start..end
     }
@@ -386,4 +395,63 @@ pub fn expand_paths(paths: &[PathBuf]) -> Vec<MediaSource> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pl(names: &[&str]) -> Playlist {
+        let mut p = Playlist::new(RepeatMode::Off, false);
+        p.add(names.iter().map(|n| MediaSource::File(PathBuf::from(n))).collect());
+        p
+    }
+
+    fn names(p: &Playlist) -> Vec<String> {
+        p.items.iter().map(|i| i.source.display_name()).collect()
+    }
+
+    #[test]
+    fn insert_in_the_middle_keeps_current() {
+        let mut p = pl(&["a", "b", "c"]);
+        p.current = Some(2);
+        let r = p.insert(1, vec![MediaSource::File("x".into()), MediaSource::File("y".into())]);
+        assert_eq!(r, 1..3);
+        assert_eq!(names(&p), ["a", "x", "y", "b", "c"]);
+        assert_eq!(p.current, Some(4));
+        assert_eq!(p.next_index(true), None);
+        p.current = Some(0);
+        assert_eq!(p.next_index(true), Some(1));
+    }
+
+    #[test]
+    fn insert_past_the_end_appends() {
+        let mut p = pl(&["a"]);
+        assert_eq!(p.insert(9, vec![MediaSource::File("b".into())]), 1..2);
+        assert_eq!(names(&p), ["a", "b"]);
+    }
+
+    #[test]
+    fn shuffled_insert_keeps_order_consistent() {
+        let mut p = pl(&["a", "b", "c", "d"]);
+        p.set_shuffle(true);
+        p.current = Some(3);
+        p.insert(0, vec![MediaSource::File("x".into()), MediaSource::File("y".into())]);
+        assert_eq!(p.current, Some(5));
+        let mut order = p.order.clone();
+        order.sort();
+        assert_eq!(order, (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn move_item_follows_current() {
+        let mut p = pl(&["a", "b", "c", "d"]);
+        p.current = Some(1);
+        p.move_item(1, 3);
+        assert_eq!(names(&p), ["a", "c", "d", "b"]);
+        assert_eq!(p.current, Some(3));
+        p.move_item(3, 0);
+        assert_eq!(names(&p), ["b", "a", "c", "d"]);
+        assert_eq!(p.current, Some(0));
+    }
 }

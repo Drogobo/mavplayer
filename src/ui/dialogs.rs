@@ -139,6 +139,7 @@ impl PlayerView {
                 }
                 None => self.osd("Couldn't understand that time", cx),
             },
+            "volume" => self.finish_volume_edit(true, window, cx),
             _ => self.close_dialog(window, cx),
         }
     }
@@ -911,7 +912,7 @@ impl PlayerView {
                     }, cx)))
                     .child(self.row("Deinterlacing", Some("Automatic only processes interlaced material (DVDs, TV)"), self.choice("deint", vec![("Automatic".into(), Deinterlace::Auto), ("Always".into(), Deinterlace::On), ("Off".into(), Deinterlace::Off)], s.deinterlace, |t, v, _| t.settings.deinterlace = v, cx)))
                     .child(self.toggle_row("tonemap", "HDR tone mapping", Some("Converts HDR10/HLG to standard range so it doesn't look washed out"), s.tone_map_hdr, |t, _| t.settings.tone_map_hdr = !t.settings.tone_map_hdr, cx))
-                    .child(self.row("Scaling quality", None, self.choice("scale", vec![("Fast (bilinear)".into(), ScaleQuality::Fast), ("Good (bicubic)".into(), ScaleQuality::Good), ("Best (Lanczos)".into(), ScaleQuality::Best)], s.scale_quality, |t, v, _| t.settings.scale_quality = v, cx)));
+                    .child(self.row("Scaling quality", None, self.choice("scale", vec![("Nearest neighbor".into(), ScaleQuality::Nearest), ("Linear".into(), ScaleQuality::Linear), ("Good (bicubic)".into(), ScaleQuality::Good), ("Best (Lanczos)".into(), ScaleQuality::Best)], s.scale_quality, |t, v, _| t.settings.scale_quality = v, cx)));
             }
             3 => {
                 let mut devs: Vec<(String, Option<String>)> = vec![("System default".into(), None)];
@@ -1149,7 +1150,7 @@ impl PlayerView {
             .flex()
             .h(px(520.))
             .child(self.tabs(SETTINGS_TABS, tab, Dialog::Settings, cx))
-            .child(div().id("settings-scroll").flex_1().overflow_y_scroll().child(c))
+            .child(div().id("settings-scroll").flex_1().min_w_0().overflow_y_scroll().child(c))
             .into_any_element();
         self.modal("Preferences", 820., body, None, cx)
     }
@@ -1480,7 +1481,7 @@ impl PlayerView {
             .flex()
             .h(px(480.))
             .child(self.tabs(EFFECT_TABS, tab, Dialog::Effects, cx))
-            .child(div().id("fx-scroll").flex_1().overflow_y_scroll().child(c))
+            .child(div().id("fx-scroll").flex_1().min_w_0().overflow_y_scroll().child(c))
             .into_any_element();
         self.modal("Effects & Filters", 760., body, None, cx)
     }

@@ -339,8 +339,15 @@ pub enum ChannelMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScaleQuality {
-    Fast,
+    /// Nearest neighbour: hard pixel edges, for pixel art and retro games.
+    /// Also used when enlarging, so pixels stay crisp at any size.
+    Nearest,
+    /// Bilinear. Saved settings from before used the name "Fast".
+    #[serde(alias = "Fast")]
+    Linear,
+    /// Bicubic.
     Good,
+    /// Lanczos.
     Best,
 }
 

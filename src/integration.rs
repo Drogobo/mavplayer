@@ -139,21 +139,20 @@ pub fn ensure_window_icon() {
     if !cfg!(target_os = "linux") || std::env::var_os("FLATPAK_ID").is_some() {
         return;
     }
-    let name = format!("{APP_ID}.desktop");
     let df = desktop_file();
     let user_entry = std::fs::read_to_string(&df).ok();
-    if let Some(text) = &user_entry {
-        if !text.contains("X-MavPlayer-IconOnly=true") {
-            return; // a real (integrated) entry
+    let icon_only = user_entry.as_deref().is_some_and(|t| t.contains("X-MavPlayer-IconOnly=true"));
+    if user_entry.is_some() && !icon_only {
+        return; // a real (integrated) entry
+    }
+    if system_entry_installed() {
+        // Installed from a package. A hidden entry left behind by an earlier
+        // portable run would shadow the package's entry (user entries win),
+        // hiding MavPlayer from menus and "Open With", so remove it.
+        if icon_only {
+            remove_icon_only_entry();
         }
-    } else {
-        let sys_dirs = std::env::var("XDG_DATA_DIRS")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-        if sys_dirs.split(':').any(|d| Path::new(d).join("applications").join(&name).exists()) {
-            return; // installed from a package
-        }
+        return;
     }
     let Some(exe) = appimage_path().or_else(|| std::env::current_exe().ok()) else { return };
     // An absolute icon path sidesteps icon-theme caches, so even the very
@@ -184,6 +183,30 @@ X-MavPlayer-IconOnly=true\n",
     if let Err(e) = write() {
         log::debug!("could not register window icon: {e}");
     }
+}
+
+/// Is there a `.desktop` entry for MavPlayer in a system data directory
+/// (from a deb, rpm or pkg.tar.zst)?
+fn system_entry_installed() -> bool {
+    let name = format!("{APP_ID}.desktop");
+    let sys_dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    sys_dirs.split(':').any(|d| Path::new(d).join("applications").join(&name).exists())
+}
+
+/// Deletes the hidden window-icon entry (and its icon) and refreshes the
+/// desktop's caches in the background so the package's entry takes over.
+fn remove_icon_only_entry() {
+    let df = desktop_file();
+    if let Err(e) = std::fs::remove_file(&df) {
+        log::debug!("could not remove {}: {e}", df.display());
+        return;
+    }
+    let _ = std::fs::remove_file(icon_files().remove(0));
+    log::info!("removed the window-icon entry {}; the installed one is used now", df.display());
+    std::thread::spawn(refresh_caches);
 }
 
 /// Marker so the first-run prompt is only shown once.

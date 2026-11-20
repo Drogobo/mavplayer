@@ -100,10 +100,16 @@ fn build_chain(
             let s = frame.raw().sample_aspect_ratio;
             if s.num > 0 && s.den > 0 { av::q2d(s) } else { info.sar }
         };
-        let (dw, dh) = super::present::output_size(frame.width(), frame.height(), sar, target);
+        let (dw, dh) = super::present::output_size(frame.width(), frame.height(), sar, target, false);
         let (dw, dh) = (dw & !1, dh & !1);
         if dw < frame.width() as u32 || dh < frame.height() as u32 {
-            f.push(format!("zscale=w={dw}:h={dh}:f=bilinear,setsar=1"));
+            let filter = match cfg.scale_quality {
+                ScaleQuality::Nearest => "point",
+                ScaleQuality::Linear => "bilinear",
+                ScaleQuality::Good => "bicubic",
+                ScaleQuality::Best => "lanczos",
+            };
+            f.push(format!("zscale=w={dw}:h={dh}:f={filter},setsar=1"));
         }
         f.push(
             "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
@@ -212,6 +218,7 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
 
         if !reported_fmt {
             reported_fmt = true;
+            log::debug!("startup: first video frame decoded at {:.0} ms", crate::ms_since_start());
             let (pf, cs, hdr) = (av::pix_fmt_name(frame.format()), color_desc(&frame), is_hdr(&frame));
             ctx.update_state(|st| {
                 if let Some(v) = st.video.as_mut() {

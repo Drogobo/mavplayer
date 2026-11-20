@@ -10,10 +10,10 @@ use crate::engine::{MediaSource, Status, SubContent, TrackKind};
 use crate::icons::Icon;
 use crate::settings::{RepeatMode, ScrollAction, SubStyle};
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, Corners, CursorStyle, Decorations, Div, ElementId, ExternalPaths, Hsla,
-    ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, RenderImage, ResizeEdge, Resource,
-    ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Window, WindowControlArea, canvas, div, img, point,
-    prelude::*, px, relative, rgba, size,
+    AnyElement, Bounds, ClickEvent, Context, Corners, CursorStyle, Decorations, Div, DragMoveEvent, ElementId,
+    ExternalPaths, Hsla, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, RenderImage,
+    ResizeEdge, Resource, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Window, WindowControlArea, canvas,
+    div, img, point, prelude::*, px, relative, rgba, size,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -21,6 +21,40 @@ use std::sync::Arc;
 
 const TITLEBAR_H: f32 = 34.0;
 const RESIZE_EDGE: f32 = 6.0;
+/// Playlist row height and the list's vertical padding (`py_1`).
+const ROW_H: f32 = 34.0;
+const LIST_PAD: f32 = 4.0;
+
+/// A playlist row being dragged to a new position.
+pub struct PlaylistDrag {
+    pub index: usize,
+    pub title: SharedString,
+}
+
+/// What follows the pointer while a playlist row is dragged.
+struct PlaylistDragPreview {
+    title: SharedString,
+    theme: Theme,
+}
+
+impl Render for PlaylistDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme;
+        div()
+            .max_w(px(280.))
+            .px_3()
+            .py_1()
+            .rounded(px(6.))
+            .bg(t.surface)
+            .border_1()
+            .border_color(t.accent)
+            .shadow_md()
+            .text_size(px(13.))
+            .text_color(t.text)
+            .truncate()
+            .child(self.title.clone())
+    }
+}
 
 /// Where the picture goes inside `area`.
 pub fn video_rect(area: Bounds<Pixels>, img: (u32, u32), aspect: Aspect, zoom: f32) -> Bounds<Pixels> {
@@ -104,7 +138,7 @@ impl PlayerView {
             .rounded(px(7.))
             .cursor_pointer()
             .text_size(px(13.))
-            .when(primary, |d| d.bg(t.accent).text_color(t.on_accent).hover(|s| s.opacity(0.9)))
+            .when(primary, |d| d.bg(t.brand(135.)).text_color(t.on_accent).hover(|s| s.opacity(0.9)))
             .when(!primary, |d| d.bg(t.surface_alt).border_1().border_color(t.border).hover(|s| s.bg(t.hover)))
             .child(label.into())
             .on_click(cx.listener(on_click))
@@ -124,37 +158,36 @@ impl PlayerView {
         let b2 = bounds.clone();
         let on_change: SliderFn = Rc::new(on_change);
         let v = value.clamp(0.0, 1.0);
-        let track = if vertical {
-            div()
-                .w(px(4.))
-                .h_full()
-                .rounded_full()
-                .bg(theme.track)
-                .relative()
-                .child(div().absolute().bottom_0().left_0().w_full().h(relative(v)).rounded_full().bg(theme.accent))
-        } else {
-            div()
-                .h(px(4.))
-                .w_full()
-                .rounded_full()
-                .bg(theme.track)
-                .relative()
-                .child(div().absolute().top_0().left_0().h_full().w(relative(v)).rounded_full().bg(theme.accent))
-        };
+        let track =
+            if vertical {
+                div().w(px(4.)).h_full().rounded_full().bg(theme.track).relative().child(
+                    div().absolute().bottom_0().left_0().w_full().h(relative(v)).rounded_full().bg(theme.brand(0.)),
+                )
+            } else {
+                div().h(px(4.)).w_full().rounded_full().bg(theme.track).relative().child(
+                    div().absolute().top_0().left_0().h_full().w(relative(v)).rounded_full().bg(theme.brand(90.)),
+                )
+            };
         let thumb = div().absolute().size(px(12.)).rounded_full().bg(gpui::white()).shadow_sm();
         let thumb = if vertical { thumb.bottom(relative(v)).mb(px(-6.)) } else { thumb.left(relative(v)).ml(px(-6.)) };
-        div()
-            .id(id)
+        // The track is inset by half the thumb so the thumb never pokes out
+        // of the slider (over neighbouring labels) at either end.
+        let inner = div()
             .relative()
             .flex()
             .items_center()
             .justify_center()
-            .cursor_pointer()
-            .when(vertical, |d| d.w(px(20.)).h_full())
-            .when(!vertical, |d| d.h(px(20.)).w_full())
+            .size_full()
             .child(canvas(move |b, _, _| b2.set(b), |_, _, _, _| {}).absolute().size_full())
             .child(track)
-            .child(thumb)
+            .child(thumb);
+        div()
+            .id(id)
+            .flex()
+            .cursor_pointer()
+            .when(vertical, |d| d.w(px(20.)).h_full().py(px(6.)))
+            .when(!vertical, |d| d.h(px(20.)).w_full().px(px(6.)))
+            .child(inner)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -848,7 +881,7 @@ impl PlayerView {
             .relative()
             .group_hover("seek", |s| s.h(px(6.)))
             .child(div().absolute().top_0().left_0().h_full().w(relative(cache)).rounded_full().bg(t.track))
-            .child(div().absolute().top_0().left_0().h_full().w(relative(frac)).rounded_full().bg(t.accent));
+            .child(div().absolute().top_0().left_0().h_full().w(relative(frac)).rounded_full().bg(t.brand(90.)));
         for c in chapters {
             track = track.child(div().absolute().top_0().left(relative(c)).w(px(2.)).h_full().bg(rgba(0x000000a0)));
         }
@@ -1032,7 +1065,8 @@ impl PlayerView {
                     .justify_center()
                     .rounded_full()
                     .cursor_pointer()
-                    .bg(t.accent)
+                    .bg(t.brand(180.))
+                    .shadow_sm()
                     .hover(|s| s.opacity(0.9))
                     .child(icon(pp_icon, px(18.), t.on_accent))
                     .tooltip(tooltip("Play / Pause (Space)", t))
@@ -1188,7 +1222,38 @@ impl PlayerView {
                 move |this, f, _, cx| this.set_volume(f as f64 * max_vol as f64, cx),
                 cx,
             )))
-            .child(div().w(px(40.)).text_size(px(11.)).text_color(t.text_dim).child(format!("{:.0}%", vol * 100.0)));
+            .child(div().w(px(4.)))
+            .child(match self.inputs.get("volume").filter(|_| self.editing_volume) {
+                Some(input) => div()
+                    .w(px(44.))
+                    .h(px(22.))
+                    .px_1()
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .bg(t.surface_alt)
+                    .border_1()
+                    .border_color(t.accent)
+                    .text_size(px(11.))
+                    .child(input.clone())
+                    .into_any_element(),
+                None => div()
+                    .id("volume-text")
+                    .w(px(44.))
+                    .text_size(px(11.))
+                    .text_color(t.text_dim)
+                    .cursor_pointer()
+                    .child(format!("{:.0}%", vol * 100.0))
+                    .tooltip(tooltip("Double-click to type a volume", t))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        if ev.click_count() >= 2 {
+                            this.start_volume_edit(window, cx);
+                        }
+                    }))
+                    .into_any_element(),
+            });
 
         div()
             .id(if overlay { "controls-overlay" } else { "controls" })
@@ -1282,6 +1347,7 @@ impl PlayerView {
 
         let current = self.playlist.current;
         let selected = self.playlist_selected;
+        let drop_at = self.pl_drop;
         let list = gpui::uniform_list(
             "playlist-items",
             count,
@@ -1293,9 +1359,23 @@ impl PlayerView {
                         let is_cur = current == Some(i);
                         let title = it.display_title();
                         let dur = it.duration.map(format_time).unwrap_or_default();
+                        let dragging = cx.has_active_drag();
+                        let marker = |top: bool| {
+                            div()
+                                .absolute()
+                                .left_1()
+                                .right_1()
+                                .h(px(2.))
+                                .rounded_full()
+                                .bg(t.accent)
+                                .when(top, |d| d.top(px(-1.)))
+                                .when(!top, |d| d.bottom(px(-1.)))
+                        };
+                        let drag_value = PlaylistDrag { index: i, title: title.clone().into() };
                         div()
                             .id(("pl-row", i))
-                            .h(px(34.))
+                            .relative()
+                            .h(px(ROW_H))
                             .w_full()
                             .px_2()
                             .flex()
@@ -1335,6 +1415,12 @@ impl PlayerView {
                                     .child(title),
                             )
                             .child(div().text_size(px(11.)).text_color(t.text_dim).child(dur))
+                            .when(dragging && drop_at == Some(i), |d| d.child(marker(true)))
+                            .when(dragging && i + 1 == count && drop_at == Some(count), |d| d.child(marker(false)))
+                            .on_drag(drag_value, move |d, _, _, cx| {
+                                let title = d.title.clone();
+                                cx.new(|_| PlaylistDragPreview { title, theme: t })
+                            })
                             .on_click(cx.listener(move |this, ev: &ClickEvent, w, cx| {
                                 this.playlist_selected = Some(i);
                                 if ev.click_count() >= 2 {
@@ -1355,8 +1441,35 @@ impl PlayerView {
                     .collect::<Vec<_>>()
             }),
         )
+        .track_scroll(self.pl_scroll.clone())
         .flex_1()
-        .px_1();
+        .px_1()
+        .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<ExternalPaths>, _, cx| {
+            this.update_playlist_drop(ev.bounds, ev.event.position, cx);
+        }))
+        .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<PlaylistDrag>, _, cx| {
+            this.update_playlist_drop(ev.bounds, ev.event.position, cx);
+        }))
+        .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+            let at = this.pl_drop.take().unwrap_or(this.playlist.items.len());
+            this.dropping = false;
+            let paths = paths.paths().to_vec();
+            if let Some(d) = paths.first().and_then(|p| p.parent()) {
+                this.settings.last_dir = Some(d.to_path_buf());
+            }
+            let sources = crate::playlist::expand_paths(&paths);
+            this.enqueue_at(at, sources, window, cx);
+            cx.notify();
+        }))
+        .on_drop(cx.listener(|this, d: &PlaylistDrag, _, cx| {
+            let at = this.pl_drop.take().unwrap_or(this.playlist.items.len());
+            // `at` is an insertion point; once the item is taken out, the
+            // points after it shift up by one.
+            let to = if at > d.index { at - 1 } else { at }.min(this.playlist.items.len().saturating_sub(1));
+            this.playlist.move_item(d.index, to);
+            this.playlist_selected = Some(to);
+            cx.notify();
+        }));
 
         let body: AnyElement = if count == 0 {
             div()
@@ -1388,6 +1501,22 @@ impl PlayerView {
             .child(header)
             .child(body)
             .into_any_element()
+    }
+
+    /// Works out where a drag over the playlist would insert (between rows,
+    /// nearest gap to the pointer).
+    fn update_playlist_drop(&mut self, bounds: Bounds<Pixels>, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let at = if bounds.contains(&pos) {
+            let scroll = self.pl_scroll.0.borrow().base_handle.offset().y;
+            let y = f32::from(pos.y - bounds.top() - scroll) - LIST_PAD;
+            Some(((y / ROW_H).round().max(0.0) as usize).min(self.playlist.items.len()))
+        } else {
+            None
+        };
+        if at != self.pl_drop {
+            self.pl_drop = at;
+            cx.notify();
+        }
     }
 
     fn playlist_item_menu(&self, i: usize) -> Vec<M> {
@@ -1430,7 +1559,7 @@ impl Render for PlayerView {
         let fullscreen = window.is_fullscreen();
         let client_decor = matches!(window.window_decorations(), Decorations::Client { .. }) && !fullscreen;
         let show_menubar = self.settings.show_menubar && !fullscreen && !cfg!(target_os = "macos");
-        let overlay_open = self.dialog.is_some() || self.menu.is_some();
+        let overlay_open = self.dialog.is_some() || self.menu.is_some() || self.editing_volume;
 
         let main = div()
             .flex_1()

@@ -91,6 +91,11 @@ impl log::Log for StderrLog {
 
 pub static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// Milliseconds since launch, for the startup timings printed with `-v`.
+pub fn ms_since_start() -> f64 {
+    START.get().map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
+}
+
 fn exit_with(r: anyhow::Result<String>) -> ! {
     match r {
         Ok(msg) => {
@@ -113,8 +118,11 @@ fn main() {
     }
     engine::init(verbose);
 
+    // Start opening the first file now: it decodes while GPUI brings up the GPU.
+    let boot = ui::player::Boot::start(args.sources);
     integration::ensure_window_icon();
     let app = Application::new().with_assets(icons::Assets);
+    log::debug!("startup: GPU and platform ready at {:.0} ms", ms_since_start());
     // Files opened from Finder / the dock while running (and URL schemes).
     app.on_open_urls(|urls| {
         let _ = ui::player::OPEN_REQUESTS.lock().map(|mut q| q.extend(urls));
@@ -125,9 +133,8 @@ fn main() {
         #[cfg(target_os = "macos")]
         ui::actions::set_native_menus(cx);
 
-        let saved = settings::Settings::load();
-        let fullscreen = args.fullscreen || saved.start_fullscreen;
-        let (w, h) = saved.window_size.unwrap_or((960.0, 600.0));
+        let fullscreen = args.fullscreen || boot.settings.start_fullscreen;
+        let (w, h) = boot.settings.window_size.unwrap_or((960.0, 600.0));
         let bounds = Bounds::centered(None, size(px(w.max(480.0)), px(h.max(320.0))), cx);
         let options = WindowOptions {
             window_bounds: Some(if fullscreen {
@@ -147,9 +154,9 @@ fn main() {
             show: true,
             ..Default::default()
         };
-        let sources = args.sources;
+        log::debug!("startup: opening window at {:.0} ms", ms_since_start());
         let window =
-            cx.open_window(options, move |window, cx| cx.new(|cx| ui::player::PlayerView::new(window, cx, sources)));
+            cx.open_window(options, move |window, cx| cx.new(|cx| ui::player::PlayerView::new(window, cx, boot)));
         if let Err(e) = window {
             eprintln!("mavplayer: could not open a window: {e:#}");
             cx.quit();
@@ -163,5 +170,6 @@ fn main() {
         })
         .detach();
         cx.activate(true);
+        log::debug!("startup: window open at {:.0} ms", ms_since_start());
     });
 }
