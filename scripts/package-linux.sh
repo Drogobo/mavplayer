@@ -81,6 +81,15 @@ if want appimage; then
         --custom-apprun packaging/appimage/AppRun \
         --exclude-library 'libpipewire-0.3.so*' \
         --output appimage
+    # The update information above makes appimagetool write a .zsync (block
+    # checksums AppImage updaters use for delta downloads), but into the
+    # current directory. It belongs in the release next to the AppImage, or
+    # updaters find nothing.
+    ZSYNC=MavPlayer-$VERSION-$ARCH.AppImage.zsync
+    if [ -f "$ROOT/$ZSYNC" ]; then
+        mv -f "$ROOT/$ZSYNC" "$DIST/"
+    fi
+    [ -f "$DIST/$ZSYNC" ] || { echo "error: appimagetool wrote no $ZSYNC" >&2; exit 1; }
 fi
 
 echo ">> packages in $DIST:"
