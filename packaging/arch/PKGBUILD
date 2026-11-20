@@ -11,7 +11,7 @@ pkgdesc="Fast, native media player for video, music, streams and DVDs"
 arch=('x86_64' 'aarch64')
 url="https://github.com/Drogobo/mavplayer"
 license=('GPL-3.0-or-later')
-depends=('ffmpeg>=2:9' 'alsa-lib' 'libxkbcommon' 'libxkbcommon-x11' 'libxcb' 'vulkan-icd-loader'
+depends=('ffmpeg>=2:9' 'libpipewire' 'alsa-lib' 'libxkbcommon' 'libxkbcommon-x11' 'libxcb' 'vulkan-icd-loader'
          'fontconfig' 'freetype2' 'wayland' 'hicolor-icon-theme')
 makedepends=('cargo' 'clang' 'git' 'pkgconf')
 optdepends=('libdvdcss: play encrypted DVDs'

@@ -18,6 +18,7 @@ use gpui::{
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const TITLEBAR_H: f32 = 34.0;
 const RESIZE_EDGE: f32 = 6.0;
@@ -502,10 +503,17 @@ impl PlayerView {
                 }
                 if ev.click_count() == 2 && this.settings.double_click_fullscreen {
                     window.toggle_fullscreen();
-                    if this.settings.single_click_pause {
-                        this.player.toggle_pause();
+                    // Undo the first click's pause toggle by restoring the
+                    // state from before it. Toggling again would leave the
+                    // video paused whenever the first click didn't toggle
+                    // (a menu swallowed it, the file was still loading).
+                    if let Some((was_paused, at)) = this.click_pause.take()
+                        && at.elapsed() < Duration::from_millis(600)
+                    {
+                        this.player.set_paused(was_paused);
                     }
                 } else if ev.click_count() == 1 && this.settings.single_click_pause && this.player.is_active() {
+                    this.click_pause = Some((this.player.paused(), Instant::now()));
                     this.player.toggle_pause();
                 }
                 window.focus(&this.focus);

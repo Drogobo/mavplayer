@@ -3,7 +3,9 @@
 /dist
 /.flatpak-builder
 /packaging/flatpak/cargo-sources.json
+# AppImage output and its update-info file (scripts/package-linux.sh)
 *.AppImage
+*.AppImage.zsync
 # makepkg work folders and output (packaging/arch)
 /packaging/arch/src/
 /packaging/arch/pkg/

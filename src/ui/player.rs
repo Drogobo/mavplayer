@@ -94,6 +94,9 @@ pub struct PlayerView {
     pub subs: Vec<SubEvent>,
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub sent_target: (u32, u32),
+    /// Pause state just before the last single-click pause toggle, so the
+    /// second click of a double-click can put it back.
+    pub click_pause: Option<(bool, Instant)>,
 
     // Interface state
     pub last_activity: Instant,
@@ -256,6 +259,7 @@ impl PlayerView {
             subs: Vec::new(),
             video_bounds: Rc::new(Cell::new(Bounds::default())),
             sent_target: (0, 0),
+            click_pause: None,
             last_activity: Instant::now(),
             pointer_over_controls: false,
             osd: None,

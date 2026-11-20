@@ -18,7 +18,8 @@ finish-args:
   - --socket=fallback-x11
   - --share=ipc
   - --device=all            # GPU decoding and optical drives
-  - --socket=pulseaudio
+  - --filesystem=xdg-run/pipewire-0   # native PipeWire audio
+  - --socket=pulseaudio     # fallback when PipeWire is missing
   - --share=network         # network streams
   - --filesystem=host:ro    # open files, sidecar subtitles, DVD folders
   - --filesystem=xdg-pictures/MavPlayer:create   # screenshots

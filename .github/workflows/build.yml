@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf ffmpeg \
-            alsa-lib libxkbcommon libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig
+            alsa-lib libpipewire libxkbcommon libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig
       - uses: actions/checkout@v7
         timeout-minutes: 15   # a stuck fetch otherwise waits for the job limit
         with: { submodules: true }
@@ -43,7 +43,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang nasm meson ninja-build pkg-config \
             autoconf automake libtool curl file \
-            libssl-dev zlib1g-dev libva-dev libasound2-dev \
+            libssl-dev zlib1g-dev libva-dev libasound2-dev libpipewire-0.3-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev \
             libfontconfig1-dev libfreetype-dev libvulkan-dev
       - uses: dtolnay/rust-toolchain@stable
@@ -81,7 +81,7 @@ jobs:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust clang pkgconf ffmpeg sudo \
-            alsa-lib libxkbcommon libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig freetype2 hicolor-icon-theme
+            alsa-lib libpipewire libxkbcommon libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig freetype2 hicolor-icon-theme
           useradd -m builder
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
       - uses: actions/checkout@v7

@@ -70,11 +70,14 @@ if want appimage; then
     export ARCH VERSION
     export LDAI_OUTPUT="$DIST/MavPlayer-$VERSION-$ARCH.AppImage"
     export LDAI_UPDATE_INFORMATION="gh-releases-zsync|Drogobo|mavplayer|latest|MavPlayer-*-$ARCH.AppImage.zsync"
+    # libpipewire must come from the host: a bundled copy looks for its
+    # modules in the build machine's paths and fails to reach the server.
     "$LINUXDEPLOY" --appdir "$APPDIR" \
         --executable "$APPDIR/usr/bin/mavplayer" \
         --desktop-file packaging/linux/io.github.drogobo.MavPlayer.desktop \
         --icon-file packaging/linux/io.github.drogobo.MavPlayer.svg \
         --custom-apprun packaging/appimage/AppRun \
+        --exclude-library 'libpipewire-0.3.so*' \
         --output appimage
 fi
 

@@ -40,9 +40,9 @@ You need:
 
 | System | Install |
 | --- | --- |
-| Arch / CachyOS / Manjaro | `sudo pacman -S rust clang pkgconf ffmpeg alsa-lib libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig` |
-| Fedora (RPM Fusion for FFmpeg 9) | `sudo dnf install rust cargo clang pkgconf ffmpeg-devel alsa-lib-devel libxkbcommon-x11-devel libxcb-devel wayland-devel vulkan-loader-devel fontconfig-devel` |
-| Debian / Ubuntu | `sudo apt install build-essential clang pkg-config libasound2-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev libfontconfig1-dev`, then build FFmpeg 9 with `scripts/build-ffmpeg.sh` (distribution FFmpeg is usually older) |
+| Arch / CachyOS / Manjaro | `sudo pacman -S rust clang pkgconf ffmpeg libpipewire alsa-lib libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig` |
+| Fedora (RPM Fusion for FFmpeg 9) | `sudo dnf install rust cargo clang pkgconf ffmpeg-devel pipewire-devel alsa-lib-devel libxkbcommon-x11-devel libxcb-devel wayland-devel vulkan-loader-devel fontconfig-devel` |
+| Debian / Ubuntu | `sudo apt install build-essential clang pkg-config libpipewire-0.3-dev libasound2-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev libfontconfig1-dev`, then build FFmpeg 9 with `scripts/build-ffmpeg.sh` (distribution FFmpeg is usually older) |
 | macOS | `xcode-select --install`, `brew install ffmpeg pkg-config` |
 | Windows | Rust (MSVC), [LLVM](https://github.com/llvm/llvm-project/releases) (set `LIBCLANG_PATH`), and an FFmpeg 9 "shared" build such as BtbN's `ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip` with `FFMPEG_DIR` pointing at it; put its `bin` folder on `PATH` to run |
 
@@ -224,7 +224,9 @@ demux.rs  ──────┼──────────── audio packet
                                                     │
 present.rs: picks the frame due now (relative to the master clock), converts it
             to BGRA with swscale at display size, hands it to the UI.
-audio.rs:   cpal output callback pulls samples and drives the master clock.
+audio.rs:   output callback pulls samples and drives the master clock: native
+            PipeWire on Linux (audio/pw_out.rs), cpal elsewhere and as the
+            ALSA fallback.
 ```
 
 - **`types.rs`**: public data types (`MediaSource`, `MediaInfo`, `Track`,

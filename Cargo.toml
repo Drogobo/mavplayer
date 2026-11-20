@@ -35,6 +35,11 @@ serde_json = "1"
 dirs = "6"
 unicode-segmentation = "1"
 
+# Native PipeWire audio output (cpal's ALSA host is the fallback).
+[target.'cfg(target_os = "linux")'.dependencies]
+# v0_3_44: target.object (PipeWire 0.3.44+; CI builds on Ubuntu 22.04, which has 0.3.48).
+pipewire = { version = "0.10", features = ["v0_3_44"] }
+
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 

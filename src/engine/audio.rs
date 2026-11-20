@@ -1,5 +1,9 @@
 //! Audio: decode → libavfilter (effects, tempo, format conversion) → sample
-//! buffer → cpal device callback. The callback drives the master clock.
+//! buffer → output callback (PipeWire natively on Linux, otherwise cpal).
+//! The callback drives the master clock.
+
+#[cfg(target_os = "linux")]
+mod pw_out;
 
 use super::SessionCtx;
 use super::av::{self, Frame, ff};
@@ -143,6 +147,10 @@ fn find_device(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
 }
 
 pub fn list_devices() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    if let Some(v) = pw_out::list_devices() {
+        return v;
+    }
     let host = cpal::default_host();
     let mut v: Vec<String> = host
         .output_devices()
@@ -227,6 +235,28 @@ pub fn open_output(
     let handle = std::thread::Builder::new().name("audio-out".into()).spawn(move || {
         let ctx = c;
         let stop = s;
+        #[cfg(target_os = "linux")]
+        {
+            let ready = |fmt: &OutFormat| {
+                if cl.swap(true, Ordering::AcqRel) {
+                    log::warn!("audio device opened after the timeout; not using it for this file");
+                    return false;
+                }
+                let _ = tx.send(fmt.clone());
+                true
+            };
+            match pw_out::run(&ctx, &stop, device_name.as_deref(), mode, media_channels, ready) {
+                Ok(pw_out::Outcome::Stopped) => return,
+                Ok(pw_out::Outcome::Failed(fmt, why)) => {
+                    log::warn!("{why}; continuing silently");
+                    ctx.emit(PlayerEvent::Warning("The audio device stopped responding; playing without sound".into()));
+                    null_sink(&ctx, &stop, fmt);
+                    return;
+                }
+                // No PipeWire server: fall through to ALSA.
+                Err(e) => log::info!("PipeWire unavailable ({e:#}); using ALSA"),
+            }
+        }
         let started = start_device(&ctx, device_name.as_deref(), mode, media_channels);
         if cl.swap(true, Ordering::AcqRel) {
             // Took too long; playback already continued without this device.

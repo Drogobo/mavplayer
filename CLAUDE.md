@@ -41,7 +41,8 @@ The engine is an ffplay-style threaded pipeline, one set of threads per playback
 - `demux.rs` reads packets and routes them into per-kind `PacketQueue`s. It also handles seeks, track switches, pause, back-pressure and EOF.
 - `video.rs`, `audio.rs` and `subs.rs` decode on their own threads. Video and audio frames pass through libavfilter graphs built from the current settings (`filters.rs`).
 - `present.rs` picks the frame due now against the master clock (`compute_target_delay`), converts it with swscale to BGRA at display size, and hands it to the UI.
-- The cpal output callback in `audio.rs` consumes samples and **drives the master clock**. Video is the master only when there is no audio.
+- The audio output callback consumes samples and **drives the master clock**. Video is the master only when there is no audio.
+  - On Linux it is a native PipeWire stream (`audio/pw_out.rs`: proper channel positions, exact delay, "MavPlayer" in mixers). cpal is the fallback when no PipeWire server is running (ALSA), and the backend on Windows and macOS.
 
 Key invariants that span files:
 
