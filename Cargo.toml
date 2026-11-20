@@ -12,7 +12,7 @@ keywords = ["media-player", "video", "audio", "dvd", "ffmpeg"]
 categories = ["multimedia::video", "multimedia::audio"]
 # Keep build output and packaging work folders out of the package (and out of
 # Cargo's file scan; makepkg's pkg/ folder is unreadable while it builds).
-exclude = ["/packaging/arch/src", "/packaging/arch/pkg", "/ffmpeg-build", "/dist", "/.flatpak-builder"]
+exclude = ["/packaging/arch/src", "/packaging/arch/pkg", "/ffmpeg-build", "/spa-headers", "/dist", "/.flatpak-builder"]
 
 [features]
 default = []

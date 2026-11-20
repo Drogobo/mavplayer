@@ -123,6 +123,11 @@ scripts/package-linux.sh appimage   # or just one: deb | rpm | appimage
   because the AppImage needs a glibc at least as new as the build machine's.
 - `MAVPLAYER_DYNAMIC_FFMPEG=1 scripts/package-linux.sh` links the system FFmpeg
   instead (for distribution-specific packages).
+- **Old PipeWire (Ubuntu 22.04's 0.3.48):** the `libspa` crate needs newer SPA
+  headers. `scripts/spa-headers.sh` puts PipeWire 1.2.7's into `spa-headers/`;
+  put `$PWD/spa-headers/lib/pkgconfig` first in `PKG_CONFIG_PATH`. SPA is
+  header-only and its audio structs haven't changed, so the binary still runs
+  with the system's older PipeWire.
 
 **AppImage desktop integration** lives in the app itself, in
 [`src/integration.rs`](src/integration.rs). When the app runs from an AppImage

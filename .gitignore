@@ -1,5 +1,6 @@
 /target
 /ffmpeg-build
+/spa-headers
 /dist
 /.flatpak-builder
 /packaging/flatpak/cargo-sources.json

@@ -62,9 +62,13 @@ jobs:
         run: scripts/build-ffmpeg.sh
       - name: Install packaging tools
         run: cargo install --locked cargo-deb cargo-generate-rpm
+      - name: Newer SPA headers
+        # Ubuntu 22.04's PipeWire 0.3.48 headers are too old for the libspa
+        # crate; see the script.
+        run: scripts/spa-headers.sh
       - name: Package
         run: |
-          export PKG_CONFIG_PATH=$PWD/ffmpeg-build/prefix/lib/pkgconfig
+          export PKG_CONFIG_PATH=$PWD/spa-headers/lib/pkgconfig:$PWD/ffmpeg-build/prefix/lib/pkgconfig
           scripts/package-linux.sh
       - uses: actions/upload-artifact@v7
         with:

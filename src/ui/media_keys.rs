@@ -128,7 +128,8 @@ impl MediaKeys {
 #[cfg(windows)]
 fn native_handle(window: &Window) -> Option<*mut std::ffi::c_void> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    match window.window_handle().ok()?.as_raw() {
+    // Spelled out: gpui's own `Window::window_handle` returns its window id.
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(h.hwnd.get() as *mut std::ffi::c_void),
         _ => None,
     }
