@@ -28,8 +28,9 @@ video/x-m4v;video/x-matroska;video/x-mpeg2;video/x-mpeg3;video/x-ms-afs;video/x-
 video/x-ms-wmx;video/x-ms-wvxvideo;video/x-msvideo;video/x-ogm+ogg;video/x-theora;video/x-theora+ogg;\
 x-content/video-dvd;x-scheme-handler/dvd;";
 
-/// The .desktop entry. `exec` is the program to run.
-pub fn desktop_entry(exec: &str, extra: &str) -> String {
+/// The .desktop entry. `exec` is the program to run, already quoted for
+/// an `Exec` key ([`quote_exec`]); `tryexec` is its plain path.
+pub fn desktop_entry(exec: &str, tryexec: &str, extra: &str) -> String {
     format!(
         "[Desktop Entry]\n\
 Type=Application\n\
@@ -51,7 +52,7 @@ Actions=OpenDisc;\n\
 [Desktop Action OpenDisc]\n\
 Name=Play DVD\n\
 Exec={exec} dvd://\n",
-        tryexec = exec.trim_matches('"'),
+        tryexec = escape_value(tryexec),
     )
 }
 
@@ -81,20 +82,51 @@ pub fn is_integrated() -> bool {
     std::fs::read_to_string(desktop_file()).map(|s| s.contains("X-MavPlayer-Integrated=true")).unwrap_or(false)
 }
 
-fn quote_exec(p: &Path) -> String {
-    let s = p.display().to_string();
-    if s.contains([' ', '"', '\'', '\\', '$']) {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$"))
-    } else {
-        s
-    }
+/// Escapes a value for a .desktop file (the "string" type).
+fn escape_value(s: &str) -> String {
+    s.replace('\\', "\\\\")
 }
 
-pub fn integrate() -> anyhow::Result<PathBuf> {
+/// Quotes a program path for an `Exec` key, per the Desktop Entry spec:
+/// reserved characters need double quotes, inside which `"`, `` ` ``, `$` and
+/// `\` take a backslash; `%` is doubled (field codes), and finally the
+/// general string escaping doubles every backslash again.
+fn quote_exec(p: &Path) -> String {
+    let s = p.display().to_string();
+    let reserved = |c: char| " \t\n\"'\\><~|&;$*?#()`".contains(c);
+    let quoted = if s.contains(reserved) {
+        let mut q = String::from("\"");
+        for c in s.chars() {
+            if matches!(c, '"' | '`' | '$' | '\\') {
+                q.push('\\');
+            }
+            q.push(c);
+        }
+        q.push('"');
+        q
+    } else {
+        s
+    };
+    escape_value(&quoted.replace('%', "%%"))
+}
+
+/// The executable to put in a .desktop entry. Paths with control characters
+/// (a line break would start a new key) can't be written safely.
+fn entry_exe() -> anyhow::Result<PathBuf> {
     let exe = appimage_path()
         .or_else(|| std::env::current_exe().ok())
         .ok_or_else(|| anyhow::anyhow!("cannot find executable path"))?;
-    let entry = desktop_entry(&quote_exec(&exe), "X-MavPlayer-Integrated=true\n");
+    anyhow::ensure!(
+        !exe.to_string_lossy().chars().any(char::is_control),
+        "the program's path contains control characters: {}",
+        exe.display()
+    );
+    Ok(exe)
+}
+
+pub fn integrate() -> anyhow::Result<PathBuf> {
+    let exe = entry_exe()?;
+    let entry = desktop_entry(&quote_exec(&exe), &exe.display().to_string(), "X-MavPlayer-Integrated=true\n");
     let df = desktop_file();
     std::fs::create_dir_all(df.parent().unwrap())?;
     std::fs::write(&df, entry)?;
@@ -154,7 +186,7 @@ pub fn ensure_window_icon() {
         }
         return;
     }
-    let Some(exe) = appimage_path().or_else(|| std::env::current_exe().ok()) else { return };
+    let Ok(exe) = entry_exe() else { return };
     // An absolute icon path sidesteps icon-theme caches, so even the very
     // first window gets the icon.
     let svg = icon_files().remove(0);
@@ -168,7 +200,7 @@ Exec={exec} %U\n\
 NoDisplay=true\n\
 StartupWMClass={APP_ID}\n\
 X-MavPlayer-IconOnly=true\n",
-        icon = svg.display(),
+        icon = escape_value(&svg.display().to_string()),
         exec = quote_exec(&exe)
     );
     if user_entry.as_deref() == Some(entry.as_str()) && svg.exists() {
@@ -212,4 +244,19 @@ fn remove_icon_only_entry() {
 /// Marker so the first-run prompt is only shown once.
 pub fn prompt_marker() -> PathBuf {
     crate::settings::config_dir().join("appimage-integration-asked")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_quoting_follows_the_spec() {
+        assert_eq!(quote_exec(Path::new("/opt/MavPlayer.AppImage")), "/opt/MavPlayer.AppImage");
+        assert_eq!(quote_exec(Path::new("/home/a b/M.AppImage")), r#""/home/a b/M.AppImage""#);
+        // `$` and `` ` `` are escaped inside quotes, then the backslash itself is doubled.
+        assert_eq!(quote_exec(Path::new("/x/$(id)`id`.AppImage")), r#""/x/\\$(id)\\`id\\`.AppImage""#);
+        assert_eq!(quote_exec(Path::new("/x/50%.AppImage")), "/x/50%%.AppImage");
+        assert_eq!(quote_exec(Path::new(r"/x/a\b c")), r#""/x/a\\\\b c""#);
+    }
 }

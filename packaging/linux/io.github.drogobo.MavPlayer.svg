@@ -21,9 +21,9 @@
      inkscape:pageopacity="0"
      inkscape:pagecheckerboard="0"
      inkscape:deskcolor="#505050"
-     inkscape:zoom="2.2732378"
-     inkscape:cx="32.332737"
-     inkscape:cy="86.000681"
+     inkscape:zoom="1.1366189"
+     inkscape:cx="58.506857"
+     inkscape:cy="127.13144"
      inkscape:window-width="1920"
      inkscape:window-height="1010"
      inkscape:window-x="0"
@@ -63,10 +63,12 @@
     </linearGradient>
     <linearGradient
        id="ring"
-       x1="0"
-       y1="0"
-       x2="1"
-       y2="1">
+       x1="46.08317"
+       y1="46.08317"
+       x2="209.91683"
+       y2="209.91683"
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="matrix(0.94922408,0,0,0.94922408,6.4993163,6.4993163)">
       <stop
          offset="0"
          stop-color="#ffffff"
@@ -86,7 +88,18 @@
        y1="161.23528"
        x2="161.23538"
        y2="94.764557"
-       gradientUnits="userSpaceOnUse" />
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="matrix(1.5040778,0,0,1.5040778,-64.521959,-64.521959)" />
+    <linearGradient
+       inkscape:collect="always"
+       xlink:href="#ring"
+       id="linearGradient1"
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="matrix(0.36316357,0,0,0.36316357,81.515058,81.515058)"
+       x1="46.08317"
+       y1="46.08317"
+       x2="209.91683"
+       y2="209.91683" />
   </defs>
   <rect
      x="16"
@@ -96,6 +109,31 @@
      rx="52"
      fill="url(#bg)"
      id="rect4" />
+  <circle
+     cx="128"
+     cy="128"
+     r="28.326759"
+     fill="none"
+     stroke="url(#ring)"
+     stroke-width="9.99998"
+     id="circle1"
+     style="stroke:url(#linearGradient1)" />
+  <path
+     id="circle6"
+     style="fill:#373737;fill-opacity:1;stroke-width:1"
+     d="M 128,40.763484 A 87.23651,87.23651 0 0 0 40.763484,128 87.23651,87.23651 0 0 0 128,215.2365 87.23651,87.23651 0 0 0 215.2365,128 87.23651,87.23651 0 0 0 128,40.763484 Z m 0,56.050395 A 31.184724,31.184724 0 0 1 159.18611,128 31.184724,31.184724 0 0 1 128,159.18611 31.184724,31.184724 0 0 1 96.813879,128 31.184724,31.184724 0 0 1 128,96.813879 Z" />
+  <path
+     id="circle7"
+     style="fill:url(#linearGradient10);fill-opacity:0.433432;stroke-width:1"
+     d="M 128,57.305402 A 70.695373,70.695373 0 0 0 57.305402,128 70.695373,70.695373 0 0 0 128,198.69458 70.695373,70.695373 0 0 0 198.69458,128 70.695373,70.695373 0 0 0 128,57.305402 Z m 0,17.531906 A 53.161762,53.161762 0 0 1 181.16267,128 53.161762,53.161762 0 0 1 128,181.16267 53.161762,53.161762 0 0 1 74.837308,128 53.161762,53.161762 0 0 1 128,74.837308 Z" />
+  <circle
+     cx="128"
+     cy="128"
+     r="14.275479"
+     fill="#000000"
+     fill-opacity="0.18"
+     id="circle10"
+     style="fill:#000000;fill-opacity:1;stroke-width:0.999997" />
   <rect
      x="15.999997"
      y="16"
@@ -105,28 +143,4 @@
      fill="#ffffff"
      fill-opacity="0.08"
      id="rect5" />
-  <circle
-     cx="128"
-     cy="128"
-     r="78"
-     fill="none"
-     stroke="url(#ring)"
-     stroke-width="10"
-     id="circle5" />
-  <path
-     id="circle6"
-     style="fill:#373737;fill-opacity:1"
-     d="M 128 70 A 58 58 0 0 0 70 128 A 58 58 0 0 0 128 186 A 58 58 0 0 0 186 128 A 58 58 0 0 0 128 70 z M 128 107.26562 A 20.733452 20.733452 0 0 1 148.73438 128 A 20.733452 20.733452 0 0 1 128 148.73438 A 20.733452 20.733452 0 0 1 107.26562 128 A 20.733452 20.733452 0 0 1 128 107.26562 z " />
-  <path
-     id="circle7"
-     style="stroke-width:1;fill:url(#linearGradient10);fill-opacity:0.43343195"
-     d="M 128 80.998047 A 47.002472 47.002472 0 0 0 80.998047 128 A 47.002472 47.002472 0 0 0 128 175.00195 A 47.002472 47.002472 0 0 0 175.00195 128 A 47.002472 47.002472 0 0 0 128 80.998047 z M 128 92.654297 A 35.345089 35.345089 0 0 1 163.3457 128 A 35.345089 35.345089 0 0 1 128 163.3457 A 35.345089 35.345089 0 0 1 92.654297 128 A 35.345089 35.345089 0 0 1 128 92.654297 z " />
-  <circle
-     cx="128"
-     cy="128"
-     r="9.4911842"
-     fill="#000000"
-     fill-opacity="0.18"
-     id="circle10"
-     style="fill:#000000;fill-opacity:1;stroke-width:0.999997" />
 </svg>

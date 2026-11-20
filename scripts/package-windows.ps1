@@ -39,6 +39,7 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 Copy-Item target\release\mavplayer.exe $stage
 Copy-Item (Join-Path $env:FFMPEG_DIR "bin\*.dll") $stage
 Copy-Item LICENSE, README.md $stage
+Copy-Item third_party\shaders\LICENSES.txt (Join-Path $stage "SHADER-LICENSES.txt")
 @"
 MavPlayer $version for Windows
 
@@ -46,7 +47,8 @@ Run mavplayer.exe. Everything it needs is in this folder; settings are kept in
 %APPDATA%\mavplayer.
 
 MavPlayer is free software under the GNU GPL v3 or later (see LICENSE);
-source: https://github.com/Drogobo/mavplayer. The bundled FFmpeg libraries
+source: https://github.com/Drogobo/mavplayer. The GPU shaders built into it
+are MIT and LGPL-3.0 licensed (see SHADER-LICENSES.txt). The bundled FFmpeg libraries
 (av*.dll, sw*.dll) are from https://github.com/BtbN/FFmpeg-Builds, also GPL v3;
 their source code is available at https://ffmpeg.org.
 "@ | Set-Content -Encoding UTF8 (Join-Path $stage "README-WINDOWS.txt")

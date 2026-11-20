@@ -1138,6 +1138,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-graphics"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "064badf302c3194842cf2c5d61f56cc88e54a759313879cdf03abdd27d0c3b97"
+dependencies = [
+ "bitflags 2.13.2",
+ "core-foundation 0.10.0",
+ "core-graphics-types 0.2.0",
+ "foreign-types",
+ "libc",
+]
+
+[[package]]
 name = "core-graphics-helmer-fork"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3348,22 +3361,27 @@ dependencies = [
 
 [[package]]
 name = "mavplayer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cpal",
  "crossbeam-channel",
  "dirs 6.0.0",
  "ffmpeg-sys-next",
+ "fontconfig-parser",
+ "fontdb 0.16.2",
  "futures",
  "gpui",
  "image",
  "log",
+ "memmap2",
  "parking_lot",
  "pipewire",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "smallvec",
+ "souvlaki",
  "unicode-segmentation",
  "winresource",
 ]
@@ -4258,6 +4276,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5da3b0203fd7ee5720aa0b5e790b591aa5d3f41c3ed2c34a3a393382198af2f7"
 
 [[package]]
+name = "pollster"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e9b9cf600136f5b976fbc5727d58c26e1ecab8ee23088d44ef1c7af793550ab"
+
+[[package]]
 name = "postage"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4269,7 +4293,7 @@ dependencies = [
  "log",
  "parking_lot",
  "pin-project",
- "pollster",
+ "pollster 0.2.5",
  "static_assertions",
  "thiserror 1.0.69",
 ]
@@ -5382,6 +5406,25 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "souvlaki"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edf43785a0649d5247f4f2ce8b59bf243be2ed0c18da01753f149ae3aac4c6e7"
+dependencies = [
+ "base64",
+ "block",
+ "core-graphics 0.25.0",
+ "dispatch",
+ "objc",
+ "pollster 1.0.3",
+ "thiserror 2.0.21",
+ "windows 0.62.2",
+ "zbus",
+ "zbus_macros",
+ "zvariant",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [package]
 name = "mavplayer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A fast, native media player for video, music, streams and DVDs"
@@ -34,11 +34,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
 unicode-segmentation = "1"
+# Media keys and now-playing info: MPRIS (Linux), SMTC (Windows), Now Playing (macOS).
+souvlaki = { version = "0.9", default-features = false, features = ["use_zbus"] }
 
 # Native PipeWire audio output (cpal's ALSA host is the fallback).
 [target.'cfg(target_os = "linux")'.dependencies]
 # v0_3_44: target.object (PipeWire 0.3.44+; CI builds on Ubuntu 22.04, which has 0.3.48).
 pipewire = { version = "0.10", features = ["v0_3_44"] }
+# Startup font prefetch (font_prefetch.rs). These are the same fontdb and
+# fontconfig-parser versions cosmic-text (GPUI's Linux text system) uses, so
+# the prefetch parses fonts exactly as GPUI's own scan does.
+fontdb = { version = "0.16", default-features = false, features = ["std", "fs"] }
+fontconfig-parser = "0.5"
+memmap2 = "0.9"
+
+# The window handle the Windows media controls attach to.
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -91,6 +103,7 @@ assets = [
     ["packaging/icons/mavplayer-256.png", "usr/share/icons/hicolor/256x256/apps/io.github.drogobo.MavPlayer.png", "644"],
     ["packaging/icons/mavplayer-512.png", "usr/share/icons/hicolor/512x512/apps/io.github.drogobo.MavPlayer.png", "644"],
     ["README.md", "usr/share/doc/mavplayer/", "644"],
+    ["third_party/shaders/LICENSES.txt", "usr/share/doc/mavplayer/SHADER-LICENSES.txt", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -108,6 +121,7 @@ assets = [
     { source = "packaging/icons/mavplayer-48.png", dest = "/usr/share/icons/hicolor/48x48/apps/io.github.drogobo.MavPlayer.png", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/licenses/mavplayer/LICENSE", mode = "644", doc = true },
     { source = "README.md", dest = "/usr/share/doc/mavplayer/README.md", mode = "644", doc = true },
+    { source = "third_party/shaders/LICENSES.txt", dest = "/usr/share/licenses/mavplayer/SHADER-LICENSES.txt", mode = "644", doc = true },
 ]
 auto-req = "auto"
 

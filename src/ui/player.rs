@@ -68,6 +68,29 @@ impl Aspect {
     }
 }
 
+/// The progress bar being dragged.
+pub struct Scrub {
+    /// Where the bar is held (0..1). While the pointer moves the bar is
+    /// drawn here, so it follows the pointer exactly; once playback has
+    /// landed here it follows playback again.
+    pub frac: f32,
+    /// The last position actually sought to, and whether that was exact.
+    sought: Option<(f32, bool)>,
+    last_seek: Instant,
+    /// A delayed seek is scheduled (seeks are throttled while dragging).
+    seek_scheduled: bool,
+    last_move: Instant,
+    /// An exact seek is scheduled for when the pointer comes to rest.
+    settle_scheduled: bool,
+    /// Playback was paused for the drag and resumes on release.
+    resume: bool,
+}
+
+/// Minimum time between seeks while the progress bar is dragged.
+const SCRUB_INTERVAL: Duration = Duration::from_millis(60);
+/// How long the pointer must rest on the bar before an exact seek there.
+const SCRUB_SETTLE: Duration = Duration::from_millis(150);
+
 /// An active slider drag.
 pub struct Drag {
     pub bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -93,24 +116,34 @@ pub struct PlayerView {
     pub sub_images: HashMap<u64, (Arc<RenderImage>, u32)>,
     pub subs: Vec<SubEvent>,
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
-    pub sent_target: (u32, u32),
     /// Pause state just before the last single-click pause toggle, so the
     /// second click of a double-click can put it back.
     pub click_pause: Option<(bool, Instant)>,
+    /// `load_counter` when the left button last went down on the video. A
+    /// click that started before the current file loaded (on the start
+    /// screen's Recent list, say) mustn't count as a click on the video.
+    pub click_origin: u64,
+    /// Volume and mute as last written to the settings file, and a change
+    /// waiting to be written (saved once it stops changing).
+    saved_volume: (f64, bool),
+    volume_change: Option<((f64, bool), Instant)>,
 
     // Interface state
     pub last_activity: Instant,
     pub pointer_over_controls: bool,
     pub osd: Option<(String, Instant)>,
     pub menu: Option<OpenMenu>,
+    pub media_keys: Option<super::media_keys::MediaKeys>,
     pub dialog: Option<Dialog>,
     pub drag: Option<Drag>,
     pub seek_hover: Option<f32>,
-    pub seek_drag_last: Instant,
+    pub scrub: Option<Scrub>,
     pub show_playlist: bool,
     pub playlist_selected: Option<usize>,
     pub ab_loop: (Option<f64>, Option<f64>),
     pub loop_file: bool,
+    /// The playlist item queued in the engine to follow the current one.
+    armed: Option<(usize, MediaSource)>,
     pub aspect: Aspect,
     pub zoom: f32,
     pub video_adjust: VideoAdjust,
@@ -134,6 +167,21 @@ pub struct PlayerView {
     /// The volume percentage is being edited as text.
     pub editing_volume: bool,
     volume_blur: Option<Subscription>,
+    /// Frames received from the engine and renders since `ui_stats.2`, for
+    /// the once-a-second `-v` report.
+    pub ui_stats: (u32, u32, Instant),
+    /// The window surface is currently declared non-opaque (see
+    /// [`PlayerView::avoid_direct_scanout`]).
+    surface_translucent: bool,
+    /// Border around `frame` beyond its `frame_size` picture (see
+    /// `PresentedFrame::pad`).
+    pub frame_pad: u32,
+    /// The current frame has been drawn (has a GPU texture to free later).
+    pub frame_painted: bool,
+    last_render: Instant,
+    /// Frames keep arriving but the window isn't drawn (minimised, on
+    /// another desktop): the engine skips converting pictures for it.
+    video_hidden: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -153,6 +201,10 @@ pub struct Boot {
     wake_pending: Arc<AtomicBool>,
     wake_rx: futures::channel::mpsc::UnboundedReceiver<()>,
     icons_rx: futures::channel::mpsc::UnboundedReceiver<()>,
+    /// Media handed over by later launches (see `instance`).
+    remote_rx: futures::channel::mpsc::UnboundedReceiver<crate::instance::Request>,
+    /// This window is the one later launches hand media to.
+    primary: bool,
     resume: ResumeStore,
     sources: Vec<MediaSource>,
     /// `sources[0]` is already loading.
@@ -160,8 +212,11 @@ pub struct Boot {
 }
 
 impl Boot {
-    pub fn start(sources: Vec<MediaSource>) -> Self {
-        let settings = Settings::load();
+    pub fn start(settings: Settings, sources: Vec<MediaSource>) -> Self {
+        let (rtx, remote_rx) = futures::channel::mpsc::unbounded();
+        let primary = crate::instance::listen(move |req| {
+            let _ = rtx.unbounded_send(req);
+        });
         icons::set_use_system_theme(settings.icon_theme == crate::settings::IconTheme::System);
         // Icons from the desktop theme are resolved off the UI thread.
         let (itx, icons_rx) = futures::channel::mpsc::unbounded::<()>();
@@ -194,29 +249,72 @@ impl Boot {
                 true
             }
         };
-        Self { settings, player, wake_pending, wake_rx, icons_rx, resume, sources, started }
+        Self { settings, player, wake_pending, wake_rx, icons_rx, remote_rx, primary, resume, sources, started }
     }
 }
 
 impl PlayerView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, boot: Boot) -> Self {
-        let Boot { settings, player, wake_pending, wake_rx: mut rx, icons_rx: mut irx, resume, sources, started } =
-            boot;
+        let Boot {
+            settings,
+            player,
+            wake_pending,
+            wake_rx: mut rx,
+            icons_rx: mut irx,
+            remote_rx: mut remote,
+            primary,
+            resume,
+            sources,
+            started,
+        } = boot;
         log::debug!("startup: creating player view at {:.0} ms", crate::ms_since_start());
-        // Engine → UI wake-ups.
+        // Engine → UI wake-ups. The engine sends one only after the previous
+        // one was handled (`wake_pending`), so a wake-up that fails to reach
+        // the view must be retried: dropping it would freeze the picture for
+        // good while audio plays on.
         cx.spawn_in(window, async move |this, cx| {
             while rx.next().await.is_some() {
-                if this.update_in(cx, |v, window, cx| v.on_engine_wake(window, cx)).is_err() {
+                loop {
+                    if this.update_in(cx, |v, window, cx| v.on_engine_wake(window, cx)).is_ok() {
+                        break;
+                    }
+                    if this.upgrade().is_none() {
+                        return;
+                    }
+                    log::debug!("engine wake-up could not reach the window; retrying");
+                    cx.background_executor().timer(Duration::from_millis(16)).await;
+                }
+            }
+        })
+        .detach();
+        // Media handed over by later launches.
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(req) = remote.next().await {
+                if this.update_in(cx, |v, window, cx| v.open_remote(req, window, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        // Media keys and the desktop's player controls.
+        let (mtx, mut media_rx) = futures::channel::mpsc::unbounded();
+        let media_keys = super::media_keys::MediaKeys::new(window, primary, move |ev| {
+            let _ = mtx.unbounded_send(ev);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(ev) = media_rx.next().await {
+                if this.update_in(cx, |v, window, cx| v.on_media_event(ev, window, cx)).is_err() {
                     break;
                 }
             }
         })
         .detach();
         // Periodic UI refresh (time display, auto-hide, A-B loop, OSD expiry).
+        // Like the wake-ups, it only stops once the view is gone.
         cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_millis(200)).await;
-                if this.update_in(cx, |v, window, cx| v.tick(window, cx)).is_err() {
+                if this.update_in(cx, |v, window, cx| v.tick(window, cx)).is_err() && this.upgrade().is_none() {
                     break;
                 }
             }
@@ -232,6 +330,13 @@ impl PlayerView {
             v.save_state();
             async {}
         }));
+        // Closing from the window frame (the compositor's close button,
+        // Alt+F4) drops this view before the app quits: save first.
+        let me = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = me.update(cx, |v, _| v.save_state());
+            true
+        });
 
         // Repaint once the desktop icon theme has been resolved.
         cx.spawn_in(window, async move |this, cx| {
@@ -258,19 +363,23 @@ impl PlayerView {
             sub_images: HashMap::new(),
             subs: Vec::new(),
             video_bounds: Rc::new(Cell::new(Bounds::default())),
-            sent_target: (0, 0),
             click_pause: None,
+            click_origin: 0,
+            saved_volume: (settings.volume, settings.muted),
+            volume_change: None,
             last_activity: Instant::now(),
             pointer_over_controls: false,
             osd: None,
             menu: None,
+            media_keys,
             dialog: None,
             drag: None,
             seek_hover: None,
-            seek_drag_last: Instant::now(),
+            scrub: None,
             playlist_selected: None,
             ab_loop: (None, None),
             loop_file: false,
+            armed: None,
             aspect: Aspect::Auto,
             zoom: 1.0,
             video_adjust: VideoAdjust::default(),
@@ -290,6 +399,12 @@ impl PlayerView {
             pl_scroll: gpui::UniformListScrollHandle::new(),
             editing_volume: false,
             volume_blur: None,
+            ui_stats: (0, 0, Instant::now()),
+            surface_translucent: false,
+            frame_pad: 0,
+            frame_painted: false,
+            last_render: Instant::now(),
+            video_hidden: false,
             settings,
             _subs: subs,
         };
@@ -297,8 +412,9 @@ impl PlayerView {
         if !sources.is_empty() {
             v.playlist.add(sources);
             v.probe_playlist(cx);
-            v.start_item(0, !started, window, cx);
-            if started {
+            let paused = v.settings.start_paused;
+            v.start_item(0, !started, paused, window, cx);
+            if started && !paused {
                 v.player.set_paused(false);
             }
         }
@@ -331,17 +447,32 @@ impl PlayerView {
                 );
             }
             self.frame_size = (f.width, f.height);
-            if let Some(buf) = image::RgbaImage::from_raw(f.width, f.height, f.bgra) {
+            self.ui_stats.0 += 1;
+            self.frame_pad = f.pad;
+            if let Some(buf) = image::RgbaImage::from_raw(f.width + 2 * f.pad, f.height + 2 * f.pad, f.bgra) {
                 let img = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(buf)]));
-                if let Some(old) = self.frame.replace(img) {
+                // A frame that was never drawn has no texture: just drop it.
+                // (Retiring those would pile up while the window isn't drawn.)
+                if let Some(old) = self.frame.replace(img)
+                    && self.frame_painted
+                {
                     self.retired.push_back((old, 3));
                 }
+                self.frame_painted = false;
+            }
+            // Pictures arrive but nothing is drawn: the compositor isn't
+            // showing the window. Stop converting frames for it until it is.
+            if !self.video_hidden && self.last_render.elapsed() > Duration::from_millis(500) {
+                self.video_hidden = true;
+                self.player.set_video_hidden(true);
+                log::debug!("ui: window not being drawn; pausing picture conversion");
             }
         }
         for ev in self.player.drain_events() {
             match ev {
                 PlayerEvent::Loaded => self.on_loaded(window, cx),
                 PlayerEvent::EndOfFile => self.on_end_of_file(window, cx),
+                PlayerEvent::Advanced(src) => self.on_advanced(src, window, cx),
                 PlayerEvent::Error(e) => {
                     if let Some(i) = self.playlist.current
                         && let Some(it) = self.playlist.items.get_mut(i)
@@ -356,7 +487,7 @@ impl PlayerView {
                         && let Some(n) = self.playlist.next_index(true)
                         && Some(n) != self.playlist.current
                     {
-                        self.play_index(n, window, cx);
+                        self.continue_to(n, window, cx);
                     }
                 }
                 PlayerEvent::Warning(w) => self.osd(w, cx),
@@ -392,7 +523,7 @@ impl PlayerView {
 
     fn on_end_of_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(src) = self.player.with_state(|s| s.source.clone()) {
-            self.resume.positions.remove(&src.key());
+            self.resume.forget(&src.key());
         }
         if self.loop_file {
             self.player.seek(0.0, false, true);
@@ -403,15 +534,101 @@ impl PlayerView {
             return;
         }
         if let Some(n) = self.playlist.next_index(false) {
-            self.play_index(n, window, cx);
+            self.continue_to(n, window, cx);
         } else if self.is_fullscreen(window) {
             // Playlist finished: leave fullscreen like most players do.
             window.toggle_fullscreen();
         }
     }
 
+    /// What should play when the current item ends, for gapless playback.
+    fn desired_next(&self) -> Option<(usize, MediaSource)> {
+        let cur = self.playlist.current?;
+        let n = if self.loop_file {
+            cur
+        } else if !self.settings.auto_play_next && self.playlist.repeat != RepeatMode::One {
+            return None;
+        } else {
+            self.playlist.next_index(false)?
+        };
+        let item = self.playlist.items.get(n)?;
+        // Discs pick their title interactively; broken items are skipped.
+        if item.failed || matches!(item.source, MediaSource::Dvd { title: 0, .. }) {
+            return None;
+        }
+        Some((n, item.source.clone()))
+    }
+
+    /// Tells the engine what follows the current item whenever that changes
+    /// (playlist edits, repeat, shuffle, loop).
+    fn update_next(&mut self) {
+        let want = self.desired_next();
+        // Loads (including reloads) clear the engine's queue behind our back.
+        if want == self.armed && self.player.queued_next() == want.as_ref().map(|(_, s)| s.clone()) {
+            return;
+        }
+        let next = want.as_ref().map(|(n, src)| {
+            let start_at = (Some(*n) != self.playlist.current && self.settings.resume_playback)
+                .then(|| self.resume.get(&src.key()))
+                .flatten();
+            (src.clone(), LoadOptions { start_at, ..Default::default() })
+        });
+        self.player.set_next(next);
+        self.armed = want;
+    }
+
+    /// The queued item took over from the one that just finished.
+    fn on_advanced(&mut self, src: MediaSource, window: &mut Window, cx: &mut Context<Self>) {
+        let prev = self.playlist.current;
+        if let Some(it) = prev.and_then(|i| self.playlist.items.get(i)) {
+            self.resume.forget(&it.source.key());
+        }
+        let idx = match self.armed.take() {
+            Some((i, s)) if s == src && self.playlist.items.get(i).is_some_and(|it| it.source == src) => Some(i),
+            _ => self.playlist.items.iter().position(|it| it.source == src),
+        };
+        self.playlist.current = idx;
+        if idx != prev {
+            self.playlist_selected = idx;
+            self.ab_loop = (None, None);
+            self.sub_delay = 0.0;
+            self.load_counter += 1;
+            self.settings.add_recent(&src);
+            if let Some(it) = idx.and_then(|i| self.playlist.items.get(i)) {
+                window.set_window_title(&format!("{} — MavPlayer", it.display_title()));
+            }
+        }
+        // Keep the last picture for a seamless cut, unless nothing will replace it.
+        if self.player.with_state(|s| s.video.is_none()) {
+            self.frame = None;
+        }
+        self.subs.clear();
+        self.update_next();
+        cx.notify();
+    }
+
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
+        self.save_volume_soon();
+        if self.scrub.is_none() {
+            self.player.set_hushed(false);
+        }
+        if self.ui_stats.2.elapsed() >= Duration::from_secs(1) {
+            if log::log_enabled!(log::Level::Debug) && self.player.is_active() {
+                let vs = window.viewport_size();
+                log::debug!(
+                    "ui: {} frames received, {} renders; {}x{}{}{}",
+                    self.ui_stats.0,
+                    self.ui_stats.1,
+                    f32::from(vs.width),
+                    f32::from(vs.height),
+                    if window.is_fullscreen() { ", fullscreen" } else { "" },
+                    if self.wake_pending.load(Ordering::Acquire) { ", wake-up pending" } else { "" },
+                );
+            }
+            self.ui_stats = (0, 0, Instant::now());
+        }
+        self.update_next();
         if let Some((want, tries)) = self.pending_fit {
             let got = window.viewport_size();
             let off = (f32::from(got.width) - f32::from(want.width)).abs()
@@ -427,6 +644,10 @@ impl PlayerView {
         if !requests.is_empty() {
             let sources = requests.iter().map(|u| playlist::source_for_arg(u)).collect();
             self.open_sources(sources, window, cx);
+        }
+        if let Some(mut mk) = self.media_keys.take() {
+            mk.update(self);
+            self.media_keys = Some(mk);
         }
         let status = self.player.with_state(|s| s.status.clone());
         if status != self.last_status {
@@ -463,9 +684,36 @@ impl PlayerView {
         }
     }
 
+    /// Keeps KWin from scanning the fullscreen window out directly.
+    ///
+    /// A fullscreen surface that declares itself opaque lets the compositor
+    /// put the app's buffers straight on the display instead of compositing
+    /// them. With KWin 6 on the NVIDIA driver that path fails ("Failed to
+    /// allocate a graphics buffer for a swapchain") and the screen keeps the
+    /// last picture while the app goes on rendering. Declaring the surface
+    /// non-opaque while fullscreen makes KWin composite it as usual. Every
+    /// pixel is still drawn opaque, so nothing looks different.
+    pub fn avoid_direct_scanout(&mut self, window: &mut Window) {
+        let want = window.is_fullscreen() && cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if want != self.surface_translucent {
+            self.surface_translucent = want;
+            window.set_background_appearance(if want {
+                gpui::WindowBackgroundAppearance::Transparent
+            } else {
+                gpui::WindowBackgroundAppearance::Opaque
+            });
+        }
+    }
+
     /// Drops GPU textures of frames that have been off screen for a few
     /// renders (the GPU may still be reading the most recent ones).
     pub fn retire_textures(&mut self, window: &mut Window) {
+        self.last_render = Instant::now();
+        if self.video_hidden {
+            self.video_hidden = false;
+            self.player.set_video_hidden(false);
+        }
+        self.frame_painted |= self.frame.is_some();
         for e in self.retired.iter_mut() {
             e.1 = e.1.saturating_sub(1);
         }
@@ -489,17 +737,6 @@ impl PlayerView {
         }
     }
 
-    pub fn update_target_size(&mut self, window: &Window) {
-        let b = self.video_bounds.get();
-        let scale = window.scale_factor();
-        let w = (f32::from(b.size.width) * scale * self.zoom).round().max(16.0) as u32;
-        let h = (f32::from(b.size.height) * scale * self.zoom).round().max(16.0) as u32;
-        if (w, h) != self.sent_target && w > 16 && h > 16 {
-            self.sent_target = (w, h);
-            self.player.set_target_size(w, h);
-        }
-    }
-
     // ───────────────────────── opening media ─────────────────────────
 
     pub fn osd(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -520,6 +757,28 @@ impl PlayerView {
         }
     }
 
+    /// Writes a changed volume or mute to the settings file once it has
+    /// stayed put for a moment, so it survives however the app ends.
+    fn save_volume_soon(&mut self) {
+        let now = (self.player.volume(), self.player.muted());
+        if now == self.saved_volume {
+            self.volume_change = None;
+            return;
+        }
+        match self.volume_change {
+            Some((v, at)) if v == now => {
+                if at.elapsed() >= Duration::from_secs(1) {
+                    self.settings.volume = now.0;
+                    self.settings.muted = now.1;
+                    self.settings.save();
+                    self.saved_volume = now;
+                    self.volume_change = None;
+                }
+            }
+            _ => self.volume_change = Some((now, Instant::now())),
+        }
+    }
+
     pub fn save_state(&mut self) {
         self.save_current_position();
         self.settings.volume = self.player.volume();
@@ -528,16 +787,25 @@ impl PlayerView {
         self.settings.shuffle = self.playlist.shuffle();
         self.settings.show_playlist = self.show_playlist;
         self.settings.save();
+        self.saved_volume = (self.settings.volume, self.settings.muted);
         self.resume.save();
     }
 
+    /// Plays playlist item `idx` because the user chose it (paused instead
+    /// if "Start files paused" is on).
     pub fn play_index(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.start_item(idx, true, window, cx);
+        self.start_item(idx, true, self.settings.start_paused, window, cx);
+    }
+
+    /// Moves on to item `idx` by itself (the previous one ended or failed):
+    /// always plays.
+    fn continue_to(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.start_item(idx, true, false, window, cx);
     }
 
     /// Makes `idx` the current item. With `load` false the engine is
     /// already playing it (started early by [`Boot`]).
-    fn start_item(&mut self, idx: usize, load: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_item(&mut self, idx: usize, load: bool, paused: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.playlist.items.get(idx).cloned() else { return };
         self.save_current_position();
         self.playlist.current = Some(idx);
@@ -551,9 +819,11 @@ impl PlayerView {
             return;
         }
         self.load_counter += 1;
+        // A new load drops whatever was queued in the engine.
+        self.armed = None;
         if load {
             let start_at = if self.settings.resume_playback { self.resume.get(&item.source.key()) } else { None };
-            self.player.load(item.source.clone(), LoadOptions { start_at, ..Default::default() });
+            self.player.load(item.source.clone(), LoadOptions { start_at, start_paused: paused, ..Default::default() });
         }
         self.settings.add_recent(&item.source);
         window.set_window_title(&format!("{} — MavPlayer", item.display_title()));
@@ -590,6 +860,31 @@ impl PlayerView {
         let range = self.playlist.add(sources);
         self.probe_playlist(cx);
         self.play_index(range.start, window, cx);
+    }
+
+    /// Media sent by another launch while this window is open.
+    pub fn open_remote(&mut self, req: crate::instance::Request, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::settings::RunningMode;
+        window.activate_window();
+        if req.sources.is_empty() {
+            return;
+        }
+        match req.mode {
+            RunningMode::Enqueue => self.enqueue(req.sources, window, cx),
+            RunningMode::Replace => {
+                self.save_current_position();
+                self.playlist.clear();
+                self.playlist_selected = None;
+                let range = self.playlist.add(req.sources);
+                self.probe_playlist(cx);
+                self.play_index(range.start, window, cx);
+            }
+            RunningMode::PlayNow | RunningMode::NewWindow => {
+                let range = self.playlist.add(req.sources);
+                self.probe_playlist(cx);
+                self.play_index(range.start, window, cx);
+            }
+        }
     }
 
     /// Adds without interrupting playback.
@@ -652,22 +947,45 @@ impl PlayerView {
         if todo.is_empty() {
             return;
         }
+        // A few workers (probing is mostly waiting on the disk), with results
+        // shown as they arrive rather than after the whole list.
         let cfg = self.settings.engine_config();
-        let task = cx.background_executor().spawn(async move {
-            todo.into_iter().map(|(id, s)| (id, engine::probe::probe(&s, &cfg))).collect::<Vec<_>>()
-        });
-        cx.spawn(async move |this, cx| {
-            let results = task.await;
-            let _ = this.update(cx, |v, cx| {
-                for (id, r) in results {
-                    if let (Some(it), Some(r)) = (v.playlist.items.iter_mut().find(|i| i.id == id), r) {
-                        it.duration = Some(r.duration).filter(|d| *d > 0.0);
-                        it.title = it.title.take().or(r.title);
-                        it.artist = it.artist.take().or(r.artist);
+        let queue = Arc::new(parking_lot::Mutex::new(VecDeque::from(todo)));
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
+        for _ in 0..workers {
+            let (queue, tx, cfg) = (queue.clone(), tx.clone(), cfg.clone());
+            cx.background_executor()
+                .spawn(async move {
+                    while let Some((id, s)) = queue.lock().pop_front() {
+                        if tx.unbounded_send((id, engine::probe::probe(&s, &cfg))).is_err() {
+                            break; // the window closed
+                        }
                     }
+                })
+                .detach();
+        }
+        drop(tx);
+        cx.spawn(async move |this, cx| {
+            while let Some(first) = rx.next().await {
+                let mut batch = vec![first];
+                while let Ok(r) = rx.try_recv() {
+                    batch.push(r);
                 }
-                cx.notify();
-            });
+                let applied = this.update(cx, |v, cx| {
+                    for (id, r) in batch {
+                        if let (Some(it), Some(r)) = (v.playlist.items.iter_mut().find(|i| i.id == id), r) {
+                            it.duration = Some(r.duration).filter(|d| *d > 0.0);
+                            it.title = it.title.take().or(r.title);
+                            it.artist = it.artist.take().or(r.artist);
+                        }
+                    }
+                    cx.notify();
+                });
+                if applied.is_err() {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -735,7 +1053,8 @@ impl PlayerView {
                 self.playlist.items[i].source = src.clone();
                 self.playlist.items[i].title = Some(format!("DVD – Title {title}"));
                 let start_at = if self.settings.resume_playback { self.resume.get(&src.key()) } else { None };
-                self.player.load(src.clone(), LoadOptions { start_at, ..Default::default() });
+                let start_paused = self.settings.start_paused;
+                self.player.load(src.clone(), LoadOptions { start_at, start_paused, ..Default::default() });
                 self.settings.add_recent(&src);
                 self.load_counter += 1;
                 window.set_window_title(&format!("DVD – Title {title} — MavPlayer"));
@@ -797,7 +1116,9 @@ impl PlayerView {
         let k = ((sw - side) / vw).min((sh - chrome_h) / vh).min(1.0);
         vw *= k;
         vh *= k;
-        let (w, h) = ((vw + side).max(480.0), (vh + chrome_h).max(320.0));
+        // Never narrower than the bottom bar's controls need.
+        let min_w = super::bar::min_window_width(&self.settings.bar_controls) as f64;
+        let (w, h) = ((vw + side).max(480.0).max(min_w), (vh + chrome_h).max(320.0));
         let want = size(px(w as f32), px(h as f32));
         window.resize(want);
         self.pending_fit = Some((want, 4));
@@ -938,6 +1259,10 @@ impl PlayerView {
     }
 
     pub fn set_volume(&mut self, v: f64, cx: &mut Context<Self>) {
+        // Media-key clients (MPRIS) can send anything, NaN included.
+        if !v.is_finite() {
+            return;
+        }
         let max = self.settings.max_volume as f64 / 100.0;
         let v = v.clamp(0.0, max);
         self.player.set_volume(v);
@@ -948,7 +1273,7 @@ impl PlayerView {
 
     pub fn set_speed(&mut self, s: f64, cx: &mut Context<Self>) {
         self.player.set_speed(s);
-        self.osd(format!("Speed {:.2}×", self.player.speed()), cx);
+        self.osd(format!("Speed {}", super::widgets::format_speed(self.player.speed())), cx);
     }
 
     pub fn set_video_adjust(&mut self, adj: VideoAdjust, cx: &mut Context<Self>) {
@@ -965,6 +1290,129 @@ impl PlayerView {
         let target = (self.player.position()).max(0.0);
         let d = self.player.duration();
         self.osd(format!("{} / {}", super::widgets::format_time(target), super::widgets::format_time(d)), cx);
+        cx.notify();
+    }
+
+    /// The position the progress bar and time show: under the pointer while
+    /// the bar is dragged and the video hasn't caught up (keyframe seeks lag
+    /// and land near it), otherwise the playback position, which keeps
+    /// moving while the bar is held still.
+    pub fn shown_position(&self) -> f64 {
+        match &self.scrub {
+            Some(s) if s.sought != Some((s.frac, true)) => s.frac as f64 * self.player.duration(),
+            _ => self.player.position(),
+        }
+    }
+
+    /// The progress bar was pressed at `f`: seeks there (exactly) and, if
+    /// set to, pauses until it is released.
+    pub fn scrub_start(&mut self, f: f32, cx: &mut Context<Self>) {
+        let pause = self.settings.seek_drag == crate::settings::SeekDragMode::Pause && !self.player.paused();
+        if pause {
+            self.player.set_paused(true);
+        }
+        let now = Instant::now();
+        self.scrub = Some(Scrub {
+            frac: f,
+            sought: None,
+            last_seek: now,
+            seek_scheduled: false,
+            last_move: now,
+            settle_scheduled: false,
+            resume: pause,
+        });
+        self.seek_hover = Some(f);
+        self.seek_fraction(f as f64, cx);
+        if let Some(s) = self.scrub.as_mut() {
+            s.sought = Some((f, true));
+        }
+    }
+
+    /// The pointer moved while holding the bar. The bar follows at once;
+    /// the video follows with fast keyframe seeks, at most one per
+    /// [`SCRUB_INTERVAL`], and lands exactly under the pointer once it
+    /// rests for [`SCRUB_SETTLE`].
+    pub fn scrub_move(&mut self, f: f32, cx: &mut Context<Self>) {
+        let Some(s) = self.scrub.as_mut() else { return };
+        if s.frac == f {
+            return;
+        }
+        s.frac = f;
+        s.last_move = Instant::now();
+        self.seek_hover = Some(f);
+        // Snippets from every position passed would stutter: keep quiet
+        // until the pointer rests.
+        self.player.set_hushed(true);
+        self.scrub_seek(cx);
+        self.scrub_settle(cx);
+        cx.notify();
+    }
+
+    fn scrub_settle(&mut self, cx: &mut Context<Self>) {
+        let Some(s) = self.scrub.as_mut() else { return };
+        if s.settle_scheduled || s.sought == Some((s.frac, true)) {
+            return;
+        }
+        let wait = SCRUB_SETTLE.saturating_sub(s.last_move.elapsed());
+        if wait.is_zero() {
+            s.sought = Some((s.frac, true));
+            s.last_seek = Instant::now();
+            let f = s.frac as f64;
+            self.seek_fraction(f, cx);
+            self.player.set_hushed(false);
+            return;
+        }
+        s.settle_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |v, cx| {
+                if let Some(s) = v.scrub.as_mut() {
+                    s.settle_scheduled = false;
+                }
+                v.scrub_settle(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn scrub_seek(&mut self, cx: &mut Context<Self>) {
+        let Some(s) = self.scrub.as_mut() else { return };
+        if s.sought.is_some_and(|(at, _)| at == s.frac) {
+            return;
+        }
+        let wait = SCRUB_INTERVAL.saturating_sub(s.last_seek.elapsed());
+        if wait.is_zero() {
+            s.last_seek = Instant::now();
+            s.sought = Some((s.frac, false));
+            let target = self.player.duration() * s.frac as f64;
+            self.player.seek(target, false, false);
+        } else if !s.seek_scheduled {
+            s.seek_scheduled = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |v, cx| {
+                    if let Some(s) = v.scrub.as_mut() {
+                        s.seek_scheduled = false;
+                    }
+                    v.scrub_seek(cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// The bar was released at `f`: lands exactly there (unless the press
+    /// already did) and resumes playback if the drag paused it.
+    pub fn scrub_end(&mut self, f: f32, cx: &mut Context<Self>) {
+        let Some(s) = self.scrub.take() else { return };
+        if s.sought != Some((f, true)) {
+            self.seek_fraction(f as f64, cx);
+        }
+        self.player.set_hushed(false);
+        if s.resume && self.player.paused() {
+            self.player.set_paused(false);
+        }
+        self.seek_hover = None;
         cx.notify();
     }
 

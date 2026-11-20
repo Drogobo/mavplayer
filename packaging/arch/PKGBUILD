@@ -5,7 +5,7 @@
 # (For an AUR-style build from a release tag, set _from_git=1.)
 
 pkgname=mavplayer
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Fast, native media player for video, music, streams and DVDs"
 arch=('x86_64' 'aarch64')
@@ -65,5 +65,6 @@ package() {
             "$pkgdir/usr/share/icons/hicolor/${s}x${s}/apps/io.github.drogobo.MavPlayer.png"
     done
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 third_party/shaders/LICENSES.txt "$pkgdir/usr/share/licenses/$pkgname/SHADER-LICENSES.txt"
     install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
 }

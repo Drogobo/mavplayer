@@ -5,15 +5,15 @@ use super::menu::MenuItem as M;
 use super::menus::MENUBAR;
 use super::player::{Aspect, Drag, PlayerView, SliderFn};
 use super::theme::{Theme, overlay_theme};
-use super::widgets::{format_time, icon, tooltip};
+use super::widgets::{format_speed, format_time, frac_to_speed, icon, speed_to_frac, tooltip};
 use crate::engine::{MediaSource, Status, SubContent, TrackKind};
 use crate::icons::Icon;
-use crate::settings::{RepeatMode, ScrollAction, SubStyle};
+use crate::settings::{BarControl, RepeatMode, ScrollAction, SubStyle};
 use gpui::{
-    AnyElement, Bounds, ClickEvent, Context, Corners, CursorStyle, Decorations, Div, DragMoveEvent, ElementId,
-    ExternalPaths, Hsla, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, RenderImage,
-    ResizeEdge, Resource, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Window, WindowControlArea, canvas,
-    div, img, point, prelude::*, px, relative, rgba, size,
+    AnyElement, Bounds, ClickEvent, ContentMask, Context, Corners, CursorStyle, Decorations, Div, DragMoveEvent,
+    ElementId, ExternalPaths, Hsla, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
+    RenderImage, ResizeEdge, Resource, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Window,
+    WindowControlArea, canvas, div, img, point, prelude::*, px, relative, rgba, size,
 };
 use std::cell::Cell;
 use std::rc::Rc;
@@ -404,9 +404,11 @@ impl PlayerView {
 
         let frame = self.frame.clone();
         let fsize = self.frame_size;
+        let pad = self.frame_pad as f32;
         let aspect = self.aspect;
         let zoom = self.zoom;
         let bcell = self.video_bounds.clone();
+        let set_target = self.player.target_size_setter();
 
         // Subtitles at the current position.
         let pos = self.player.position() - self.sub_delay;
@@ -449,15 +451,35 @@ impl PlayerView {
         let canvas_size = self.player.subtitle_canvas();
 
         let picture = canvas(
-            move |b, _, _| {
+            move |b, window, _| {
                 bcell.set(b);
+                // Tell the engine the size as soon as layout knows it, so a
+                // paused picture is redone for a resized window right away.
+                let s = window.scale_factor() * zoom;
+                let (w, h) = ((f32::from(b.size.width) * s).round(), (f32::from(b.size.height) * s).round());
+                if w > 16.0 && h > 16.0 {
+                    set_target(w as u32, h as u32);
+                }
                 b
             },
             move |b, _, window, _| {
                 window.paint_quad(gpui::fill(b, gpui::black()));
                 if let Some(img) = frame {
                     let r = video_rect(b, fsize, aspect, zoom);
-                    let _ = window.paint_image(r, Corners::default(), img, 0, false);
+                    // The image carries a border of repeated edge pixels so
+                    // the GPU's filtering never reaches past the picture:
+                    // draw it that much larger, clipped to the picture.
+                    let (px_w, px_h) = (
+                        f32::from(r.size.width) / fsize.0.max(1) as f32,
+                        f32::from(r.size.height) / fsize.1.max(1) as f32,
+                    );
+                    let padded = Bounds::new(
+                        point(r.origin.x - px(pad * px_w), r.origin.y - px(pad * px_h)),
+                        size(r.size.width + px(2. * pad * px_w), r.size.height + px(2. * pad * px_h)),
+                    );
+                    window.with_content_mask(Some(ContentMask { bounds: r }), |window| {
+                        let _ = window.paint_image(padded, Corners::default(), img, 0, false);
+                    });
                     // Bitmap subtitles (PGS/DVD/DVB) are positioned on the video frame.
                     for (img, x, y, w, h, cw, ch) in bitmaps {
                         let (cw, ch) = if cw > 0 {
@@ -497,8 +519,22 @@ impl PlayerView {
             .child(picture)
             .when(active && !show_controls && self.menu.is_none(), |d| d.cursor(CursorStyle::None))
             .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.note_activity(cx)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, _| {
+                    if ev.click_count <= 1 {
+                        this.click_origin = this.load_counter;
+                    }
+                }),
+            )
             .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
                 if ev.is_right_click() {
+                    return;
+                }
+                // The click (or a double-click's first click) opened what is
+                // now playing, from the start screen: it isn't meant for the video.
+                if this.click_origin != this.load_counter {
+                    window.focus(&this.focus);
                     return;
                 }
                 if ev.click_count() == 2 && this.settings.double_click_fullscreen {
@@ -872,7 +908,8 @@ impl PlayerView {
         let pos = self.player.position();
         let st = self.player.state();
         let seekable = st.media.as_ref().map(|m| m.seekable && m.duration > 0.0).unwrap_or(false);
-        let frac = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
+        let shown = self.shown_position();
+        let frac = if dur > 0.0 { (shown / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
         let cache = if dur > 0.0 { ((pos + st.cache_secs) / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
         let bounds = Rc::new(Cell::new(Bounds::default()));
         let (b1, b2, b3) = (bounds.clone(), bounds.clone(), bounds.clone());
@@ -942,7 +979,7 @@ impl PlayerView {
                     .rounded_full()
                     .bg(gpui::white())
                     .shadow_md()
-                    .opacity(if self.drag.is_some() { 1.0 } else { 0.0 })
+                    .opacity(if self.scrub.is_some() { 1.0 } else { 0.0 })
                     .group_hover("seek", |s| s.opacity(1.0)),
             )
             .when_some(hover_label, |d, (f, label)| {
@@ -962,6 +999,9 @@ impl PlayerView {
                 )
             })
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
+                if this.scrub.is_some() {
+                    return; // the drag keeps the label under the pointer
+                }
                 let f = frac_in(b2.get(), ev.position, false);
                 if this.seek_hover != Some(f) {
                     this.seek_hover = Some(f);
@@ -969,7 +1009,7 @@ impl PlayerView {
                 }
             }))
             .on_hover(cx.listener(|this, h: &bool, _, cx| {
-                if !*h {
+                if !*h && this.scrub.is_none() {
                     this.seek_hover = None;
                     cx.notify();
                 }
@@ -979,18 +1019,9 @@ impl PlayerView {
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                         let f = frac_in(b3.get(), ev.position, false);
-                        this.seek_fraction(f as f64, cx);
-                        let on_change: SliderFn = Rc::new(|this, f, _, cx| {
-                            // Fast keyframe seeks while scrubbing, throttled.
-                            if this.seek_drag_last.elapsed().as_millis() > 80 {
-                                this.seek_drag_last = std::time::Instant::now();
-                                let d = this.player.duration();
-                                this.player.seek(d * f as f64, false, false);
-                            }
-                            this.seek_hover = Some(f);
-                            cx.notify();
-                        });
-                        let on_release: SliderFn = Rc::new(|this, f, _, cx| this.seek_fraction(f as f64, cx));
+                        this.scrub_start(f, cx);
+                        let on_change: SliderFn = Rc::new(|this, f, _, cx| this.scrub_move(f, cx));
+                        let on_release: SliderFn = Rc::new(|this, f, _, cx| this.scrub_end(f, cx));
                         this.drag = Some(Drag {
                             bounds: b3.clone(),
                             vertical: false,
@@ -1010,8 +1041,9 @@ impl PlayerView {
         let st = self.player.state();
         let active = self.player.is_active();
         let paused = self.player.paused() || st.status == Status::Ended;
-        let pos = self.player.position();
         let dur = self.player.duration();
+        // The time follows the progress bar while it is dragged.
+        let pos = self.shown_position();
         let time_left = format_time(pos);
         let time_right = if self.settings.show_remaining_time && dur > 0.0 {
             format!("-{}", format_time(dur - pos))
@@ -1060,47 +1092,31 @@ impl PlayerView {
         );
 
         let pp_icon = if paused || !active { Icon::Play } else { Icon::Pause };
-        let left = div()
+        let play = div()
+            .id("btn-play")
+            .size(px(38.))
             .flex()
             .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .id("btn-play")
-                    .size(px(38.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .cursor_pointer()
-                    .bg(t.brand(180.))
-                    .shadow_sm()
-                    .hover(|s| s.opacity(0.9))
-                    .child(icon(pp_icon, px(18.), t.on_accent))
-                    .tooltip(tooltip("Play / Pause (Space)", t))
-                    .on_click(cx.listener(|this, _, w, cx| {
-                        if this.player.is_active() {
-                            this.player.toggle_pause();
-                        } else if let Some(i) =
-                            this.playlist.current.or(if this.playlist.items.is_empty() { None } else { Some(0) })
-                        {
-                            this.play_index(i, w, cx);
-                        } else {
-                            this.prompt_open(false, false, w, cx);
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(self.icon_button("btn-stop", Icon::Stop, "Stop", t, |this, _, w, cx| this.stop(w, cx), cx))
-            .child(self.icon_button(
-                "btn-prev",
-                Icon::Previous,
-                "Previous (Shift+N)",
-                t,
-                |this, _, w, cx| this.prev_item(w, cx),
-                cx,
-            ))
-            .child(self.icon_button("btn-next", Icon::Next, "Next (N)", t, |this, _, w, cx| this.next_item(w, cx), cx));
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .bg(t.brand(180.))
+            .shadow_sm()
+            .hover(|s| s.opacity(0.9))
+            .child(icon(pp_icon, px(18.), t.on_accent))
+            .tooltip(tooltip("Play / Pause (Space)", t))
+            .on_click(cx.listener(|this, _, w, cx| {
+                if this.player.is_active() {
+                    this.player.toggle_pause();
+                } else if let Some(i) =
+                    this.playlist.current.or(if this.playlist.items.is_empty() { None } else { Some(0) })
+                {
+                    this.play_index(i, w, cx);
+                } else {
+                    this.prompt_open(false, false, w, cx);
+                }
+                cx.notify();
+            }));
 
         let center = div().flex_1().min_w_0().px_2().truncate().text_size(px(13.)).text_color(t.text_dim).child(title);
 
@@ -1120,148 +1136,215 @@ impl PlayerView {
                 )
             };
 
+        // The chosen controls that apply to what is playing, minus any that
+        // don't fit (the window's minimum width normally leaves room for all).
+        let wanted: Vec<BarControl> = self
+            .settings
+            .bar_controls
+            .iter()
+            .copied()
+            .filter(|&c| match c {
+                BarControl::Subtitles => has_subs,
+                BarControl::AudioTrack => audio_tracks > 1,
+                BarControl::Playlist => !overlay,
+                _ => true,
+            })
+            .collect();
+        let shown = super::bar::fit(&wanted, f32::from(window.viewport_size().width));
+
+        let mut left = div().flex().items_center().gap_1().child(play);
         let mut right = div().flex().items_center().gap_1();
-        if has_subs {
-            right = right.child(popup_btn(self, "btn-subs", Icon::Subtitles, "Subtitles", |s| s.subtitle_popup(), cx));
-        }
-        if audio_tracks > 1 {
-            right = right.child(popup_btn(self, "btn-audio", Icon::Audio, "Audio track", |s| s.audio_popup(), cx));
-        }
-        right = right
-            .child(
-                div()
-                    .id("btn-speed")
-                    .h(px(32.))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .rounded(px(7.))
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .text_color(if (speed - 1.0).abs() > 1e-3 { t.accent } else { t.text })
-                    .hover(|s| s.bg(t.hover))
-                    .child(format!("{speed}×"))
-                    .tooltip(tooltip("Playback speed", t))
-                    .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
-                        let pos = ev.position();
-                        let items = this.speed_popup();
-                        this.open_menu(items, point(pos.x - px(80.), pos.y - px(10.)), None, cx);
-                    })),
-            )
-            .child(
-                self.icon_button(
-                    "btn-repeat",
-                    repeat_icon,
-                    "Repeat (R)",
-                    t,
-                    |this, _, _, cx| this.cycle_repeat(cx),
-                    cx,
-                )
-                .when(self.playlist.repeat != RepeatMode::Off, |d| d.bg(t.accent_soft)),
-            )
-            .child(
-                self.icon_button(
-                    "btn-shuffle",
-                    Icon::Shuffle,
-                    "Shuffle (Shift+S)",
-                    t,
-                    |this, _, _, cx| {
-                        let s = !this.playlist.shuffle();
-                        this.playlist.set_shuffle(s);
-                        this.settings.shuffle = s;
-                        this.osd(if s { "Shuffle: on" } else { "Shuffle: off" }, cx);
-                    },
-                    cx,
-                )
-                .when(self.playlist.shuffle(), |d| d.bg(t.accent_soft)),
-            );
-        if !overlay {
-            right = right.child(
-                self.icon_button(
-                    "btn-playlist",
-                    Icon::Playlist,
-                    "Playlist (Ctrl+L)",
-                    t,
-                    |this, _, _, cx| {
-                        this.show_playlist = !this.show_playlist;
-                        cx.notify();
-                    },
-                    cx,
-                )
-                .when(self.show_playlist, |d| d.bg(t.accent_soft)),
-            );
-        }
-        right = right
-            .child(self.icon_button(
-                "btn-settings",
-                Icon::Settings,
-                "Preferences",
-                t,
-                |this, _, w, cx| this.show_dialog(super::dialogs::Dialog::Settings(0), w, cx),
-                cx,
-            ))
-            .child(self.icon_button(
-                "btn-fs",
-                if fullscreen { Icon::ExitFullscreen } else { Icon::Fullscreen },
-                "Fullscreen (F)",
-                t,
-                |_, _, w, _| w.toggle_fullscreen(),
-                cx,
-            ))
-            .child(div().w(px(6.)))
-            .child(self.icon_button(
-                "btn-mute",
-                vol_icon,
-                "Mute (M)",
-                t,
-                |this, _, _, cx| {
-                    let m = !this.player.muted();
-                    this.player.set_muted(m);
-                    this.settings.muted = m;
-                    cx.notify();
-                },
-                cx,
-            ))
-            .child(div().w(px(96.)).child(self.slider(
-                "volume",
-                if muted { 0.0 } else { vol as f32 / max_vol },
-                false,
-                t,
-                move |this, f, _, cx| this.set_volume(f as f64 * max_vol as f64, cx),
-                cx,
-            )))
-            .child(div().w(px(4.)))
-            .child(match self.inputs.get("volume").filter(|_| self.editing_volume) {
-                Some(input) => div()
-                    .w(px(44.))
-                    .h(px(22.))
-                    .px_1()
-                    .flex()
-                    .items_center()
-                    .rounded(px(5.))
-                    .bg(t.surface_alt)
-                    .border_1()
-                    .border_color(t.accent)
-                    .text_size(px(11.))
-                    .child(input.clone())
+        for c in shown {
+            let el: AnyElement = match c {
+                BarControl::Stop => self
+                    .icon_button("btn-stop", Icon::Stop, "Stop", t, |this, _, w, cx| this.stop(w, cx), cx)
                     .into_any_element(),
-                None => div()
-                    .id("volume-text")
-                    .w(px(44.))
-                    .text_size(px(11.))
-                    .text_color(t.text_dim)
-                    .cursor_pointer()
-                    .child(format!("{:.0}%", vol * 100.0))
-                    .tooltip(tooltip("Double-click to type a volume", t))
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        if ev.click_count() >= 2 {
-                            this.start_volume_edit(window, cx);
+                BarControl::Previous => self
+                    .icon_button(
+                        "btn-prev",
+                        Icon::Previous,
+                        "Previous (Shift+N)",
+                        t,
+                        |this, _, w, cx| this.prev_item(w, cx),
+                        cx,
+                    )
+                    .into_any_element(),
+                BarControl::Next => self
+                    .icon_button("btn-next", Icon::Next, "Next (N)", t, |this, _, w, cx| this.next_item(w, cx), cx)
+                    .into_any_element(),
+                BarControl::Subtitles => {
+                    popup_btn(self, "btn-subs", Icon::Subtitles, "Subtitles", |s| s.subtitle_popup(), cx)
+                        .into_any_element()
+                }
+                BarControl::AudioTrack => {
+                    popup_btn(self, "btn-audio", Icon::Audio, "Audio track", |s| s.audio_popup(), cx).into_any_element()
+                }
+                BarControl::Speed => div()
+                    .id("speed")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, cx| {
+                        let dy = match ev.delta {
+                            ScrollDelta::Lines(p) => p.y,
+                            ScrollDelta::Pixels(p) => f32::from(p.y) / 40.0,
+                        };
+                        if dy.abs() >= 0.2 {
+                            let s = this.player.speed() + 0.05 * dy.signum() as f64;
+                            this.set_speed((s / 0.05).round() * 0.05, cx);
                         }
+                        cx.stop_propagation();
                     }))
+                    .child(
+                        div()
+                            .id("btn-speed")
+                            .w(px(super::bar::SPEED_LABEL))
+                            .h(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(7.))
+                            .cursor_pointer()
+                            .text_size(px(12.))
+                            .text_color(if (speed - 1.0).abs() > 1e-3 { t.accent } else { t.text })
+                            .hover(|s| s.bg(t.hover))
+                            .child(format_speed(speed))
+                            .tooltip(tooltip("Playback speed: click for normal speed", t))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_speed(1.0, cx))),
+                    )
+                    .child(div().w(px(super::bar::SPEED_SLIDER)).child(self.slider(
+                        "speed-slider",
+                        speed_to_frac(speed),
+                        false,
+                        t,
+                        |this, f, _, cx| this.set_speed(frac_to_speed(f), cx),
+                        cx,
+                    )))
                     .into_any_element(),
-            });
+                BarControl::Repeat => self
+                    .icon_button("btn-repeat", repeat_icon, "Repeat (R)", t, |this, _, _, cx| this.cycle_repeat(cx), cx)
+                    .when(self.playlist.repeat != RepeatMode::Off, |d| d.bg(t.accent_soft))
+                    .into_any_element(),
+                BarControl::Shuffle => self
+                    .icon_button(
+                        "btn-shuffle",
+                        Icon::Shuffle,
+                        "Shuffle (Shift+S)",
+                        t,
+                        |this, _, _, cx| {
+                            let s = !this.playlist.shuffle();
+                            this.playlist.set_shuffle(s);
+                            this.settings.shuffle = s;
+                            this.osd(if s { "Shuffle: on" } else { "Shuffle: off" }, cx);
+                        },
+                        cx,
+                    )
+                    .when(self.playlist.shuffle(), |d| d.bg(t.accent_soft))
+                    .into_any_element(),
+                BarControl::Playlist => self
+                    .icon_button(
+                        "btn-playlist",
+                        Icon::Playlist,
+                        "Playlist (Ctrl+L)",
+                        t,
+                        |this, _, _, cx| {
+                            this.show_playlist = !this.show_playlist;
+                            cx.notify();
+                        },
+                        cx,
+                    )
+                    .when(self.show_playlist, |d| d.bg(t.accent_soft))
+                    .into_any_element(),
+                BarControl::Settings => self
+                    .icon_button(
+                        "btn-settings",
+                        Icon::Settings,
+                        "Preferences",
+                        t,
+                        |this, _, w, cx| this.show_dialog(super::dialogs::Dialog::Settings(0), w, cx),
+                        cx,
+                    )
+                    .into_any_element(),
+                BarControl::Fullscreen => self
+                    .icon_button(
+                        "btn-fs",
+                        if fullscreen { Icon::ExitFullscreen } else { Icon::Fullscreen },
+                        "Fullscreen (F)",
+                        t,
+                        |_, _, w, _| w.toggle_fullscreen(),
+                        cx,
+                    )
+                    .into_any_element(),
+                BarControl::Volume => div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap_1()
+                    .pl(px(super::bar::VOLUME_LEAD))
+                    .child(self.icon_button(
+                        "btn-mute",
+                        vol_icon,
+                        "Mute (M)",
+                        t,
+                        |this, _, _, cx| {
+                            let m = !this.player.muted();
+                            this.player.set_muted(m);
+                            this.settings.muted = m;
+                            cx.notify();
+                        },
+                        cx,
+                    ))
+                    .child(div().w(px(super::bar::VOLUME_SLIDER)).child(self.slider(
+                        "volume",
+                        if muted { 0.0 } else { vol as f32 / max_vol },
+                        false,
+                        t,
+                        move |this, f, _, cx| this.set_volume(f as f64 * max_vol as f64, cx),
+                        cx,
+                    )))
+                    .child(
+                        div().flex_none().pl(px(super::bar::VOLUME_TEXT_LEAD)).child(
+                            match self.inputs.get("volume").filter(|_| self.editing_volume) {
+                                Some(input) => div()
+                                    .w(px(44.))
+                                    .h(px(22.))
+                                    .px_1()
+                                    .flex()
+                                    .items_center()
+                                    .rounded(px(5.))
+                                    .bg(t.surface_alt)
+                                    .border_1()
+                                    .border_color(t.accent)
+                                    .text_size(px(11.))
+                                    .child(input.clone())
+                                    .into_any_element(),
+                                None => div()
+                                    .id("volume-text")
+                                    .w(px(44.))
+                                    .text_size(px(11.))
+                                    .text_color(t.text_dim)
+                                    .cursor_pointer()
+                                    .child(format!("{:.0}%", vol * 100.0))
+                                    .tooltip(tooltip("Double-click to type a volume", t))
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        if ev.click_count() >= 2 {
+                                            this.start_volume_edit(window, cx);
+                                        }
+                                    }))
+                                    .into_any_element(),
+                            },
+                        ),
+                    )
+                    .into_any_element(),
+            };
+            if c.on_left() {
+                left = left.child(el);
+            } else {
+                right = right.child(el);
+            }
+        }
 
         div()
             .id(if overlay { "controls-overlay" } else { "controls" })
@@ -1561,8 +1644,9 @@ impl PlayerView {
 
 impl Render for PlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ui_stats.1 += 1;
+        self.avoid_direct_scanout(window);
         self.retire_textures(window);
-        self.update_target_size(window);
         let t = self.theme;
         let fullscreen = window.is_fullscreen();
         let client_decor = matches!(window.window_decorations(), Decorations::Client { .. }) && !fullscreen;

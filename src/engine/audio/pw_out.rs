@@ -6,8 +6,7 @@
 //! exact output delay for A/V sync, and a "MavPlayer" entry with its icon in
 //! volume mixers.
 
-use super::{OutFormat, callback_state, wanted_channels};
-use crate::engine::SessionCtx;
+use super::{OutFormat, OutputLink, callback_state, wanted_channels};
 use crate::engine::av::ff;
 use crate::engine::types::ChannelMode;
 use pipewire as pw;
@@ -18,7 +17,7 @@ use pw::stream::{StreamFlags, StreamState};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// PipeWire's default graph rate; anything else is resampled by PipeWire.
@@ -175,8 +174,7 @@ struct ProcessData {
 /// already took over the output and this returns at once. An `Err` means
 /// PipeWire couldn't be used at all, so the caller can try another backend.
 pub fn run(
-    ctx: &Arc<SessionCtx>,
-    stop: &Arc<AtomicBool>,
+    link: &Arc<OutputLink>,
     device: Option<&str>,
     mode: ChannelMode,
     media_channels: i32,
@@ -217,7 +215,7 @@ pub fn run(
 
     let callbacks = Arc::new(AtomicU64::new(0));
     let data = ProcessData {
-        state: callback_state(ctx, &fmt),
+        state: callback_state(link, &fmt),
         scratch: Vec::new(),
         channels: channels as usize,
         callbacks: callbacks.clone(),
@@ -282,19 +280,19 @@ pub fn run(
         return Ok(Outcome::Stopped);
     }
 
-    // Stop when the session ends; give up on a stream that stops asking for
-    // samples (no sink, stuck server) so the clock doesn't freeze.
+    // Stop when nothing is left to play; give up on a stream that stops
+    // asking for samples (no sink, stuck server) so the clock doesn't freeze.
     let stalled = Rc::new(Cell::new(false));
-    let (c, s, ml, st) = (ctx.clone(), stop.clone(), mainloop.clone(), stalled.clone());
+    let (l, ml, st) = (link.clone(), mainloop.clone(), stalled.clone());
     let seen = Cell::new(0u64);
     let last_progress = Cell::new(Instant::now());
     let ticker = mainloop.loop_().add_timer(move |_| {
-        if !c.alive() || s.load(Ordering::Acquire) {
+        if !l.keep_serving() {
             ml.quit();
             return;
         }
         let n = callbacks.load(Ordering::Relaxed);
-        if n != seen.get() || c.paused() {
+        if n != seen.get() || l.paused() {
             seen.set(n);
             last_progress.set(Instant::now());
         } else if last_progress.get().elapsed() > Duration::from_secs(2) {

@@ -49,7 +49,7 @@ pub fn open_input(source: &MediaSource, cfg: &EngineConfig, ctx: Option<&Session
         let mut opts = Dict::new();
         let mut fmt: *const ff::AVInputFormat = ptr::null();
         let url = match source {
-            MediaSource::File(p) => p.to_string_lossy().into_owned(),
+            MediaSource::File(p) => file_url(p),
             MediaSource::Url(u) => {
                 opts.set("user_agent", &cfg.user_agent);
                 if u.starts_with("http") {
@@ -96,6 +96,13 @@ pub fn open_input(source: &MediaSource, cfg: &EngineConfig, ctx: Option<&Session
         }
         Ok(fctx)
     }
+}
+
+/// A local path as an FFmpeg URL. The explicit `file:` protocol keeps names
+/// such as `concat:a|b`, `subfile:…` or `pipe:0` (from a playlist or the
+/// command line) from being interpreted as other FFmpeg protocols.
+fn file_url(p: &std::path::Path) -> String {
+    format!("file:{}", p.to_string_lossy())
 }
 
 fn friendly_open_error(code: c_int, source: &MediaSource) -> String {
@@ -291,25 +298,38 @@ fn start_component(
             let (c, s, cfg) = (ctx.clone(), stop.clone(), cfg.clone());
             threads.push(spawn("audio-dec", move || {
                 let pending = PendingAudio(&c, token);
+                let publish = |fmt: &audio::OutFormat| {
+                    c.update_state(|st| {
+                        st.audio = Some(AudioParams {
+                            decoder: decoder_name.clone(),
+                            in_rate,
+                            in_layout: in_layout.clone(),
+                            in_format: in_format.clone(),
+                            out_rate: fmt.rate,
+                            out_channels: fmt.channels,
+                            device: fmt.device.clone(),
+                        })
+                    });
+                    c.audio_active.store(true, Ordering::Release);
+                };
+                // Preloaded next item: continue on the device that is playing now.
+                if let Some((link, fmt)) = audio::adopt_output(&c, &s, &cfg, media_channels, token) {
+                    log::debug!("audio queued gaplessly on the open output");
+                    publish(&fmt);
+                    // `audio_pending` stays set until the output switches over.
+                    std::mem::forget(pending);
+                    audio::run_decoder(c.clone(), dec, tb, fmt, s);
+                    audio::finish_output(&link, c.id, None);
+                    return;
+                }
                 log::debug!("startup: opening audio device at {:.0} ms", crate::ms_since_start());
                 match audio::open_output(c.clone(), s.clone(), &cfg, media_channels) {
-                    Ok((out_thread, fmt)) => {
+                    Ok((out_thread, fmt, link)) => {
                         log::info!("audio output ready: {} ({} Hz, {} ch)", fmt.device, fmt.rate, fmt.channels);
-                        c.update_state(|st| {
-                            st.audio = Some(AudioParams {
-                                decoder: decoder_name,
-                                in_rate,
-                                in_layout,
-                                in_format,
-                                out_rate: fmt.rate,
-                                out_channels: fmt.channels,
-                                device: fmt.device.clone(),
-                            })
-                        });
-                        c.audio_active.store(true, Ordering::Release);
+                        publish(&fmt);
                         drop(pending);
-                        audio::run_decoder(c, dec, tb, fmt, s);
-                        let _ = out_thread.join();
+                        audio::run_decoder(c.clone(), dec, tb, fmt, s);
+                        audio::finish_output(&link, c.id, Some(out_thread));
                     }
                     Err(e) => {
                         log::warn!("audio output failed: {e:#}");
@@ -562,23 +582,26 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
         // Back-pressure: stop reading when every queue has enough.
         let enough = |q: &super::sync::PacketQueue, active: bool| !active || q.len() > MIN_FRAMES;
         let total = ctx.vq.bytes() + ctx.aq.bytes() + ctx.sq.bytes();
+        let cached = cache_ahead(&ctx, &ic, &audio_c, &video_c);
         let full = total > MAX_QUEUE_BYTES
             || (enough(&ctx.vq, video_c.is_some() && ctx.video_active.load(Ordering::Acquire))
                 && enough(&ctx.aq, audio_c.is_some())
-                && cache_ahead(&ctx, &ic, &audio_c, &video_c)
-                    > cfg.network_cache_secs.min(if info.is_live { 4.0 } else { 120.0 }).max(1.0));
-        update_cache_state(&ctx, &ic, &audio_c, &video_c);
+                && cached > cfg.network_cache_secs.min(if info.is_live { 4.0 } else { 120.0 }).max(1.0));
+        update_cache_state(&ctx, cached, audio_c.is_some());
         if full || (ctx.eof.load(Ordering::Acquire) && ctx.seek_req.lock().is_none()) {
             if ctx.eof.load(Ordering::Acquire) {
+                super::preload_next(&ctx);
                 let audio_done = audio_c.is_none()
                     || (ctx.audio_finished.load(Ordering::Acquire) == ctx.aq.serial() && ctx.abuf.is_empty());
                 let video_done = video_c.is_none()
                     || !ctx.video_active.load(Ordering::Acquire)
                     || (ctx.video_finished.load(Ordering::Acquire) == ctx.vq.serial() && ctx.frames.len() == 0);
-                if audio_done && video_done && !ctx.paused() && !eof_reported {
+                if audio_done && video_done && !ctx.paused() && !eof_reported && ctx.is_current() {
                     eof_reported = true;
-                    ctx.update_state(|st| st.status = Status::Ended);
-                    ctx.emit(PlayerEvent::EndOfFile);
+                    if !super::advance(&ctx) {
+                        ctx.update_state(|st| st.status = Status::Ended);
+                        ctx.emit(PlayerEvent::EndOfFile);
+                    }
                 }
             }
             let mut g = ctx.demux_lock.lock();
@@ -588,7 +611,13 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
 
         let r = unsafe { ff::av_read_frame(ic.0, pkt.0) };
         if r < 0 {
-            let at_eof = r == ff::AVERROR_EOF || unsafe { !(*ic.0).pb.is_null() && ff::avio_feof((*ic.0).pb) != 0 };
+            // A failed I/O context (after FFmpeg's own reconnect attempts)
+            // won't recover either: end the input rather than retry forever.
+            let at_eof = r == ff::AVERROR_EOF
+                || unsafe {
+                    let pb = (*ic.0).pb;
+                    !pb.is_null() && (ff::avio_feof(pb) != 0 || (*pb).error < 0)
+                };
             if at_eof || r == ff::AVERROR_EXIT {
                 if !ctx.eof.swap(true, Ordering::AcqRel) {
                     if video_c.is_some() {
@@ -680,13 +709,12 @@ fn cache_ahead(ctx: &SessionCtx, ic: &FormatCtx, a: &Option<Component>, v: &Opti
     if m.is_finite() { m } else { 0.0 }
 }
 
-fn update_cache_state(ctx: &SessionCtx, ic: &FormatCtx, a: &Option<Component>, v: &Option<Component>) {
-    let c = cache_ahead(ctx, ic, a, v);
-    if let Some(mut st) = ctx.shared.state.try_lock()
-        && ctx.is_current()
+fn update_cache_state(ctx: &SessionCtx, cached: f64, has_audio: bool) {
+    if ctx.is_current()
+        && let Some(mut st) = ctx.shared.state.try_lock()
     {
-        st.cache_secs = c;
-        let empty = (a.is_some() && ctx.aq.len() == 0 && ctx.abuf.is_empty()) && !ctx.eof.load(Ordering::Acquire);
+        st.cache_secs = cached;
+        let empty = (has_audio && ctx.aq.len() == 0 && ctx.abuf.is_empty()) && !ctx.eof.load(Ordering::Acquire);
         st.buffering = empty && !ctx.paused();
         st.seeking = ctx.seeking.load(Ordering::Acquire);
     }

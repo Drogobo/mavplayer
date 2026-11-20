@@ -22,6 +22,7 @@ cp target/release/mavplayer "$APP/Contents/MacOS/mavplayer"
 cp packaging/macos/MavPlayer.icns "$APP/Contents/Resources/MavPlayer.icns"
 sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
 cp LICENSE README.md "$APP/Contents/Resources/"
+cp third_party/shaders/LICENSES.txt "$APP/Contents/Resources/SHADER-LICENSES.txt"
 
 # Anything not from the OS must have been linked statically.
 if otool -L "$APP/Contents/MacOS/mavplayer" | tail -n +2 | grep -Ev '/System/Library/|/usr/lib/'; then

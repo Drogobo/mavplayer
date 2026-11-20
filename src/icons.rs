@@ -133,20 +133,31 @@ impl Icon {
     }
 
     /// Asset path for `gpui::svg().path(..)`.
+    /// Called for every icon on every render, so both answers are cached.
     pub fn path(self) -> SharedString {
         let name = self.freedesktop_name();
         if use_system_theme()
             && let Some(map) = SYSTEM.get()
             && let Some(p) = map.read().ok().and_then(|m| m.get(name).cloned())
         {
-            return format!("sys:{}", p.display()).into();
+            return p;
         }
-        format!("icons/{name}.svg").into()
+        static BUNDLED: OnceLock<HashMap<&'static str, SharedString>> = OnceLock::new();
+        BUNDLED
+            .get_or_init(|| {
+                ALL.iter()
+                    .map(|i| (i.freedesktop_name(), format!("icons/{}.svg", i.freedesktop_name()).into()))
+                    .collect()
+            })
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| format!("icons/{name}.svg").into())
     }
 }
 
 static USE_SYSTEM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static SYSTEM: OnceLock<RwLock<HashMap<&'static str, PathBuf>>> = OnceLock::new();
+/// Icon name → asset path (`sys:<file>`) in the desktop's theme.
+static SYSTEM: OnceLock<RwLock<HashMap<&'static str, SharedString>>> = OnceLock::new();
 
 fn use_system_theme() -> bool {
     USE_SYSTEM.load(std::sync::atomic::Ordering::Relaxed)
@@ -169,7 +180,7 @@ pub fn init_system_icons(done: impl FnOnce() + Send + 'static) {
                 if let Some(m) = SYSTEM.get()
                     && let Ok(mut w) = m.write()
                 {
-                    *w = found;
+                    *w = found.into_iter().map(|(k, p)| (k, format!("sys:{}", p.display()).into())).collect();
                 }
                 done();
             }

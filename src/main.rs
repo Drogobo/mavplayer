@@ -3,7 +3,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod engine;
+#[cfg(target_os = "linux")]
+mod font_prefetch;
 mod icons;
+mod instance;
 mod integration;
 mod playlist;
 mod settings;
@@ -22,6 +25,7 @@ USAGE:
 
 OPTIONS:
     -f, --fullscreen          Start in fullscreen
+    -n, --new-window          Open a new window even if MavPlayer is already open
         --integrate           Add this AppImage to the desktop's application menu
         --remove-integration  Remove the application menu entry created by --integrate
     -v, --verbose             Print FFmpeg diagnostics to stderr
@@ -32,11 +36,12 @@ OPTIONS:
 struct Args {
     sources: Vec<engine::MediaSource>,
     fullscreen: bool,
+    new_window: bool,
     verbose: bool,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { sources: vec![], fullscreen: false, verbose: false };
+    let mut args = Args { sources: vec![], fullscreen: false, new_window: false, verbose: false };
     let mut paths: Vec<PathBuf> = vec![];
     let mut only_files = false;
     for a in std::env::args().skip(1) {
@@ -52,6 +57,7 @@ fn parse_args() -> Args {
                     std::process::exit(0);
                 }
                 "-f" | "--fullscreen" => args.fullscreen = true,
+                "-n" | "--new-window" => args.new_window = true,
                 "-v" | "--verbose" => args.verbose = true,
                 "--integrate" => exit_with(integration::integrate().map(|p| format!("Installed {}", p.display()))),
                 "--remove-integration" | "--unintegrate" => {
@@ -118,9 +124,27 @@ fn main() {
     }
     engine::init(verbose);
 
+    let settings = settings::Settings::load();
+    // Hand the files to an open window instead, if the settings say so.
+    if !args.sources.is_empty()
+        && !args.new_window
+        && settings.when_running != settings::RunningMode::NewWindow
+        && instance::forward(settings.when_running, &args.sources)
+    {
+        log::debug!("startup: handed {} item(s) to the open window", args.sources.len());
+        return;
+    }
+
+    // GPUI's font scan in Application::new() is slow on a cold cache: warm it in parallel first.
+    #[cfg(target_os = "linux")]
+    let fonts = font_prefetch::start();
     // Start opening the first file now: it decodes while GPUI brings up the GPU.
-    let boot = ui::player::Boot::start(args.sources);
+    let boot = ui::player::Boot::start(settings, args.sources);
     integration::ensure_window_icon();
+    #[cfg(target_os = "linux")]
+    if let Some(fonts) = fonts {
+        let _ = fonts.join();
+    }
     let app = Application::new().with_assets(icons::Assets);
     log::debug!("startup: GPU and platform ready at {:.0} ms", ms_since_start());
     // Files opened from Finder / the dock while running (and URL schemes).
@@ -135,7 +159,10 @@ fn main() {
 
         let fullscreen = args.fullscreen || boot.settings.start_fullscreen;
         let (w, h) = boot.settings.window_size.unwrap_or((960.0, 600.0));
-        let bounds = Bounds::centered(None, size(px(w.max(480.0)), px(h.max(320.0))), cx);
+        // Wide enough for every control chosen for the bottom bar. (GPUI can't
+        // change it later; the bar leaves controls out if it must.)
+        let min_w = ui::bar::min_window_width(&boot.settings.bar_controls);
+        let bounds = Bounds::centered(None, size(px(w.max(480.0).max(min_w)), px(h.max(320.0))), cx);
         let options = WindowOptions {
             window_bounds: Some(if fullscreen {
                 WindowBounds::Fullscreen(bounds)
@@ -148,7 +175,7 @@ fn main() {
                 traffic_light_position: None,
             }),
             app_id: Some(integration::APP_ID.to_string()),
-            window_min_size: Some(size(px(420.), px(280.))),
+            window_min_size: Some(size(px(min_w), px(280.))),
             window_decorations: Some(WindowDecorations::Server),
             focus: true,
             show: true,

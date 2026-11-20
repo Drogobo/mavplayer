@@ -25,11 +25,28 @@ one click away.
 - HDR10/HLG to SDR tone mapping, automatic deinterlacing, exact frame seeking,
   frame stepping, A-B loop, playback speed 0.25×–4× with pitch preserved.
 - Resumes files where you left off.
+- Media keys and the desktop's player controls (MPRIS on Linux, the media
+  overlay on Windows, Now Playing on macOS).
+- Opening files while MavPlayer is open can start a new window, or add to the
+  open window's playlist (and play), or replace it: your choice in settings.
 
 **Video**: aspect ratio override, crop, zoom, rotate and flip, brightness /
 contrast / saturation / gamma / hue, sharpen, denoise, grayscale, invert.
 
-**Audio**: output device and channel layout selection (stereo through 7.1),
+**Upscaling** (Video ▸ Upscaling, or Settings ▸ Video): besides plain bilinear
+and nearest neighbour (for pixel art), GPU upscalers run through FFmpeg's
+libplacebo filter (Vulkan) when FFmpeg is built with it, as in every Linux
+and Windows package (not yet on macOS):
+- **Anime4K** with its six presets (A, B, C, A+A, B+B, C+A) in HQ and Fast
+  versions.
+- **FSRCNNX** (16 and 8 filters), **ArtCNN** C4F16 (plain or denoise +
+  sharpen), **RAVU-Lite**, **AMD FSR**, **NVIDIA Image Scaling** and EWA
+  Lanczos.
+- **KrigBilateral** chroma upscaling and **AMD CAS** sharpening on top of any
+  of them.
+- Your own mpv-style `.glsl`/`.hook` shader file (NNEDI3, SSimSuperRes, …).
+
+**Audio**: native PipeWire output on Linux; output device and channel layout selection (stereo through 7.1),
 10-band equalizer with presets, volume normalization, night mode (dynamic range
 compression), stereo widening, channel swap, karaoke, audio delay, volume up to
 150 %.
@@ -42,6 +59,8 @@ video; preferred languages, encoding detection, delay, size, position and style.
 - Light and dark themes that follow the system; menus, context menu, keyboard
   shortcuts for everything, drag and drop, mouse-wheel volume or seek.
 - Playlists (M3U/PLS load and save), shuffle, repeat, recent files.
+- Gapless playback: songs follow each other and loops repeat with no gap, down
+  to the sample.
 - Uses your desktop's icon theme on Linux, falling back to built-in
   [Papirus](https://github.com/PapirusDevelopmentTeam/papirus-icon-theme) icons.
 - Native window decorations everywhere they exist.
@@ -98,6 +117,7 @@ MavPlayer will use it automatically. Check that doing so is legal where you live
 mavplayer [OPTIONS] [FILE | FOLDER | URL | dvd://[TITLE][/DEVICE]] ...
 
   -f, --fullscreen          Start in fullscreen
+  -n, --new-window          Open a new window even if MavPlayer is already open
       --integrate           Add this AppImage to the desktop's application menu
       --remove-integration  Remove that menu entry again
   -v, --verbose             Print diagnostics to stderr
@@ -171,6 +191,11 @@ Release builds also contain these components, under GPL-3.0-compatible licenses:
   uses the runtime's shaderc (Apache-2.0). The Windows packages ship BtbN's
   GPL FFmpeg build, which includes libplacebo too.
 - **Papirus icons** (GPL-3.0), compiled into the binary as fallback icons.
+- **Upscaling shaders** (MIT and LGPL-3.0-or-later): Anime4K, ArtCNN, FSRCNNX,
+  RAVU, AMD FSR and CAS, NVIDIA Image Scaling and KrigBilateral, compiled into
+  the binary. See [`third_party/shaders`](third_party/shaders/README.md) for
+  sources and [`LICENSES.txt`](third_party/shaders/LICENSES.txt) for the
+  license texts, which packages install as `SHADER-LICENSES.txt`.
 - **GPUI** (Apache-2.0) and Rust crates under MIT/Apache-2.0.
 
 `scripts/build-ffmpeg.sh` records the exact versions; their source code is

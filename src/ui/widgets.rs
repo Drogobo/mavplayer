@@ -35,6 +35,32 @@ pub fn tooltip(text: impl Into<SharedString>, theme: Theme) -> impl Fn(&mut Wind
     move |_w, cx| cx.new(|_| Tooltip { text: text.clone(), theme }).into()
 }
 
+/// Playback speed slider range. The scale is logarithmic so 1× sits in the
+/// middle, with as much room for slowing down as for speeding up.
+pub const SPEED_MIN: f64 = 0.25;
+pub const SPEED_MAX: f64 = 4.0;
+
+/// Slider position (0..=1) for a speed.
+pub fn speed_to_frac(speed: f64) -> f32 {
+    ((speed.clamp(SPEED_MIN, SPEED_MAX) / SPEED_MIN).ln() / (SPEED_MAX / SPEED_MIN).ln()) as f32
+}
+
+/// Speed for a slider position: 0.05 steps, catching at 1×.
+pub fn frac_to_speed(f: f32) -> f64 {
+    let raw = SPEED_MIN * (SPEED_MAX / SPEED_MIN).powf(f.clamp(0.0, 1.0) as f64);
+    if (raw - 1.0).abs() < 0.04 {
+        return 1.0;
+    }
+    ((raw / 0.05).round() * 0.05).clamp(SPEED_MIN, SPEED_MAX)
+}
+
+/// "1×", "1.25×", "0.5×".
+pub fn format_speed(speed: f64) -> String {
+    let s = format!("{speed:.2}");
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    format!("{s}×")
+}
+
 pub fn format_time(secs: f64) -> String {
     if !secs.is_finite() || secs < 0.0 {
         return "--:--".into();
@@ -89,6 +115,22 @@ pub fn parse_time(s: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_slider_mapping() {
+        assert!((speed_to_frac(1.0) - 0.5).abs() < 1e-6);
+        assert_eq!(frac_to_speed(0.0), SPEED_MIN);
+        assert_eq!(frac_to_speed(1.0), SPEED_MAX);
+        assert_eq!(frac_to_speed(0.5), 1.0);
+        assert_eq!(frac_to_speed(0.51), 1.0); // catches at 1×
+        for s in [0.25, 0.5, 0.75, 1.25, 1.5, 2.0, 3.0] {
+            assert!((frac_to_speed(speed_to_frac(s)) - s).abs() < 1e-9, "{s}");
+        }
+        assert_eq!(format_speed(1.0), "1×");
+        assert_eq!(format_speed(1.25), "1.25×");
+        assert_eq!(format_speed(0.5), "0.5×");
+        assert_eq!(format_speed(1.1500000000000001), "1.15×");
+    }
     #[test]
     fn time_roundtrip() {
         assert_eq!(format_time(3725.4), "1:02:05");

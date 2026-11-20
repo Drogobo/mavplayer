@@ -9,6 +9,13 @@
 //!         ├─► audio packets ──► audio decode ─► filter ─► sample buffer ─► audio device (master clock)
 //!         └─► subtitle packets ─► subtitle decode ─► event store ─► UI overlay
 //! ```
+//!
+//! Gapless playback: near the end of a file, the item queued with
+//! [`Player::set_next`] is opened as a second, *standby* session that
+//! buffers but shows and plays nothing. The audio output (which outlives
+//! sessions, see `audio::OutputLink`) switches to it on the sample where
+//! the current file's audio runs out and promotes it to current; without
+//! audio, the demuxer promotes it at end of file.
 
 mod audio;
 pub mod av;
@@ -21,15 +28,22 @@ pub mod probe;
 mod subs;
 mod sync;
 pub mod types;
+mod upscale;
 mod video;
 
 pub use types::*;
 
+/// Whether the GPU upscalers (libplacebo: EWA Lanczos and shaders) are
+/// available in this FFmpeg build.
+pub fn gpu_upscaling_available() -> bool {
+    upscale::available()
+}
+
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Condvar, Mutex};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
 /// An `f64` stored in an `AtomicU64`.
@@ -51,6 +65,12 @@ pub struct Controls {
     pub paused: AtomicBool,
     pub volume: AtomicF64,
     pub muted: AtomicBool,
+    /// Sound held silent while the progress bar is dragged (no stutter of
+    /// snippets from each position passed).
+    pub hushed: AtomicBool,
+    /// The window isn't being drawn: decode and keep time, but don't
+    /// convert pictures nobody sees.
+    pub video_hidden: AtomicBool,
     pub speed: AtomicF64,
     pub audio_delay: AtomicF64,
     pub config: Mutex<EngineConfig>,
@@ -58,6 +78,12 @@ pub struct Controls {
     pub video_adjust: Mutex<(u64, VideoAdjust)>,
     /// Largest useful output size in physical pixels (w << 32 | h).
     pub target_size: AtomicU64,
+    /// The UI has reported `target_size` (until then it is a 4K guess,
+    /// which mustn't start GPU upscaling for a window that isn't open).
+    pub target_known: AtomicBool,
+    /// The audio output currently open, so a preloaded next item can carry
+    /// on through it without a gap.
+    pub(crate) output: Mutex<Weak<audio::OutputLink>>,
 }
 
 impl Controls {
@@ -77,6 +103,24 @@ pub struct Shared {
     pub wake: Box<dyn Fn() + Send + Sync>,
     pub events: Sender<PlayerEvent>,
     pub current_session: AtomicU64,
+    next_id: AtomicU64,
+    /// The item to play after the current one, for gapless transitions.
+    next: Mutex<NextSlot>,
+}
+
+/// What follows the current session.
+#[derive(Default)]
+struct NextSlot {
+    /// What the UI wants played next.
+    want: Option<(MediaSource, LoadOptions)>,
+    /// Its preloaded session, started once the current one nears its end.
+    session: Option<Session>,
+}
+
+/// State changes and events a preloaded session collects until it takes over.
+pub struct Standby {
+    state: PlaybackState,
+    events: Vec<PlayerEvent>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -125,6 +169,13 @@ pub struct SessionCtx {
     pub subs: subs::SubStore,
     pub last_frame: Mutex<Option<(av::Frame, f64)>>,
     pub sub_canvas: AtomicU64,
+    /// `Some` while this session is preloaded as the next item: it opens,
+    /// decodes and buffers, but shows and plays nothing, and its state and
+    /// events reach the UI only when it takes over ([`SessionCtx::promote`]).
+    standby: Mutex<Option<Standby>>,
+    standby_flag: AtomicBool,
+    /// The session this one was preloaded to follow (0 if none).
+    pub follows: u64,
 }
 
 impl SessionCtx {
@@ -137,16 +188,61 @@ impl SessionCtx {
     }
 
     pub fn emit(&self, ev: PlayerEvent) {
-        if self.is_current() && self.alive() {
+        if !self.alive() {
+            return;
+        }
+        if let Some(sb) = self.standby.lock().as_mut() {
+            sb.events.push(ev);
+            return;
+        }
+        if self.is_current() {
             let _ = self.shared.events.send(ev);
             (self.shared.wake)();
         }
     }
 
     pub fn update_state(&self, f: impl FnOnce(&mut PlaybackState)) {
+        if let Some(sb) = self.standby.lock().as_mut() {
+            f(&mut sb.state);
+            return;
+        }
         if self.is_current() {
             f(&mut self.shared.state.lock());
         }
+    }
+
+    /// True while preloaded and waiting to take over.
+    pub fn is_standby(&self) -> bool {
+        self.standby_flag.load(Ordering::Acquire)
+    }
+
+    /// Makes this preloaded session the one playing: publishes the state and
+    /// events it collected and tells the UI it advanced. Returns false if it
+    /// already took over or was shut down.
+    pub fn promote(&self) -> bool {
+        let mut sb = self.standby.lock();
+        if !self.alive() {
+            return false;
+        }
+        let Some(s) = sb.take() else { return false };
+        self.standby_flag.store(false, Ordering::Release);
+        let source = s.state.source.clone();
+        {
+            let mut st = self.shared.state.lock();
+            *st = s.state;
+            self.shared.current_session.store(self.id, Ordering::Release);
+        }
+        if let Some(src) = source {
+            let _ = self.shared.events.send(PlayerEvent::Advanced(src));
+        }
+        for ev in s.events {
+            let _ = self.shared.events.send(ev);
+        }
+        drop(sb);
+        log::debug!("session {} took over from {}", self.id, self.follows);
+        (self.shared.wake)();
+        self.wake_demuxer();
+        true
     }
 
     pub fn wake(&self) {
@@ -177,6 +273,11 @@ impl SessionCtx {
     /// True while playback is held until the audio device is ready.
     pub fn audio_pending(&self) -> bool {
         self.audio_pending.load(Ordering::Acquire) != 0
+    }
+
+    /// Clears `audio_pending` if `token`'s audio component still holds it.
+    pub fn release_audio_pending(&self, token: u64) {
+        let _ = self.audio_pending.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Relaxed);
     }
 
     pub fn audio_is_master(&self) -> bool {
@@ -254,23 +355,121 @@ pub struct Player {
     shared: Arc<Shared>,
     session: Option<Session>,
     events_rx: Receiver<PlayerEvent>,
-    next_id: u64,
+}
+
+/// How long before the end of the current item the next one is preloaded.
+const PRELOAD_SECS: f64 = 10.0;
+
+fn new_session(controls: &Arc<Controls>, shared: &Arc<Shared>, source: &MediaSource, follows: u64) -> Arc<SessionCtx> {
+    let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+    let standby = (follows != 0).then(|| Standby {
+        state: PlaybackState { status: Status::Loading, source: Some(source.clone()), ..Default::default() },
+        events: Vec::new(),
+    });
+    let ctx = SessionCtx {
+        id,
+        abort: AtomicBool::new(false),
+        controls: controls.clone(),
+        shared: shared.clone(),
+        vq: Arc::new(sync::PacketQueue::new()),
+        aq: Arc::new(sync::PacketQueue::new()),
+        sq: Arc::new(sync::PacketQueue::new()),
+        frames: sync::FrameQueue::new(4),
+        abuf: audio::AudioBuffer::new(),
+        aclk: sync::Clock::new(),
+        vclk: sync::Clock::new(),
+        audio_active: AtomicBool::new(false),
+        audio_pending: AtomicU64::new(0),
+        audio_tokens: AtomicU64::new(0),
+        video_active: AtomicBool::new(false),
+        audio_finished: AtomicI32::new(-1),
+        video_finished: AtomicI32::new(-1),
+        eof: AtomicBool::new(false),
+        seek_req: Mutex::new(None),
+        demux_cv: Condvar::new(),
+        demux_lock: Mutex::new(()),
+        seek_target: Mutex::new(None),
+        seek_display: AtomicF64::new(0.0),
+        seeking: AtomicBool::new(false),
+        step: AtomicBool::new(false),
+        show_one: AtomicBool::new(false),
+        stepped: AtomicBool::new(false),
+        start_time: AtomicF64::new(0.0),
+        duration: AtomicF64::new(0.0),
+        switch_req: Mutex::new(Vec::new()),
+        subs: subs::SubStore::new(),
+        last_frame: Mutex::new(None),
+        sub_canvas: AtomicU64::new(0),
+        standby_flag: AtomicBool::new(standby.is_some()),
+        standby: Mutex::new(standby),
+        follows,
+    };
+    let speed = controls.speed();
+    ctx.aclk.set_speed(speed);
+    ctx.vclk.set_speed(speed);
+    Arc::new(ctx)
+}
+
+fn start_session(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) -> Session {
+    ctx.seek_display.set(opts.start_at.unwrap_or(0.0));
+    let c = ctx.clone();
+    let demux = std::thread::Builder::new()
+        .name("demux".into())
+        .spawn(move || demux::run(c, source, opts))
+        .expect("spawn demux thread");
+    Session { ctx, demux: Some(demux) }
+}
+
+/// Called by the current session's demuxer once it has read everything:
+/// preloads the queued next item when the end is near.
+fn preload_next(ctx: &SessionCtx) {
+    if !ctx.is_current() {
+        return;
+    }
+    let d = ctx.duration.get();
+    if d > 0.0 && d - ctx.position() > PRELOAD_SECS {
+        return;
+    }
+    let mut slot = ctx.shared.next.lock();
+    if slot.session.is_some() {
+        return;
+    }
+    let Some((source, opts)) = slot.want.clone() else { return };
+    log::debug!("preloading the next item: {}", source.display_name());
+    let next = new_session(&ctx.controls, &ctx.shared, &source, ctx.id);
+    slot.session = Some(start_session(next, source, opts));
+}
+
+/// Called when `ctx` has finished playing: hands over to its preloaded
+/// successor, if there is one. (With audio the output usually does this
+/// already, sample-accurately, a moment earlier.)
+fn advance(ctx: &SessionCtx) -> bool {
+    let slot = ctx.shared.next.lock();
+    match &slot.session {
+        Some(s) if s.ctx.follows == ctx.id => s.ctx.promote(),
+        _ => false,
+    }
 }
 
 impl Player {
     pub fn new(config: EngineConfig, wake: impl Fn() + Send + Sync + 'static) -> Self {
+        upscale::prewarm(&config);
         let (tx, rx) = crossbeam_channel::unbounded();
         Player {
             controls: Arc::new(Controls {
                 paused: AtomicBool::new(false),
                 volume: AtomicF64::new(1.0),
                 muted: AtomicBool::new(false),
+                hushed: AtomicBool::new(false),
+                video_hidden: AtomicBool::new(false),
                 speed: AtomicF64::new(1.0),
                 audio_delay: AtomicF64::new(0.0),
                 config: Mutex::new(config),
                 audio_fx: Mutex::new((0, AudioFx::default())),
                 video_adjust: Mutex::new((0, VideoAdjust::default())),
                 target_size: AtomicU64::new((3840u64 << 32) | 2160),
+                target_known: AtomicBool::new(false),
+                output: Mutex::new(Weak::new()),
             }),
             shared: Arc::new(Shared {
                 state: Mutex::new(PlaybackState::default()),
@@ -278,71 +477,85 @@ impl Player {
                 wake: Box::new(wake),
                 events: tx,
                 current_session: AtomicU64::new(0),
+                next_id: AtomicU64::new(1),
+                next: Mutex::new(NextSlot::default()),
             }),
             session: None,
             events_rx: rx,
-            next_id: 1,
         }
     }
 
     /// Starts playing `source`, replacing whatever was playing.
     pub fn load(&mut self, source: MediaSource, opts: LoadOptions) {
         self.stop_session();
-        let id = self.next_id;
-        self.next_id += 1;
-        self.shared.current_session.store(id, Ordering::Release);
+        let ctx = new_session(&self.controls, &self.shared, &source, 0);
+        self.shared.current_session.store(ctx.id, Ordering::Release);
         self.controls.paused.store(opts.start_paused, Ordering::Release);
         {
             let mut st = self.shared.state.lock();
             *st = PlaybackState { status: Status::Loading, source: Some(source.clone()), ..Default::default() };
         }
         *self.shared.frame_slot.lock() = None;
-        let ctx = Arc::new(SessionCtx {
-            id,
-            abort: AtomicBool::new(false),
-            controls: self.controls.clone(),
-            shared: self.shared.clone(),
-            vq: Arc::new(sync::PacketQueue::new()),
-            aq: Arc::new(sync::PacketQueue::new()),
-            sq: Arc::new(sync::PacketQueue::new()),
-            frames: sync::FrameQueue::new(4),
-            abuf: audio::AudioBuffer::new(),
-            aclk: sync::Clock::new(),
-            vclk: sync::Clock::new(),
-            audio_active: AtomicBool::new(false),
-            audio_pending: AtomicU64::new(0),
-            audio_tokens: AtomicU64::new(0),
-            video_active: AtomicBool::new(false),
-            audio_finished: AtomicI32::new(-1),
-            video_finished: AtomicI32::new(-1),
-            eof: AtomicBool::new(false),
-            seek_req: Mutex::new(None),
-            demux_cv: Condvar::new(),
-            demux_lock: Mutex::new(()),
-            seek_target: Mutex::new(None),
-            seek_display: AtomicF64::new(opts.start_at.unwrap_or(0.0)),
-            seeking: AtomicBool::new(false),
-            step: AtomicBool::new(false),
-            show_one: AtomicBool::new(false),
-            stepped: AtomicBool::new(false),
-            start_time: AtomicF64::new(0.0),
-            duration: AtomicF64::new(0.0),
-            switch_req: Mutex::new(Vec::new()),
-            subs: subs::SubStore::new(),
-            last_frame: Mutex::new(None),
-            sub_canvas: AtomicU64::new(0),
-        });
-        let c = ctx.clone();
-        let demux = std::thread::Builder::new()
-            .name("demux".into())
-            .spawn(move || demux::run(c, source, opts))
-            .expect("spawn demux thread");
-        self.session = Some(Session { ctx, demux: Some(demux) });
+        self.session = Some(start_session(ctx, source, opts));
         (self.shared.wake)();
+    }
+
+    /// Queues what to play when the current item ends (`None`: nothing).
+    /// It is preloaded shortly before the end and takes over without a gap;
+    /// [`PlayerEvent::Advanced`] reports the switch.
+    pub fn set_next(&mut self, next: Option<(MediaSource, LoadOptions)>) {
+        self.adopt();
+        let mut slot = self.shared.next.lock();
+        let same = match (&slot.want, &next) {
+            (Some((a, ao)), Some((b, bo))) => a == b && ao.start_at == bo.start_at,
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        slot.want = next;
+        if let Some(s) = slot.session.take() {
+            s.shutdown();
+        }
+    }
+
+    /// What [`Player::set_next`] last queued (cleared by a load and by the switch).
+    pub fn queued_next(&self) -> Option<MediaSource> {
+        self.shared.next.lock().want.as_ref().map(|(s, _)| s.clone())
+    }
+
+    /// Takes ownership of the preloaded session once it has taken over.
+    fn adopt(&mut self) {
+        let cur = self.shared.current_session.load(Ordering::Acquire);
+        if self.session.as_ref().is_none_or(|s| s.ctx.id == cur) {
+            return;
+        }
+        let mut slot = self.shared.next.lock();
+        if slot.session.as_ref().is_some_and(|s| s.ctx.id == cur) {
+            let next = slot.session.take();
+            // The UI queues whatever follows the new item.
+            slot.want = None;
+            drop(slot);
+            if let Some(old) = std::mem::replace(&mut self.session, next) {
+                old.shutdown();
+            }
+        }
+    }
+
+    /// The current session and the preloaded one.
+    fn sessions(&self) -> Vec<Arc<SessionCtx>> {
+        let mut v: Vec<_> = self.session.iter().map(|s| s.ctx.clone()).collect();
+        v.extend(self.shared.next.lock().session.as_ref().map(|s| s.ctx.clone()));
+        v
     }
 
     fn stop_session(&mut self) {
         if let Some(s) = self.session.take() {
+            s.shutdown();
+        }
+        let next = std::mem::take(&mut *self.shared.next.lock());
+        if let Some(s) = next.session {
             s.shutdown();
         }
     }
@@ -367,7 +580,8 @@ impl Player {
         f(&self.shared.state.lock())
     }
 
-    pub fn drain_events(&self) -> Vec<PlayerEvent> {
+    pub fn drain_events(&mut self) -> Vec<PlayerEvent> {
+        self.adopt();
         self.events_rx.try_iter().collect()
     }
 
@@ -388,7 +602,12 @@ impl Player {
     }
 
     pub fn set_paused(&mut self, paused: bool) {
+        self.adopt();
         let was = self.controls.paused.swap(paused, Ordering::AcqRel);
+        if let Some(n) = &self.shared.next.lock().session {
+            n.ctx.aclk.set_paused(paused);
+            n.ctx.vclk.set_paused(paused);
+        }
         if let Some(s) = &self.session {
             let ctx = &s.ctx;
             ctx.aclk.set_paused(paused);
@@ -421,6 +640,10 @@ impl Player {
 
     /// Seeks to `target` seconds (or by `target` seconds if `relative`).
     pub fn seek(&mut self, target: f64, relative: bool, precise: bool) {
+        if !target.is_finite() {
+            return;
+        }
+        self.adopt();
         if let Some(s) = &self.session {
             s.ctx.request_seek(SeekRequest { target, relative, precise });
             s.ctx.update_state(|st| {
@@ -432,6 +655,7 @@ impl Player {
     }
 
     pub fn frame_step(&mut self, forward: bool) {
+        self.adopt();
         if self.session.is_none() {
             return;
         }
@@ -457,7 +681,18 @@ impl Player {
     }
     /// Volume as a linear 0.0..=1.5 scale (1.0 = 100%).
     pub fn set_volume(&self, v: f64) {
-        self.controls.volume.set(v.clamp(0.0, 1.5));
+        // `clamp` passes NaN through, which would silence (or corrupt) every sample.
+        if v.is_finite() {
+            self.controls.volume.set(v.clamp(0.0, 1.5));
+        }
+    }
+    /// Silences output (with a fade) without changing the mute setting.
+    pub fn set_hushed(&self, h: bool) {
+        self.controls.hushed.store(h, Ordering::Relaxed);
+    }
+    /// Whether the video is currently out of sight (see [`Controls::video_hidden`]).
+    pub fn set_video_hidden(&self, h: bool) {
+        self.controls.video_hidden.store(h, Ordering::Relaxed);
     }
     pub fn muted(&self) -> bool {
         self.controls.muted.load(Ordering::Relaxed)
@@ -470,11 +705,14 @@ impl Player {
         self.controls.speed()
     }
     pub fn set_speed(&self, speed: f64) {
+        if !speed.is_finite() {
+            return;
+        }
         let speed = speed.clamp(0.25, 4.0);
         self.controls.speed.set(speed);
-        if let Some(s) = &self.session {
-            s.ctx.aclk.set_speed(speed);
-            s.ctx.vclk.set_speed(speed);
+        for ctx in self.sessions() {
+            ctx.aclk.set_speed(speed);
+            ctx.vclk.set_speed(speed);
         }
     }
 
@@ -482,7 +720,9 @@ impl Player {
         self.controls.audio_delay.get()
     }
     pub fn set_audio_delay(&self, d: f64) {
-        self.controls.audio_delay.set(d);
+        if d.is_finite() {
+            self.controls.audio_delay.set(d);
+        }
     }
 
     pub fn set_audio_fx(&self, fx: AudioFx) {
@@ -510,14 +750,19 @@ impl Player {
     }
 
     pub fn set_config(&self, cfg: EngineConfig) {
+        upscale::prewarm(&cfg);
         *self.controls.config.lock() = cfg;
     }
 
     /// Tells the engine how large the video is drawn, in physical pixels, so
-    /// it can avoid converting more pixels than will be shown.
-    pub fn set_target_size(&self, w: u32, h: u32) {
-        let v = ((w.max(16) as u64) << 32) | h.max(16) as u64;
-        self.controls.target_size.store(v, Ordering::Relaxed);
+    /// it can avoid converting more pixels than will be shown. A function the
+    /// UI's layout code calls with each size it lays the video out at.
+    pub fn target_size_setter(&self) -> impl Fn(u32, u32) + 'static {
+        let c = self.controls.clone();
+        move |w, h| {
+            c.target_size.store(((w.max(16) as u64) << 32) | h.max(16) as u64, Ordering::Relaxed);
+            c.target_known.store(true, Ordering::Relaxed);
+        }
     }
 
     pub fn select_track(&self, kind: TrackKind, id: Option<TrackId>) {

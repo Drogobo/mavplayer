@@ -48,16 +48,21 @@ impl MediaSource {
     }
 }
 
-fn percent_decode(s: &str) -> String {
+/// Decodes `%XX` escapes. Works on bytes, so a `%` followed by a
+/// multi-byte character is kept as-is instead of panicking.
+pub fn percent_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        (b as char).to_digit(16).map(|d| d as u8)
+    }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
         {
-            out.push(v);
+            out.push(h << 4 | l);
             i += 3;
             continue;
         }
@@ -300,6 +305,9 @@ pub enum PlayerEvent {
     Loaded,
     /// Playback reached the end of the file.
     EndOfFile,
+    /// The item queued with `Player::set_next` took over without a gap.
+    /// Its own `Loaded` (and any other events) follow.
+    Advanced(MediaSource),
     /// Could not open or play the file.
     Error(String),
     /// A non-fatal problem worth telling the user about.
@@ -337,10 +345,11 @@ pub enum ChannelMode {
     Surround71,
 }
 
+/// Filter for shrinking pictures to the window (and for the HDR tone-mapping
+/// path, which only ever shrinks).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScaleQuality {
-    /// Nearest neighbour: hard pixel edges, for pixel art and retro games.
-    /// Also used when enlarging, so pixels stay crisp at any size.
+    /// Nearest neighbour: hard pixel edges.
     Nearest,
     /// Bilinear. Saved settings from before used the name "Fast".
     #[serde(alias = "Fast")]
@@ -349,6 +358,112 @@ pub enum ScaleQuality {
     Good,
     /// Lanczos.
     Best,
+}
+
+/// How pictures smaller than the window are enlarged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Upscaler {
+    /// The GPU's bilinear texture filtering when drawing (cheapest).
+    #[default]
+    Bilinear,
+    /// Nearest neighbour on the CPU: hard pixel edges, for pixel art.
+    Nearest,
+    /// libplacebo's EWA Lanczos (sharp), as in mpv's high-quality profile.
+    EwaLanczos,
+    /// FSRCNNX x2 16-0-4-1: neural luma doubler, good for live action.
+    Fsrcnnx,
+    /// FSRCNNX x2 8-0-4-1: lighter version of the above.
+    FsrcnnxFast,
+    /// ArtCNN C4F16: newer neural luma doubler, very sharp; anime and art.
+    ArtCnn,
+    /// ArtCNN C4F16 DS: the same, trained to also denoise and sharpen.
+    ArtCnnDenoise,
+    /// RAVU-Lite AR r4: light prescaler with anti-ringing.
+    Ravu,
+    /// AMD FidelityFX Super Resolution 1.0 (EASU + RCAS).
+    Fsr,
+    /// NVIDIA Image Scaling 1.0.3.
+    Nis,
+    /// The bundled Anime4K presets (see [`Anime4KMode`]).
+    Anime4K,
+    /// The user's own mpv-style `.glsl`/`.hook` shader.
+    CustomShader,
+}
+
+impl Upscaler {
+    /// Whether this runs on the GPU through FFmpeg's libplacebo filter.
+    pub fn needs_libplacebo(self) -> bool {
+        !matches!(self, Upscaler::Bilinear | Upscaler::Nearest)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Upscaler::Bilinear => "Bilinear (fastest)",
+            Upscaler::Nearest => "Nearest neighbor (pixel art)",
+            Upscaler::EwaLanczos => "EWA Lanczos (high quality)",
+            Upscaler::Fsrcnnx => "FSRCNNX (live action)",
+            Upscaler::FsrcnnxFast => "FSRCNNX fast",
+            Upscaler::ArtCnn => "ArtCNN (anime, sharp)",
+            Upscaler::ArtCnnDenoise => "ArtCNN denoise + sharpen",
+            Upscaler::Ravu => "RAVU-Lite (light)",
+            Upscaler::Fsr => "AMD FSR",
+            Upscaler::Nis => "NVIDIA Image Scaling",
+            Upscaler::Anime4K => "Anime4K",
+            Upscaler::CustomShader => "Custom shader file",
+        }
+    }
+
+    pub const ALL: [Upscaler; 12] = [
+        Upscaler::Bilinear,
+        Upscaler::Nearest,
+        Upscaler::EwaLanczos,
+        Upscaler::Fsrcnnx,
+        Upscaler::FsrcnnxFast,
+        Upscaler::ArtCnn,
+        Upscaler::ArtCnnDenoise,
+        Upscaler::Ravu,
+        Upscaler::Fsr,
+        Upscaler::Nis,
+        Upscaler::Anime4K,
+        Upscaler::CustomShader,
+    ];
+}
+
+/// Anime4K's mpv presets. A suits blurry 1080p-like sources, B 720p with
+/// aliasing or ringing, C 480p/SD; the doubled modes restore twice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Anime4KMode {
+    #[default]
+    A,
+    B,
+    C,
+    AA,
+    BB,
+    CA,
+}
+
+impl Anime4KMode {
+    pub const ALL: [Anime4KMode; 6] =
+        [Anime4KMode::A, Anime4KMode::B, Anime4KMode::C, Anime4KMode::AA, Anime4KMode::BB, Anime4KMode::CA];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Anime4KMode::A => "A",
+            Anime4KMode::B => "B",
+            Anime4KMode::C => "C",
+            Anime4KMode::AA => "A+A",
+            Anime4KMode::BB => "B+B",
+            Anime4KMode::CA => "C+A",
+        }
+    }
+}
+
+/// Anime4K network size: HQ for desktop GPUs, Fast for laptops and iGPUs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Anime4KQuality {
+    #[default]
+    High,
+    Fast,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,6 +552,15 @@ pub struct EngineConfig {
     pub channels: ChannelMode,
     pub audio_device: Option<String>,
     pub scale_quality: ScaleQuality,
+    pub upscaler: Upscaler,
+    pub anime4k_mode: Anime4KMode,
+    pub anime4k_quality: Anime4KQuality,
+    /// For [`Upscaler::CustomShader`].
+    pub custom_shader: Option<std::path::PathBuf>,
+    /// KrigBilateral chroma upscaling alongside a GPU upscaler.
+    pub shader_chroma: bool,
+    /// AMD CAS sharpening after a GPU upscaler.
+    pub shader_sharpen: bool,
     pub tone_map_hdr: bool,
     pub audio_langs: Vec<String>,
     pub sub_langs: Vec<String>,
@@ -457,6 +581,12 @@ impl Default for EngineConfig {
             channels: ChannelMode::Auto,
             audio_device: None,
             scale_quality: ScaleQuality::Good,
+            upscaler: Upscaler::Bilinear,
+            anime4k_mode: Anime4KMode::A,
+            anime4k_quality: Anime4KQuality::High,
+            custom_shader: None,
+            shader_chroma: false,
+            shader_sharpen: false,
             tone_map_hdr: true,
             audio_langs: vec![],
             sub_langs: vec![],
@@ -474,8 +604,13 @@ impl Default for EngineConfig {
 /// A decoded, colour-converted picture ready for the screen. Pixels are BGRA,
 /// tightly packed, with square pixels (aspect already applied).
 pub struct PresentedFrame {
+    /// Size of the picture itself.
     pub width: u32,
     pub height: u32,
+    /// Border around the picture in `bgra`, repeating its edge pixels: the
+    /// buffer is `width + 2*pad` × `height + 2*pad`. Draw the image `pad`
+    /// pixels larger on each side, clipped to the picture.
+    pub pad: u32,
     pub bgra: Vec<u8>,
 }
 

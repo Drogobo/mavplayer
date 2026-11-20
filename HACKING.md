@@ -220,6 +220,7 @@ src/
   playlist.rs        Playlist model, file-type lists, M3U/PLS, argument parsing
   icons.rs           Icon enum; desktop icon-theme lookup; bundled Papirus fallback
   integration.rs     Linux .desktop integration (AppImage, Wayland window icon)
+  font_prefetch.rs   Linux: warms GPUI's system-font scan in parallel (cold-start speed)
   engine/            Playback engine; no UI code
   ui/                GPUI interface
 build.rs             Embeds Papirus icons; Windows exe resources
@@ -260,12 +261,33 @@ audio.rs:   output callback pulls samples and drives the master clock: native
   current settings. These do deinterlacing, tone mapping, crop, rotation, colour
   adjustment, the equalizer, normalization, tempo, and format conversion. The
   decoder threads rebuild the graph when a setting changes.
+- **`upscale.rs`**: GPU upscaling. When the picture is enlarged and a GPU
+  upscaler is chosen, `build_chain` ends with FFmpeg's `libplacebo` filter at
+  display size. The bundled mpv shaders (`third_party/shaders`, compiled in with
+  `include_str!`) are concatenated into one hook file and passed as
+  `custom_shader_bin`. One Vulkan device is shared by every graph (creating it
+  is slow on some drivers; `prewarm` starts it early), and compiled shaders are
+  cached under the user cache directory. Window resizes are debounced before the
+  graph is rebuilt, and a graph that fails to build turns upscaling off for
+  those settings with a warning instead of retrying every frame.
 - **`present.rs`**: frame timing (`compute_target_delay`), frame dropping,
   stepping, colour conversion, screenshots.
 - **`subs.rs`**: subtitle decoding (text, ASS, bitmap), external file loading
   with charset detection, sidecar discovery.
 - **`disc.rs` / `probe.rs`**: DVD folder/ISO/drive detection and title probing,
   plus quick metadata probes for playlist entries.
+
+**Gapless transitions.** The UI queues what follows the current item with
+`Player::set_next` (the next playlist entry, or the same file when looping).
+About 10 s before the end, once the current file is fully read, the demuxer
+preloads it as a second, *standby* session: it opens, decodes and buffers,
+but shows and plays nothing, and its state and events are held back. The
+audio output (`audio::OutputLink`) is not tied to one session: the standby
+session queues its audio on it, and on the sample where the current file runs
+dry the output callback carries straight on with the next one and promotes
+it (`SessionCtx::promote`), which publishes its state and sends
+`PlayerEvent::Advanced`. Without audio, or when the next file needs a
+different channel layout, the demuxer promotes it at end of file instead.
 
 The UI talks to the engine only through `engine::Player`: `load`, `seek`,
 `set_paused`, `set_volume`, `select_track`, `set_config`, `take_frame`,
@@ -325,6 +347,15 @@ the libavfilter string, and add the setting to `VideoAdjust` / `AudioFx` in
 `engine/types.rs`. The decoder threads compare a settings generation counter and
 rebuild the graph automatically. Use `av::filter_available("name")` for filters
 an FFmpeg build might lack.
+
+**Add an upscaling shader**
+Put the unmodified mpv `.glsl`/`.hook` file under `third_party/shaders/<project>/`
+(the license must be GPL-3.0-compatible: MIT, BSD, LGPL, GPL-3.0). Record its source
+and commit in `third_party/shaders/README.md`, and add its license text to
+`third_party/shaders/LICENSES.txt`. Then add an `Upscaler` variant (label and
+`ALL` in `engine/types.rs`) and map it to the file in `ShaderSet::source` in
+`engine/upscale.rs`. Test it with `ffmpeg -vf libplacebo=w=3840:h=2160:custom_shader_path=FILE`
+first: libplacebo rejects some mpv-only features.
 
 **Add an icon**
 Add a variant to `Icon` in `icons.rs` with its freedesktop name, and add the

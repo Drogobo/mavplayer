@@ -22,6 +22,20 @@ impl Graph {
         chain: &str,
         threads: i32,
     ) -> anyhow::Result<Graph> {
+        Self::with_setup(src_filter, src_args, sink_filter, chain, threads, &mut |_| Ok(()))
+    }
+
+    /// Like [`Graph::new`], calling `setup` on each filter of `chain` after
+    /// it is created but before its options are applied and it initialises
+    /// (to give it a hardware device, or binary options).
+    pub fn with_setup(
+        src_filter: &str,
+        src_args: &str,
+        sink_filter: &str,
+        chain: &str,
+        threads: i32,
+        setup: &mut dyn FnMut(*mut ff::AVFilterContext) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Graph> {
         unsafe {
             let graph = FilterGraph(ff::avfilter_graph_alloc());
             if graph.0.is_null() {
@@ -57,21 +71,37 @@ impl Graph {
             )?;
             let chain =
                 if chain.trim().is_empty() { if src_filter == "abuffer" { "anull" } else { "null" } } else { chain };
-            let mut outputs = ff::avfilter_inout_alloc();
-            let mut inputs = ff::avfilter_inout_alloc();
-            (*outputs).name = ff::av_strdup(in_name.as_ptr());
-            (*outputs).filter_ctx = src;
-            (*outputs).pad_idx = 0;
-            (*outputs).next = ptr::null_mut();
-            (*inputs).name = ff::av_strdup(out_name.as_ptr());
-            (*inputs).filter_ctx = sink;
-            (*inputs).pad_idx = 0;
-            (*inputs).next = ptr::null_mut();
             let desc = av::cstr(chain);
-            let r = ff::avfilter_graph_parse_ptr(graph.0, desc.as_ptr(), &mut inputs, &mut outputs, ptr::null_mut());
+            // What avfilter_graph_parse_ptr does, with `setup` in between:
+            // parse, create the filters, set them up, initialise and link
+            // them, then join the chain's open ends to the source and sink.
+            let mut seg: *mut ff::AVFilterGraphSegment = ptr::null_mut();
+            let mut inputs: *mut ff::AVFilterInOut = ptr::null_mut();
+            let mut outputs: *mut ff::AVFilterInOut = ptr::null_mut();
+            let r = (|| {
+                av::check(ff::avfilter_graph_segment_parse(graph.0, desc.as_ptr(), 0, &mut seg), "parse")?;
+                av::check(ff::avfilter_graph_segment_create_filters(seg, 0), "create filters")?;
+                for c in 0..(*seg).nb_chains {
+                    let ch = *(*seg).chains.add(c);
+                    for i in 0..(*ch).nb_filters {
+                        let p = *(*ch).filters.add(i);
+                        if !(*p).filter.is_null() {
+                            setup((*p).filter)?;
+                        }
+                    }
+                }
+                av::check(ff::avfilter_graph_segment_apply(seg, 0, &mut inputs, &mut outputs), "apply")?;
+                if inputs.is_null() || outputs.is_null() || !(*inputs).next.is_null() || !(*outputs).next.is_null() {
+                    anyhow::bail!("needs exactly one input and one output");
+                }
+                av::check(ff::avfilter_link(src, 0, (*inputs).filter_ctx, (*inputs).pad_idx as u32), "link input")?;
+                av::check(ff::avfilter_link((*outputs).filter_ctx, (*outputs).pad_idx as u32, sink, 0), "link output")?;
+                anyhow::Ok(())
+            })();
+            ff::avfilter_graph_segment_free(&mut seg);
             ff::avfilter_inout_free(&mut inputs);
             ff::avfilter_inout_free(&mut outputs);
-            av::check(r, &format!("filter chain '{chain}'"))?;
+            r.map_err(|e| anyhow::anyhow!("filter chain '{chain}': {e}"))?;
             av::check(ff::avfilter_graph_config(graph.0, ptr::null_mut()), "avfilter_graph_config")?;
             Ok(Graph { _graph: graph, src, sink })
         }

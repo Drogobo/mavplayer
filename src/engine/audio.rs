@@ -5,12 +5,12 @@
 #[cfg(target_os = "linux")]
 mod pw_out;
 
-use super::SessionCtx;
 use super::av::{self, Frame, ff};
 use super::decoder::{DecodeResult, Decoder};
 use super::filters::Graph;
 use super::sync::now;
 use super::types::*;
+use super::{Controls, SessionCtx};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
@@ -39,7 +39,25 @@ struct AbInner {
     chunks: VecDeque<Chunk>,
     samples: usize,
     serial: i32,
+    /// Format of the last fill (interleaved channels, rate), for sizing fades.
+    fmt: (usize, f64),
+    /// The first moments of what was about to play when a seek flushed the
+    /// buffer, faded out before the new position starts (no click).
+    tail: Vec<f32>,
+    tail_pos: usize,
+    /// Output stopped abruptly (seek, stall): wait for a little audio, then
+    /// fade it in instead of starting at full level.
+    restart: bool,
+    /// Frames of fade-in still to apply.
+    fade_left: usize,
 }
+
+/// Length of the fade-out of interrupted audio and of the fade-in after it.
+/// Long enough to remove the click, short enough not to be heard as a fade.
+const DECLICK_SECS: f64 = 0.006;
+/// Audio buffered before output resumes after a seek or stall, so it doesn't
+/// start, run dry and stop again in the next callback.
+const PREROLL_SECS: f64 = 0.03;
 
 /// Decoded, device-ready samples waiting for the audio callback.
 pub struct AudioBuffer {
@@ -53,13 +71,25 @@ pub struct Filled {
     pub first: Option<(f64, i32, f64)>,
     /// Media pts just after the last written sample.
     pub end_pts: Option<f64>,
+    /// Frames written, faded-out tail included.
     pub frames: usize,
+    /// Frames of the faded-out tail before the first new sample.
+    pub lead: usize,
 }
 
 impl AudioBuffer {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(AbInner { chunks: VecDeque::new(), samples: 0, serial: 0 }),
+            inner: Mutex::new(AbInner {
+                chunks: VecDeque::new(),
+                samples: 0,
+                serial: 0,
+                fmt: (0, 0.0),
+                tail: Vec::new(),
+                tail_pos: 0,
+                restart: false,
+                fade_left: 0,
+            }),
             cv: Condvar::new(),
             abort: AtomicBool::new(false),
         }
@@ -83,11 +113,39 @@ impl AudioBuffer {
 
     pub fn flush(&self, serial: i32) {
         let mut g = self.inner.lock();
+        // Keep what would have played next, to fade it out (unless a fade-out
+        // from an earlier flush is still playing: continue that one).
+        let (ch, rate) = g.fmt;
+        let want = (rate * DECLICK_SECS) as usize * ch;
+        if want > 0 && g.tail_pos >= g.tail.len() {
+            let mut tail = std::mem::take(&mut g.tail);
+            tail.clear();
+            for c in g.chunks.iter().filter(|c| c.serial == g.serial) {
+                let n = (c.data.len() - c.pos).min(want - tail.len());
+                tail.extend_from_slice(&c.data[c.pos..c.pos + n]);
+                if tail.len() >= want {
+                    break;
+                }
+            }
+            tail.truncate(tail.len() / ch * ch);
+            g.tail = tail;
+            g.tail_pos = 0;
+        }
         g.chunks.clear();
         g.samples = 0;
         g.serial = serial;
+        g.restart = true;
+        g.fade_left = 0;
         drop(g);
         self.cv.notify_all();
+    }
+
+    /// Drops a pending fade-out tail: output was silent (paused, muted), so
+    /// there's nothing to fade, and the tail is from before a seek.
+    fn drop_tail(&self) {
+        let mut g = self.inner.lock();
+        g.tail.clear();
+        g.tail_pos = 0;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -99,12 +157,56 @@ impl AudioBuffer {
         self.cv.notify_all();
     }
 
-    fn fill(&self, out: &mut [f32], channels: usize, rate: f64) -> Filled {
-        let mut res = Filled { first: None, end_pts: None, frames: 0 };
+    /// Fills `out` from the buffer, zero-padding what's missing. Interrupted
+    /// audio is faded out and resumed audio faded in, so seeks and stalls
+    /// don't click. `finished`: the decoder has delivered everything for
+    /// this serial (no stall to wait out, and a running-dry end is the
+    /// real end, which gapless playback continues seamlessly).
+    fn fill(&self, out: &mut [f32], channels: usize, rate: f64, finished: bool) -> Filled {
+        let ch = channels.max(1);
+        let fade = ((rate * DECLICK_SECS) as usize).max(1);
+        let mut res = Filled { first: None, end_pts: None, frames: 0, lead: 0 };
         let mut g = self.inner.lock();
+        g.fmt = (ch, rate);
         let serial = g.serial;
         let mut written = 0;
-        while written < out.len() {
+
+        // 1. Fade out the remains of the audio a seek interrupted.
+        if g.tail_pos < g.tail.len() {
+            let total = (g.tail.len() / ch).max(1);
+            let n = (g.tail.len() - g.tail_pos).min(out.len() / ch * ch);
+            for i in 0..n {
+                let frame = (g.tail_pos + i) / ch;
+                let gain = 1.0 - (frame + 1) as f32 / total as f32;
+                out[i] = g.tail[g.tail_pos + i] * gain;
+            }
+            g.tail_pos += n;
+            written = n;
+            if g.tail_pos >= g.tail.len() {
+                g.tail.clear();
+                g.tail_pos = 0;
+            }
+        }
+        res.lead = written / ch;
+
+        // 2. After an interruption, wait until enough is buffered.
+        while g.chunks.front().is_some_and(|c| c.serial != serial) {
+            let c = g.chunks.pop_front().unwrap();
+            g.samples -= c.data.len() - c.pos;
+        }
+        let mut hold = false;
+        if g.restart {
+            if g.samples >= (rate * PREROLL_SECS) as usize * ch || (finished && g.samples > 0) {
+                g.restart = false;
+                g.fade_left = fade;
+            } else {
+                hold = true;
+            }
+        }
+
+        // 3. The audio itself.
+        let data_start = written;
+        while !hold && written < out.len() {
             let Some(c) = g.chunks.front_mut() else { break };
             if c.serial != serial {
                 let n = c.data.len() - c.pos;
@@ -113,27 +215,50 @@ impl AudioBuffer {
                 continue;
             }
             if res.first.is_none() {
-                let off = (c.pos / channels) as f64 / rate * c.speed;
+                let off = (c.pos / ch) as f64 / rate * c.speed;
                 res.first = Some((c.pts + off, c.serial, c.speed));
             }
             let n = (c.data.len() - c.pos).min(out.len() - written);
             out[written..written + n].copy_from_slice(&c.data[c.pos..c.pos + n]);
             c.pos += n;
             written += n;
-            res.end_pts = Some(c.pts + (c.pos / channels) as f64 / rate * c.speed);
+            res.end_pts = Some(c.pts + (c.pos / ch) as f64 / rate * c.speed);
             if c.pos >= c.data.len() {
                 g.chunks.pop_front();
             }
             g.samples -= n;
         }
+        // Fade in after an interruption.
+        if g.fade_left > 0 {
+            for frame in out[data_start..written].chunks_exact_mut(ch) {
+                if g.fade_left == 0 {
+                    break;
+                }
+                let gain = 1.0 - g.fade_left as f32 / fade as f32;
+                frame.iter_mut().for_each(|s| *s *= gain);
+                g.fade_left -= 1;
+            }
+        }
+        // Ran dry mid-stream (a stall): fade out what was written and fade
+        // in once audio returns.
+        if !hold && written < out.len() && written > data_start && !finished {
+            let frames = (written - data_start) / ch;
+            let n = fade.min(frames);
+            let end = data_start + frames * ch;
+            for (i, frame) in out[end - n * ch..end].chunks_exact_mut(ch).enumerate() {
+                let gain = 1.0 - (i + 1) as f32 / n as f32;
+                frame.iter_mut().for_each(|s| *s *= gain);
+            }
+            g.restart = true;
+            g.fade_left = 0;
+        }
         drop(g);
         self.cv.notify_all();
         out[written..].fill(0.0);
-        res.frames = written / channels.max(1);
+        res.frames = written / ch;
         res
     }
 }
-
 fn find_device(host: &cpal::Host, name: Option<&str>) -> Option<cpal::Device> {
     if let Some(name) = name {
         if let Ok(mut devs) = host.output_devices()
@@ -170,48 +295,234 @@ fn wanted_channels(mode: ChannelMode, media: i32) -> Option<u16> {
     }
 }
 
-struct CallbackState {
+/// A session the output plays from.
+#[derive(Clone)]
+struct Feed {
     ctx: Arc<SessionCtx>,
+    stop: Arc<AtomicBool>,
+    /// The `audio_pending` token to clear when this feed starts playing.
+    token: u64,
+}
+
+impl Feed {
+    fn active(&self) -> bool {
+        self.ctx.alive() && !self.stop.load(Ordering::Acquire)
+    }
+}
+
+struct Feeds {
+    cur: Feed,
+    /// A preloaded next item, played as soon as `cur` runs out.
+    next: Option<Feed>,
+    /// The output stopped; nothing may be queued on it any more.
+    closed: bool,
+}
+
+/// What an open output device plays. It outlives sessions: when the next
+/// playlist item was preloaded, the device carries straight on with it.
+pub struct OutputLink {
+    feeds: Mutex<Feeds>,
+    controls: Arc<Controls>,
+    /// Device and channel request it was opened for; a session wanting
+    /// something else opens its own.
+    key: (Option<String>, Option<u16>),
+    fmt: Mutex<Option<OutFormat>>,
+}
+
+impl OutputLink {
+    fn new(cur: Feed, cfg: &EngineConfig, media_channels: i32) -> Arc<Self> {
+        Arc::new(Self {
+            controls: cur.ctx.controls.clone(),
+            feeds: Mutex::new(Feeds { cur, next: None, closed: false }),
+            key: (cfg.audio_device.clone(), wanted_channels(cfg.channels, media_channels)),
+            fmt: Mutex::new(None),
+        })
+    }
+
+    fn snapshot(&self) -> (Feed, Option<Feed>) {
+        let f = self.feeds.lock();
+        (f.cur.clone(), f.next.clone())
+    }
+
+    fn current(&self) -> Arc<SessionCtx> {
+        self.feeds.lock().cur.ctx.clone()
+    }
+
+    fn paused(&self) -> bool {
+        self.controls.paused.load(Ordering::Acquire)
+    }
+
+    /// Called regularly by whichever thread drives the device: drops a dead
+    /// next feed, moves on to a live one when the current session ended,
+    /// and says whether there is anything left to play. Once it returns
+    /// false the output is closed for good.
+    fn keep_serving(&self) -> bool {
+        let mut f = self.feeds.lock();
+        if f.closed {
+            return false;
+        }
+        if f.next.as_ref().is_some_and(|n| !n.active()) {
+            f.next = None;
+        }
+        if f.cur.active() {
+            return true;
+        }
+        if let Some(n) = f.next.take() {
+            n.ctx.release_audio_pending(n.token);
+            f.cur = n;
+            return true;
+        }
+        f.closed = true;
+        false
+    }
+
+    /// Switches to `next` if it is still the queued feed.
+    fn switch_to(&self, next: &Feed) -> bool {
+        let mut f = self.feeds.lock();
+        if f.closed || f.next.as_ref().is_none_or(|n| n.ctx.id != next.ctx.id) {
+            return false;
+        }
+        f.cur = f.next.take().unwrap();
+        true
+    }
+
+    /// Waits until the output no longer plays session `id` (its audio
+    /// stopped). Returns true if the output closed rather than moving on.
+    fn release(&self, id: u64) -> bool {
+        loop {
+            {
+                let f = self.feeds.lock();
+                if f.closed {
+                    return true;
+                }
+                if f.cur.ctx.id != id && f.next.as_ref().is_none_or(|n| n.ctx.id != id) {
+                    return false;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// For a preloaded session: queues its audio on the output that is playing
+/// the session it follows, so it starts on the very sample where that one
+/// ends. `None` if there is no such output or it was opened differently.
+pub fn adopt_output(
+    ctx: &Arc<SessionCtx>,
+    stop: &Arc<AtomicBool>,
+    cfg: &EngineConfig,
+    media_channels: i32,
+    token: u64,
+) -> Option<(Arc<OutputLink>, OutFormat)> {
+    if ctx.follows == 0 {
+        return None;
+    }
+    let link = ctx.controls.output.lock().upgrade()?;
+    if link.key != (cfg.audio_device.clone(), wanted_channels(cfg.channels, media_channels)) {
+        return None;
+    }
+    let fmt = link.fmt.lock().clone()?;
+    let mut f = link.feeds.lock();
+    if f.closed || f.cur.ctx.id != ctx.follows || !f.cur.active() {
+        return None;
+    }
+    f.next = Some(Feed { ctx: ctx.clone(), stop: stop.clone(), token });
+    drop(f);
+    Some((link, fmt))
+}
+
+/// Everything of `ctx`'s audio has been heard (and its video decoded), so a
+/// successor can start.
+fn drained(ctx: &SessionCtx) -> bool {
+    ctx.eof.load(Ordering::Acquire)
+        && ctx.audio_finished.load(Ordering::Acquire) == ctx.aq.serial()
+        && ctx.abuf.is_empty()
+        && (!ctx.video_active.load(Ordering::Acquire) || ctx.video_finished.load(Ordering::Acquire) == ctx.vq.serial())
+}
+
+struct CallbackState {
+    link: Arc<OutputLink>,
     channels: usize,
     rate: f64,
     gain: f32,
     scratch: Vec<f32>,
-    last_end: Option<(f64, i32, f64)>,
+    /// (session id, media pts after the last written sample, serial, speed)
+    last_end: Option<(u64, f64, i32, f64)>,
 }
 
 impl CallbackState {
     fn run(&mut self, out: &mut [f32], latency: f64) {
-        let ctx = &self.ctx;
-        if !ctx.alive() || ctx.paused() {
+        let (cur, next) = self.link.snapshot();
+        let ctx = &cur.ctx;
+        // Nothing was audible: a fade-out of pre-seek audio would only be heard now.
+        if self.gain == 0.0 {
+            ctx.abuf.drop_tail();
+        }
+        if !cur.active() || ctx.paused() || ctx.is_standby() {
             out.fill(0.0);
+            if self.gain > 0.0 && cur.active() && !ctx.is_standby() {
+                // Pausing: fade out over the next few milliseconds rather than cut off.
+                let n = ((self.rate * DECLICK_SECS) as usize).max(1).min(out.len() / self.channels.max(1));
+                let part = &mut out[..n * self.channels];
+                ctx.abuf.fill(part, self.channels, self.rate, true);
+                ramp(part, self.channels, self.gain, 0.0);
+            }
             self.gain = 0.0;
             return;
         }
-        let r = ctx.abuf.fill(out, self.channels, self.rate);
+        let finished = |c: &SessionCtx| c.audio_finished.load(Ordering::Acquire) == c.aq.serial();
+        let r = ctx.abuf.fill(out, self.channels, self.rate, finished(ctx));
         let t = now();
-        if let Some((pts, serial, speed)) = r.first {
-            ctx.aclk.set_at(pts - latency * speed, serial, t);
-            if let Some(e) = r.end_pts {
-                self.last_end = Some((e, serial, speed));
+        let written = r.frames * self.channels;
+        if written < out.len()
+            && let Some(n) = next
+            && n.active()
+            && !n.ctx.abuf.is_empty()
+            && drained(ctx)
+            && self.link.switch_to(&n)
+        {
+            // Gapless: the next item starts right after the last sample of
+            // this one, in this very buffer.
+            n.ctx.release_audio_pending(n.token);
+            let r2 = n.ctx.abuf.fill(&mut out[written..], self.channels, self.rate, finished(&n.ctx));
+            let lead = (r.frames + r2.lead) as f64 / self.rate;
+            if let Some((pts, serial, speed)) = r2.first {
+                n.ctx.aclk.set_at(pts - (latency + lead) * speed, serial, t);
+                if let Some(e) = r2.end_pts {
+                    self.last_end = Some((n.ctx.id, e, serial, speed));
+                }
             }
-        } else if let Some((e, serial, speed)) = self.last_end {
+            n.ctx.promote();
+        } else if let Some((pts, serial, speed)) = r.first {
+            ctx.aclk.set_at(pts - (latency + r.lead as f64 / self.rate) * speed, serial, t);
+            if let Some(e) = r.end_pts {
+                self.last_end = Some((ctx.id, e, serial, speed));
+            }
+        } else if let Some((id, e, serial, speed)) = self.last_end {
             // Starved (buffering): hold the clock at the last audible sample.
-            if serial == ctx.aq.serial() {
+            if id == ctx.id && serial == ctx.aq.serial() {
                 ctx.aclk.set_at(e - latency * speed, serial, t);
             }
         }
-        // Volume: cubic curve like most players, ramped per buffer to avoid clicks.
+        // Volume: cubic curve like most players, ramped per buffer to avoid
+        // clicks. Silent while the progress bar is being dragged.
         let v = ctx.controls.volume.get() as f32;
-        let target = if ctx.controls.muted.load(Ordering::Relaxed) { 0.0 } else { v * v * v };
-        let frames = out.len() / self.channels.max(1);
-        let start = self.gain;
-        for (i, frame) in out.chunks_exact_mut(self.channels).enumerate() {
-            let g = start + (target - start) * (i as f32 + 1.0) / frames.max(1) as f32;
-            for s in frame {
-                *s = (*s * g).clamp(-1.0, 1.0);
-            }
-        }
+        let silent = ctx.controls.muted.load(Ordering::Relaxed) || ctx.controls.hushed.load(Ordering::Relaxed);
+        let target = if silent { 0.0 } else { v * v * v };
+        ramp(out, self.channels, self.gain, target);
         self.gain = target;
+    }
+}
+
+/// Scales `out` by a gain moving linearly from `from` to `to` across it.
+fn ramp(out: &mut [f32], channels: usize, from: f32, to: f32) {
+    let ch = channels.max(1);
+    let frames = (out.len() / ch).max(1) as f32;
+    for (i, frame) in out.chunks_exact_mut(ch).enumerate() {
+        let g = from + (to - from) * (i as f32 + 1.0) / frames;
+        for s in frame {
+            *s = (*s * g).clamp(-1.0, 1.0);
+        }
     }
 }
 
@@ -224,17 +535,17 @@ pub fn open_output(
     stop: Arc<AtomicBool>,
     cfg: &EngineConfig,
     media_channels: i32,
-) -> anyhow::Result<(JoinHandle<()>, OutFormat)> {
+) -> anyhow::Result<(JoinHandle<()>, OutFormat, Arc<OutputLink>)> {
     let (tx, rx) = crossbeam_channel::bounded::<OutFormat>(1);
     let device_name = cfg.audio_device.clone();
     let mode = cfg.channels;
+    let link = OutputLink::new(Feed { ctx: ctx.clone(), stop, token: 0 }, cfg, media_channels);
     // Whoever sets this first owns the output: the device thread when it
     // opens in time, or the fallback below when it doesn't.
     let claimed = Arc::new(AtomicBool::new(false));
-    let (c, s, cl) = (ctx.clone(), stop.clone(), claimed.clone());
+    let (l, cl) = (link.clone(), claimed.clone());
     let handle = std::thread::Builder::new().name("audio-out".into()).spawn(move || {
-        let ctx = c;
-        let stop = s;
+        let link = l;
         #[cfg(target_os = "linux")]
         {
             let ready = |fmt: &OutFormat| {
@@ -245,19 +556,21 @@ pub fn open_output(
                 let _ = tx.send(fmt.clone());
                 true
             };
-            match pw_out::run(&ctx, &stop, device_name.as_deref(), mode, media_channels, ready) {
+            match pw_out::run(&link, device_name.as_deref(), mode, media_channels, ready) {
                 Ok(pw_out::Outcome::Stopped) => return,
                 Ok(pw_out::Outcome::Failed(fmt, why)) => {
                     log::warn!("{why}; continuing silently");
-                    ctx.emit(PlayerEvent::Warning("The audio device stopped responding; playing without sound".into()));
-                    null_sink(&ctx, &stop, fmt);
+                    link.current().emit(PlayerEvent::Warning(
+                        "The audio device stopped responding; playing without sound".into(),
+                    ));
+                    null_sink(&link, fmt);
                     return;
                 }
                 // No PipeWire server: fall through to ALSA.
                 Err(e) => log::info!("PipeWire unavailable ({e:#}); using ALSA"),
             }
         }
-        let started = start_device(&ctx, device_name.as_deref(), mode, media_channels);
+        let started = start_device(&link, device_name.as_deref(), mode, media_channels);
         if cl.swap(true, Ordering::AcqRel) {
             // Took too long; playback already continued without this device.
             log::warn!("audio device opened after the timeout; not using it for this file");
@@ -271,19 +584,19 @@ pub fn open_output(
                 // clock. Fall back to the silent sink if that happens.
                 let mut seen = callbacks.load(Ordering::Relaxed);
                 let mut last_progress = std::time::Instant::now();
-                while ctx.alive() && !stop.load(Ordering::Acquire) {
+                while link.keep_serving() {
                     std::thread::sleep(Duration::from_millis(30));
                     let c = callbacks.load(Ordering::Relaxed);
-                    if c != seen || ctx.paused() {
+                    if c != seen || link.paused() {
                         seen = c;
                         last_progress = std::time::Instant::now();
                     } else if last_progress.elapsed() > Duration::from_secs(2) {
                         log::warn!("audio device stopped requesting samples; continuing silently");
-                        ctx.emit(PlayerEvent::Warning(
+                        link.current().emit(PlayerEvent::Warning(
                             "The audio device stopped responding; playing without sound".into(),
                         ));
                         drop(stream);
-                        null_sink(&ctx, &stop, fmt);
+                        null_sink(&link, fmt);
                         return;
                     }
                 }
@@ -292,31 +605,43 @@ pub fn open_output(
             Err(e) => {
                 // No usable device: keep playing in real time without sound.
                 log::warn!("audio output unavailable: {e:#}");
-                ctx.emit(PlayerEvent::Warning("No audio device available — playing without sound".into()));
+                link.current().emit(PlayerEvent::Warning("No audio device available — playing without sound".into()));
                 let fmt = silent_format(mode, media_channels);
                 let _ = tx.send(fmt.clone());
-                null_sink(&ctx, &stop, fmt);
+                null_sink(&link, fmt);
             }
         }
     })?;
-    match rx.recv_timeout(DEVICE_OPEN_TIMEOUT) {
-        Ok(fmt) => Ok((handle, fmt)),
+    let opened = match rx.recv_timeout(DEVICE_OPEN_TIMEOUT) {
+        Ok(fmt) => (handle, fmt),
         Err(_) if !claimed.swap(true, Ordering::AcqRel) => {
             // The device is hanging. Leave its thread behind (it exits on its
             // own if the device ever answers) and play silently instead.
             log::warn!("audio device did not open within {DEVICE_OPEN_TIMEOUT:?}; playing without sound");
             ctx.emit(PlayerEvent::Warning("The audio device isn't responding — playing without sound".into()));
             let fmt = silent_format(mode, media_channels);
-            let f2 = fmt.clone();
-            let sink =
-                std::thread::Builder::new().name("audio-null".into()).spawn(move || null_sink(&ctx, &stop, f2))?;
-            Ok((sink, fmt))
+            let (f2, l2) = (fmt.clone(), link.clone());
+            let sink = std::thread::Builder::new().name("audio-null".into()).spawn(move || null_sink(&l2, f2))?;
+            (sink, fmt)
         }
         // The device won the race just as we timed out; its format is on the way.
         Err(_) => match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(fmt) => Ok((handle, fmt)),
+            Ok(fmt) => (handle, fmt),
             Err(_) => anyhow::bail!("audio device did not respond"),
         },
+    };
+    *link.fmt.lock() = Some(opened.1.clone());
+    *ctx.controls.output.lock() = Arc::downgrade(&link);
+    Ok((opened.0, opened.1, link))
+}
+
+/// After a session's audio decoder stopped: waits until the output has let
+/// go of it, joining the device thread if this was the last user.
+pub fn finish_output(link: &OutputLink, id: u64, thread: Option<JoinHandle<()>>) {
+    if link.release(id)
+        && let Some(t) = thread
+    {
+        let _ = t.join();
     }
 }
 
@@ -328,9 +653,9 @@ fn silent_format(mode: ChannelMode, media_channels: i32) -> OutFormat {
     }
 }
 
-fn callback_state(ctx: &Arc<SessionCtx>, fmt: &OutFormat) -> CallbackState {
+fn callback_state(link: &Arc<OutputLink>, fmt: &OutFormat) -> CallbackState {
     CallbackState {
-        ctx: ctx.clone(),
+        link: link.clone(),
         channels: fmt.channels as usize,
         rate: fmt.rate as f64,
         gain: 0.0,
@@ -341,12 +666,12 @@ fn callback_state(ctx: &Arc<SessionCtx>, fmt: &OutFormat) -> CallbackState {
 
 /// Consumes audio in real time and discards it, so the audio clock keeps
 /// driving playback when there is no working output device.
-fn null_sink(ctx: &Arc<SessionCtx>, stop: &AtomicBool, fmt: OutFormat) {
+fn null_sink(link: &Arc<OutputLink>, fmt: OutFormat) {
     const PERIOD: Duration = Duration::from_millis(20);
-    let mut state = callback_state(ctx, &fmt);
+    let mut state = callback_state(link, &fmt);
     let mut buf = vec![0f32; (fmt.rate as usize / 50).max(1) * fmt.channels as usize];
     let mut next = std::time::Instant::now();
-    while ctx.alive() && !stop.load(Ordering::Acquire) {
+    while link.keep_serving() {
         state.run(&mut buf, 0.0);
         next += PERIOD;
         let now = std::time::Instant::now();
@@ -361,7 +686,7 @@ fn null_sink(ctx: &Arc<SessionCtx>, stop: &AtomicBool, fmt: OutFormat) {
 type Started = (cpal::Stream, OutFormat, Arc<std::sync::atomic::AtomicU64>);
 
 fn start_device(
-    ctx: &Arc<SessionCtx>,
+    link: &Arc<OutputLink>,
     device_name: Option<&str>,
     mode: ChannelMode,
     media_channels: i32,
@@ -390,12 +715,12 @@ fn start_device(
     }
     let fmt = OutFormat { rate, channels, device: dev_label };
     let config = cpal::StreamConfig { channels, sample_rate: rate, buffer_size: cpal::BufferSize::Default };
-    let mut state = callback_state(ctx, &fmt);
+    let mut state = callback_state(link, &fmt);
     let callbacks = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let err_ctx = ctx.clone();
+    let err_link = link.clone();
     let on_err = move |e: cpal::Error| {
         log::warn!("audio stream error: {e}");
-        err_ctx.emit(PlayerEvent::Warning(format!("Audio device error: {e}")));
+        err_link.current().emit(PlayerEvent::Warning(format!("Audio device error: {e}")));
     };
     let latency_of = |info: &cpal::OutputCallbackInfo| {
         let ts = info.timestamp();
@@ -506,6 +831,10 @@ struct Key {
     layout: String,
     fx_gen: u64,
     speed: u64,
+    /// Seeks start a new graph: filters with memory (tempo, normaliser,
+    /// compressor) would otherwise play pre-seek audio under the new
+    /// position, and atempo would keep counting time from the old one.
+    serial: i32,
 }
 
 pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, tb: ff::AVRational, out: OutFormat, stop: Arc<AtomicBool>) {
@@ -558,10 +887,11 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, tb: ff::AVRational, o
         let speed = ctx.controls.speed();
         let (fx_gen, fx) = ctx.controls.audio_fx.lock().clone();
         let layout = layout_string(&frame.raw().ch_layout);
-        let key = Key { rate, fmt: frame.format(), layout: layout.clone(), fx_gen, speed: speed.to_bits() };
+        let key = Key { rate, fmt: frame.format(), layout: layout.clone(), fx_gen, speed: speed.to_bits(), serial };
         if graph.as_ref().map(|(k, _, _)| k != &key).unwrap_or(true) {
-            // Flush the old graph's tail so speed/effect changes don't drop audio.
-            if let Some((_, g, start)) = graph.as_mut() {
+            // Flush the old graph's tail so speed/effect changes don't drop
+            // audio. After a seek its tail is from the old position: drop it.
+            if let Some((_, g, start)) = graph.as_mut().filter(|(k, _, _)| k.serial == serial) {
                 g.push_eof();
                 let (start, old_speed) = (*start, f64::from_bits(graph.as_ref().unwrap().0.speed));
                 let g = &mut graph.as_mut().unwrap().1;
@@ -620,6 +950,17 @@ fn drain(
 ) {
     let otb = g.out_time_base();
     while g.pull(filtered) {
+        // The graph ends in `aformat` for packed float in the output layout;
+        // anything else would make the read below run past the buffer.
+        let raw = filtered.raw();
+        if raw.ch_layout.nb_channels != channels as c_int
+            || raw.format != ff::AVSampleFormat::AV_SAMPLE_FMT_FLT as c_int
+            || raw.data[0].is_null()
+            || raw.nb_samples <= 0
+        {
+            filtered.unref();
+            continue;
+        }
         let n = filtered.nb_samples() as usize * channels as usize;
         let out_pts = av::ts_to_secs(filtered.raw().pts, otb);
         // atempo stamps output on its own timeline; map back to media time.
@@ -630,5 +971,74 @@ fn drain(
         if !ctx.abuf.push(chunk, max_samples, stop, || aq.serial()) {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RATE: f64 = 48000.0;
+
+    fn push(b: &AudioBuffer, value: f32, frames: usize, serial: i32) {
+        let c = Chunk { data: vec![value; frames * 2], pos: 0, pts: 0.0, speed: 1.0, serial };
+        assert!(b.push(c, usize::MAX, &AtomicBool::new(false), || serial));
+    }
+
+    /// Plays `n` callbacks of 256 frames and returns the left channel.
+    fn play(b: &AudioBuffer, n: usize, finished: bool, out: &mut Vec<f32>) {
+        for _ in 0..n {
+            let mut buf = vec![0.0f32; 512];
+            b.fill(&mut buf, 2, RATE, finished);
+            out.extend(buf.iter().step_by(2));
+        }
+    }
+
+    fn largest_step(s: &[f32]) -> f32 {
+        s.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn seeks_fade_instead_of_clicking() {
+        let b = AudioBuffer::new();
+        push(&b, 0.8, 4800, 0);
+        let mut out = Vec::new();
+        play(&b, 4, false, &mut out);
+        assert_eq!(*out.last().unwrap(), 0.8);
+        b.flush(1);
+        push(&b, -0.8, 4800, 1);
+        play(&b, 12, false, &mut out);
+        // Full level on both sides, but no jump anywhere: a 1.6 step became a ramp.
+        assert_eq!(*out.last().unwrap(), -0.8);
+        assert!(largest_step(&out) < 0.01, "step {}", largest_step(&out));
+    }
+
+    #[test]
+    fn stalls_fade_out_and_back_in() {
+        let b = AudioBuffer::new();
+        b.flush(0); // as after a seek: starts with a fade-in
+        push(&b, 0.8, 2000, 0);
+        let mut out = Vec::new();
+        play(&b, 10, false, &mut out); // runs dry in the 8th callback
+        assert!(out[out.len() - 256..].iter().all(|&s| s == 0.0));
+        // Not enough for the pre-roll yet: stays silent rather than starting and stopping.
+        push(&b, 0.8, 100, 0);
+        play(&b, 2, false, &mut out);
+        assert!(out[out.len() - 256..].iter().all(|&s| s == 0.0));
+        push(&b, 0.8, 4800, 0);
+        play(&b, 10, false, &mut out);
+        assert_eq!(*out.last().unwrap(), 0.8);
+        assert!(largest_step(&out) < 0.01, "step {}", largest_step(&out));
+    }
+
+    #[test]
+    fn the_real_end_is_not_faded() {
+        // Gapless playback carries straight on from the last sample.
+        let b = AudioBuffer::new();
+        push(&b, 0.8, 300, 0);
+        let mut buf = vec![0.0f32; 1024];
+        b.fill(&mut buf, 2, RATE, true);
+        assert_eq!(buf[599], 0.8);
+        assert_eq!(buf[600], 0.0);
     }
 }

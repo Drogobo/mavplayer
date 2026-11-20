@@ -1,7 +1,10 @@
 //! User settings and small bits of persistent state (recent files, resume
 //! positions), stored as JSON in the platform config directory.
 
-use crate::engine::{AudioFx, ChannelMode, Deinterlace, EngineConfig, HwDecode, MediaSource, ScaleQuality};
+use crate::engine::{
+    Anime4KMode, Anime4KQuality, AudioFx, ChannelMode, Deinterlace, EngineConfig, HwDecode, MediaSource, ScaleQuality,
+    Upscaler,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +51,98 @@ pub enum OpenMode {
     Append,
 }
 
+/// What playback does while the progress bar is held down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SeekDragMode {
+    /// Keep playing; the picture follows the bar as it is dragged.
+    KeepPlaying,
+    /// Pause while the bar is held and resume when it is released.
+    Pause,
+}
+
+/// What opening media does while a MavPlayer window is already open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunningMode {
+    /// Start another, independent window.
+    NewWindow,
+    /// Add to the open window's playlist and play it.
+    PlayNow,
+    /// Add to the open window's playlist without interrupting playback.
+    Enqueue,
+    /// Clear the open window's playlist and play it.
+    Replace,
+}
+
+/// A control the bottom bar can show. Play/Pause is always there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BarControl {
+    Stop,
+    Previous,
+    Next,
+    Subtitles,
+    AudioTrack,
+    Speed,
+    Repeat,
+    Shuffle,
+    Playlist,
+    Settings,
+    Fullscreen,
+    Volume,
+}
+
+impl BarControl {
+    /// Every control, in the bar's default order.
+    pub const ALL: [BarControl; 12] = [
+        Self::Stop,
+        Self::Previous,
+        Self::Next,
+        Self::Subtitles,
+        Self::AudioTrack,
+        Self::Speed,
+        Self::Repeat,
+        Self::Shuffle,
+        Self::Playlist,
+        Self::Settings,
+        Self::Fullscreen,
+        Self::Volume,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Previous => "Previous",
+            Self::Next => "Next",
+            Self::Subtitles => "Subtitle track",
+            Self::AudioTrack => "Audio track",
+            Self::Speed => "Playback speed",
+            Self::Repeat => "Repeat",
+            Self::Shuffle => "Shuffle",
+            Self::Playlist => "Playlist",
+            Self::Settings => "Preferences",
+            Self::Fullscreen => "Fullscreen",
+            Self::Volume => "Volume",
+        }
+    }
+
+    /// Shown next to Play/Pause, left of the title (the rest go right of it).
+    pub fn on_left(self) -> bool {
+        matches!(self, Self::Stop | Self::Previous | Self::Next)
+    }
+}
+
+/// Reads the bar's control list, skipping entries this version doesn't know
+/// (so a settings file from a newer version doesn't reset every setting).
+fn de_bar_controls<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<BarControl>, D::Error> {
+    let raw = Vec::<serde_json::Value>::deserialize(d)?;
+    let mut out: Vec<BarControl> = Vec::new();
+    for c in raw.into_iter().filter_map(|v| serde_json::from_value(v).ok()) {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -63,21 +158,34 @@ pub struct Settings {
     pub double_click_fullscreen: bool,
     pub scroll_action: ScrollAction,
     pub show_playlist: bool,
+    /// Controls shown in the bottom bar, in order.
+    #[serde(deserialize_with = "de_bar_controls")]
+    pub bar_controls: Vec<BarControl>,
     // Playback
     pub resume_playback: bool,
     pub auto_play_next: bool,
+    /// Files you open start paused (moving on to the next item never does).
+    pub start_paused: bool,
     pub open_mode: OpenMode,
+    pub when_running: RunningMode,
     pub start_fullscreen: bool,
     pub seek_step: f64,
     pub seek_step_large: f64,
     pub volume_step: f64,
     pub max_volume: u32,
     pub exact_seeks: bool,
+    pub seek_drag: SeekDragMode,
     pub screenshot_dir: Option<PathBuf>,
     // Video
     pub hwdec: HwDecode,
     pub deinterlace: Deinterlace,
     pub scale_quality: ScaleQuality,
+    pub upscaler: Upscaler,
+    pub anime4k_mode: Anime4KMode,
+    pub anime4k_quality: Anime4KQuality,
+    pub custom_shader: Option<PathBuf>,
+    pub shader_chroma: bool,
+    pub shader_sharpen: bool,
     pub tone_map_hdr: bool,
     // Audio
     pub audio_device: Option<String>,
@@ -122,19 +230,29 @@ impl Default for Settings {
             double_click_fullscreen: true,
             scroll_action: ScrollAction::Volume,
             show_playlist: false,
+            bar_controls: BarControl::ALL.to_vec(),
             resume_playback: true,
             auto_play_next: true,
+            start_paused: false,
             open_mode: OpenMode::Replace,
+            when_running: RunningMode::NewWindow,
             start_fullscreen: false,
             seek_step: 5.0,
             seek_step_large: 60.0,
             volume_step: 5.0,
             max_volume: 130,
             exact_seeks: true,
+            seek_drag: SeekDragMode::KeepPlaying,
             screenshot_dir: None,
             hwdec: HwDecode::Auto,
             deinterlace: Deinterlace::Auto,
             scale_quality: ScaleQuality::Good,
+            upscaler: Upscaler::Bilinear,
+            anime4k_mode: Anime4KMode::A,
+            anime4k_quality: Anime4KQuality::High,
+            custom_shader: None,
+            shader_chroma: false,
+            shader_sharpen: false,
             tone_map_hdr: true,
             audio_device: None,
             channels: ChannelMode::Auto,
@@ -174,6 +292,12 @@ impl Settings {
             channels: self.channels,
             audio_device: self.audio_device.clone(),
             scale_quality: self.scale_quality,
+            upscaler: self.upscaler,
+            anime4k_mode: self.anime4k_mode,
+            anime4k_quality: self.anime4k_quality,
+            custom_shader: self.custom_shader.clone(),
+            shader_chroma: self.shader_chroma,
+            shader_sharpen: self.shader_sharpen,
             tone_map_hdr: self.tone_map_hdr,
             audio_langs: split_langs(&self.audio_langs),
             sub_langs: split_langs(&self.sub_langs),
@@ -220,19 +344,43 @@ fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Option<T> {
     }
 }
 
-/// Writes atomically so a crash never leaves a half-written file.
+/// Writes atomically so a crash never leaves a half-written file. The
+/// temporary file is per process, so two windows saving at once can't mix
+/// their writes, and (on Unix) readable only by the user: these files hold
+/// what was watched, and stream URLs can carry credentials.
 fn write_json<T: Serialize>(p: &Path, v: &T) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d)?;
     }
-    let tmp = p.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec_pretty(v)?)?;
-    std::fs::rename(&tmp, p)
+    let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let written = opts.open(&tmp).and_then(|mut f| f.write_all(&serde_json::to_vec_pretty(v)?));
+    if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, p)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 impl Settings {
     pub fn load() -> Self {
-        read_json(&config_dir().join("settings.json")).unwrap_or_default()
+        let raw: Option<serde_json::Value> = read_json(&config_dir().join("settings.json"));
+        raw.and_then(|v| Self::from_value(v).ok()).unwrap_or_default()
+    }
+
+    fn from_value(v: serde_json::Value) -> serde_json::Result<Self> {
+        // Before upscaling had its own setting, choosing nearest-neighbour
+        // scaling also enlarged with it: keep that for old settings files.
+        let had_upscaler = v.get("upscaler").is_some();
+        let mut s: Settings = serde_json::from_value(v)?;
+        if !had_upscaler && s.scale_quality == ScaleQuality::Nearest {
+            s.upscaler = Upscaler::Nearest;
+        }
+        Ok(s)
     }
     pub fn save(&self) {
         if let Err(e) = write_json(&config_dir().join("settings.json"), self) {
@@ -244,8 +392,14 @@ impl Settings {
 /// Remembered playback positions, keyed by `MediaSource::key()`.
 #[derive(Default, Serialize, Deserialize)]
 pub struct ResumeStore {
-    pub positions: HashMap<String, f64>,
+    positions: HashMap<String, f64>,
+    /// Keys from least to most recently stored, so the oldest go first when
+    /// the store is full. (Missing from files written before it existed.)
+    #[serde(default)]
+    order: Vec<String>,
 }
+
+const MAX_RESUME: usize = 500;
 
 impl ResumeStore {
     pub fn load() -> Self {
@@ -261,16 +415,78 @@ impl ResumeStore {
     }
     /// Stores a position unless it's at the very start or end.
     pub fn remember(&mut self, key: String, pos: f64, duration: f64) {
-        if duration > 60.0 && pos > 10.0 && pos < duration - 20.0 {
-            self.positions.insert(key, pos);
-        } else {
-            self.positions.remove(&key);
+        if !(duration > 60.0 && pos > 10.0 && pos < duration - 20.0) {
+            self.forget(&key);
+            return;
         }
-        if self.positions.len() > 500 {
-            let k: Vec<String> = self.positions.keys().take(100).cloned().collect();
-            for k in k {
-                self.positions.remove(&k);
+        self.order.retain(|k| *k != key);
+        self.order.push(key.clone());
+        self.positions.insert(key, pos);
+        if self.positions.len() > MAX_RESUME {
+            // Entries saved before `order` existed count as the oldest.
+            let ordered: std::collections::HashSet<&String> = self.order.iter().collect();
+            let mut victims: Vec<String> = self.positions.keys().filter(|k| !ordered.contains(k)).cloned().collect();
+            victims.extend(self.order.iter().cloned());
+            victims.truncate(self.positions.len() - MAX_RESUME + 100);
+            for k in victims {
+                self.forget(&k);
             }
         }
+    }
+
+    pub fn forget(&mut self, key: &str) {
+        self.positions.remove(key);
+        self.order.retain(|k| k != key);
+    }
+
+    pub fn clear(&mut self) {
+        self.positions.clear();
+        self.order.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_store_evicts_the_oldest() {
+        let mut r = ResumeStore::default();
+        for i in 0..=MAX_RESUME {
+            r.remember(format!("f{i}"), 100.0, 1000.0);
+        }
+        // Touch the first one again: it is now the newest.
+        r.remember("f0".into(), 200.0, 1000.0);
+        r.remember("new".into(), 100.0, 1000.0);
+        assert!(r.positions.len() <= MAX_RESUME);
+        assert_eq!(r.get("f0"), Some(200.0));
+        assert_eq!(r.get("new"), Some(100.0));
+        assert_eq!(r.get("f1"), None);
+        assert_eq!(r.positions.len(), r.order.len());
+    }
+
+    #[test]
+    fn bar_controls_load_leniently() {
+        // Older files have no list: today's full bar.
+        let s: Settings = serde_json::from_str("{\"muted\":true}").unwrap();
+        assert_eq!(s.bar_controls, BarControl::ALL.to_vec());
+        assert!(s.muted);
+        // Unknown entries (from a newer version) and repeats are skipped
+        // rather than resetting every setting.
+        let s: Settings =
+            serde_json::from_str(r#"{"bar_controls":["Volume","Teleport","Stop","Volume"],"muted":true}"#).unwrap();
+        assert_eq!(s.bar_controls, vec![BarControl::Volume, BarControl::Stop]);
+        assert!(s.muted);
+        let round: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(round.bar_controls, s.bar_controls);
+    }
+
+    #[test]
+    fn old_nearest_scaling_also_upscales() {
+        let load = |j: &str| Settings::from_value(serde_json::from_str(j).unwrap()).unwrap();
+        assert_eq!(load(r#"{"scale_quality":"Nearest"}"#).upscaler, Upscaler::Nearest);
+        assert_eq!(load(r#"{"scale_quality":"Good"}"#).upscaler, Upscaler::Bilinear);
+        assert_eq!(load(r#"{"scale_quality":"Nearest","upscaler":"Bilinear"}"#).upscaler, Upscaler::Bilinear);
+        assert_eq!(load(r#"{"upscaler":"Anime4K"}"#).upscaler, Upscaler::Anime4K);
     }
 }

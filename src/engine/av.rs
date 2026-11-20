@@ -259,9 +259,16 @@ impl Drop for FilterGraph {
     }
 }
 
-pub fn filter_available(name: &str) -> bool {
-    let n = cstr(name);
-    unsafe { !ff::avfilter_get_by_name(n.as_ptr()).is_null() }
+/// Whether this FFmpeg build has filter `name`. Cached: the video thread
+/// asks for every frame, and FFmpeg's lookup is a linear search.
+pub fn filter_available(name: &'static str) -> bool {
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    static CACHE: Mutex<Option<HashMap<&'static str, bool>>> = Mutex::new(None);
+    *CACHE.lock().get_or_insert_with(HashMap::new).entry(name).or_insert_with(|| {
+        let n = cstr(name);
+        unsafe { !ff::avfilter_get_by_name(n.as_ptr()).is_null() }
+    })
 }
 
 pub fn codec_name(id: ff::AVCodecID) -> String {

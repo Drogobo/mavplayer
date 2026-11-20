@@ -1,7 +1,9 @@
 //! The GPUI user interface.
 
 pub mod actions;
+pub mod bar;
 pub mod dialogs;
+pub mod media_keys;
 pub mod menu;
 pub mod menus;
 pub mod player;

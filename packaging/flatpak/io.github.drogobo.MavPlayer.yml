@@ -21,6 +21,8 @@ finish-args:
   - --filesystem=xdg-run/pipewire-0   # native PipeWire audio
   - --socket=pulseaudio     # fallback when PipeWire is missing
   - --share=network         # network streams
+  - --own-name=org.mpris.MediaPlayer2.mavplayer     # media keys (MPRIS)
+  - --own-name=org.mpris.MediaPlayer2.mavplayer.*   # ...for extra windows
   - --filesystem=host:ro    # open files, sidecar subtitles, DVD folders
   - --filesystem=xdg-pictures/MavPlayer:create   # screenshots
   - --filesystem=xdg-music:ro
@@ -116,6 +118,8 @@ modules:
       - install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml /app/share/metainfo/io.github.drogobo.MavPlayer.metainfo.xml
       - install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.svg /app/share/icons/hicolor/scalable/apps/io.github.drogobo.MavPlayer.svg
       - for s in 16 32 48 64 128 256 512; do install -Dm644 packaging/icons/mavplayer-$s.png /app/share/icons/hicolor/${s}x${s}/apps/io.github.drogobo.MavPlayer.png; done
+      - install -Dm644 LICENSE /app/share/licenses/io.github.drogobo.MavPlayer/LICENSE
+      - install -Dm644 third_party/shaders/LICENSES.txt /app/share/licenses/io.github.drogobo.MavPlayer/SHADER-LICENSES.txt
     sources:
       - type: dir
         path: ../..

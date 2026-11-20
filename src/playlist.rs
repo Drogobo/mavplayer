@@ -5,6 +5,7 @@ use crate::engine::MediaSource;
 use crate::engine::disc;
 use crate::settings::RepeatMode;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 pub const VIDEO_EXTS: &[&str] = &[
@@ -218,15 +219,21 @@ impl Playlist {
     }
 
     pub fn save_m3u(&self, path: &Path) -> std::io::Result<()> {
+        // Titles come from file metadata: a line break in one would start
+        // a bogus entry when the playlist is read back.
+        let one_line = |t: &str| t.replace(['\r', '\n'], " ");
         let mut s = String::from("#EXTM3U\n");
         for it in &self.items {
-            let dur = it.duration.map(|d| d.round() as i64).unwrap_or(-1);
-            s.push_str(&format!("#EXTINF:{dur},{}\n", it.display_title()));
-            match &it.source {
-                MediaSource::File(p) => s.push_str(&format!("{}\n", p.display())),
-                MediaSource::Url(u) => s.push_str(&format!("{u}\n")),
-                MediaSource::Dvd { path, title, .. } => s.push_str(&format!("dvd://{title}/{path}\n")),
+            let entry = match &it.source {
+                MediaSource::File(p) => p.display().to_string(),
+                MediaSource::Url(u) => u.clone(),
+                MediaSource::Dvd { path, title, .. } => format!("dvd://{title}/{path}"),
+            };
+            if entry.contains(['\r', '\n']) {
+                continue; // can't be represented in M3U
             }
+            let dur = it.duration.map(|d| d.round() as i64).unwrap_or(-1);
+            s.push_str(&format!("#EXTINF:{dur},{}\n{entry}\n", one_line(&it.display_title())));
         }
         std::fs::write(path, s)
     }
@@ -268,7 +275,12 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
     }
 }
 
-fn scan_dir(dir: &Path, out: &mut Vec<MediaSource>, depth: u32) {
+fn scan_dir(dir: &Path, out: &mut Vec<MediaSource>, depth: u32, seen: &mut HashSet<PathBuf>) {
+    // A symlink back up the tree would otherwise add everything again at
+    // every level down to the depth limit.
+    if !seen.insert(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())) {
+        return;
+    }
     if let Some(dvd) = disc::is_disc_source(dir) {
         out.push(dvd);
         return;
@@ -282,7 +294,7 @@ fn scan_dir(dir: &Path, out: &mut Vec<MediaSource>, depth: u32) {
         }
         if p.is_dir() {
             if depth < 8 {
-                scan_dir(&p, out, depth + 1);
+                scan_dir(&p, out, depth + 1, seen);
             }
         } else if is_media_path(&p) {
             out.push(source_for_path(&p));
@@ -313,8 +325,8 @@ pub fn source_for_arg(arg: &str) -> MediaSource {
         };
         return MediaSource::Dvd { path, title, angle: 1 };
     }
-    if let Some(p) = arg.strip_prefix("file://") {
-        return source_for_path(Path::new(&percent_decode(p)));
+    if let Some(p) = file_uri_path(arg) {
+        return source_for_path(&p);
     }
     if lower.contains("://") {
         return MediaSource::Url(arg.to_string());
@@ -334,23 +346,23 @@ pub fn default_dvd_device() -> String {
     })
 }
 
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
-        {
-            out.push(v);
-            i += 3;
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+/// The local path in a `file://` URI (`file:///x`, `file://localhost/x`),
+/// percent-decoded and without any query or fragment.
+fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.get(..7).filter(|p| p.eq_ignore_ascii_case("file://")).map(|_| &uri[7..])?;
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let rest = match rest.get(..9) {
+        Some(h) if h.eq_ignore_ascii_case("localhost") => &rest[9..],
+        _ => rest,
+    };
+    let path = crate::engine::types::percent_decode(rest);
+    // file:///C:/Videos/x.mkv on Windows.
+    #[cfg(windows)]
+    let path = match path.as_bytes() {
+        [b'/', d, b':', ..] if d.is_ascii_alphabetic() => path[1..].to_string(),
+        _ => path,
+    };
+    Some(PathBuf::from(path))
 }
 
 fn is_hls(path: &Path) -> bool {
@@ -387,7 +399,7 @@ pub fn expand_paths(paths: &[PathBuf]) -> Vec<MediaSource> {
     for p in paths {
         let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         if p.is_dir() {
-            scan_dir(p, &mut out, 0);
+            scan_dir(p, &mut out, 0, &mut HashSet::new());
         } else if PLAYLIST_EXTS.contains(&ext.as_str()) && !(ext == "m3u8" && is_hls(p)) {
             out.extend(parse_playlist_file(p));
         } else {
@@ -441,6 +453,45 @@ mod tests {
         let mut order = p.order.clone();
         order.sort();
         assert_eq!(order, (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn file_uris() {
+        let path = |s: &str| match source_for_arg(s) {
+            MediaSource::File(p) => p,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(path("file:///tmp/a%20b.mkv"), PathBuf::from("/tmp/a b.mkv"));
+        assert_eq!(path("FILE:///tmp/x.mkv"), PathBuf::from("/tmp/x.mkv"));
+        assert_eq!(path("file://localhost/tmp/x.mkv"), PathBuf::from("/tmp/x.mkv"));
+        assert_eq!(path("file:///tmp/%E2%9C%93.mkv"), PathBuf::from("/tmp/✓.mkv"));
+        // A stray % before a multi-byte character used to panic.
+        assert_eq!(path("file:///tmp/%aé%"), PathBuf::from("/tmp/%aé%"));
+        assert_eq!(MediaSource::Url("http://h/%zé%4".into()).display_name(), "%zé%4");
+    }
+
+    #[test]
+    fn m3u_export_keeps_one_entry_per_line() {
+        let mut p = pl(&["/m/a.mkv"]);
+        p.items[0].title = Some("evil\n/etc/passwd".into());
+        let f = std::env::temp_dir().join(format!("mavplayer-test-{}.m3u", std::process::id()));
+        p.save_m3u(&f).unwrap();
+        let back = parse_playlist_file(&f);
+        let _ = std::fs::remove_file(&f);
+        assert_eq!(back, vec![MediaSource::File("/m/a.mkv".into())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_scan_survives_symlink_loops() {
+        let d = std::env::temp_dir().join(format!("mavplayer-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        std::fs::write(d.join("sub/x.mkv"), b"").unwrap();
+        std::os::unix::fs::symlink(&d, d.join("sub/loop")).unwrap();
+        let found = expand_paths(std::slice::from_ref(&d));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     #[test]

@@ -5,11 +5,12 @@ use super::menu::MenuItem as M;
 use super::player::PlayerView;
 use super::widgets::{format_size, format_time, icon, parse_time};
 use crate::engine::{
-    self, AudioFx, ChannelMode, Deinterlace, EQ_BANDS, HwDecode, ScaleQuality, TrackKind, VideoAdjust, disc,
+    self, Anime4KMode, Anime4KQuality, AudioFx, ChannelMode, Deinterlace, EQ_BANDS, HwDecode, ScaleQuality, TrackKind,
+    Upscaler, VideoAdjust, disc,
 };
 use crate::icons::Icon;
 use crate::playlist;
-use crate::settings::{IconTheme, OpenMode, ScrollAction, SubStyle, ThemeMode};
+use crate::settings::{BarControl, IconTheme, OpenMode, RunningMode, ScrollAction, SeekDragMode, SubStyle, ThemeMode};
 use gpui::{
     AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, Resource, SharedString, Window, deferred,
     div, img, prelude::*, px, relative,
@@ -165,6 +166,50 @@ impl PlayerView {
         footer: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.modal_impl(title, width, body, footer, false, cx)
+    }
+
+    /// A modal with a category list on the left and that category's options on
+    /// the right. The two columns scroll independently: GPUI scrolls every
+    /// scroll container under the pointer at once, so the body must not sit
+    /// inside the modal's own scroll area.
+    fn tabbed_modal(
+        &self,
+        title: &str,
+        width: f32,
+        height: f32,
+        (names, current, make): (&[&str], usize, fn(usize) -> Dialog),
+        content: gpui::Div,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = div()
+            .flex()
+            .h(px(height))
+            .min_h_0()
+            .child(self.tabs(names, current, make, cx))
+            .child(
+                div()
+                    .id(SharedString::from(format!("{title}-options")))
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .child(content),
+            )
+            .into_any_element();
+        self.modal_impl(title, width, body, None, true, cx)
+    }
+
+    /// `self_scrolling`: the body handles its own scrolling, and shrinks to fit
+    /// instead of the modal scrolling it as a whole.
+    fn modal_impl(
+        &self,
+        title: &str,
+        width: f32,
+        body: AnyElement,
+        footer: Option<AnyElement>,
+        self_scrolling: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = self.theme;
         deferred(
             div()
@@ -217,7 +262,15 @@ impl PlayerView {
                                     cx,
                                 )),
                         )
-                        .child(div().id("modal-body").flex_1().min_h_0().overflow_y_scroll().child(body))
+                        .child(
+                            div()
+                                .id("modal-body")
+                                .flex_1()
+                                .min_h_0()
+                                .when(self_scrolling, |d| d.flex().flex_col())
+                                .when(!self_scrolling, |d| d.overflow_y_scroll())
+                                .child(body),
+                        )
                         .when_some(footer, |d, f| {
                             d.child(
                                 div()
@@ -308,6 +361,118 @@ impl PlayerView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.row(label, desc, self.toggle(format!("tg-{id}"), on, f, cx))
+    }
+
+    /// Settings rows for enlarging video: the upscaler, and the options of
+    /// the chosen one.
+    fn upscaling_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let s = &self.settings;
+        let gpu = engine::gpu_upscaling_available();
+        let options: Vec<(String, Upscaler)> =
+            Upscaler::ALL.into_iter().filter(|u| gpu || !u.needs_libplacebo()).map(|u| (u.label().into(), u)).collect();
+        let desc = if gpu {
+            "For pictures smaller than the window. All but the first two run shaders on the GPU (Vulkan)"
+        } else {
+            "GPU upscalers and shaders need FFmpeg built with libplacebo"
+        };
+        let mut rows = vec![self.row(
+            "Upscaling",
+            Some(desc),
+            self.choice("upscale", options, s.upscaler, |t, v, _| t.settings.upscaler = v, cx),
+        )];
+        if !gpu || !s.upscaler.needs_libplacebo() {
+            return rows;
+        }
+        match s.upscaler {
+            Upscaler::Anime4K => {
+                let modes = Anime4KMode::ALL
+                    .into_iter()
+                    .map(|m| {
+                        let what = match m {
+                            Anime4KMode::A => "blurry, 1080p sources",
+                            Anime4KMode::B => "720p, aliasing or ringing",
+                            Anime4KMode::C => "480p and SD",
+                            Anime4KMode::AA => "stronger A",
+                            Anime4KMode::BB => "stronger B",
+                            Anime4KMode::CA => "C, then A",
+                        };
+                        (format!("{} ({what})", m.name()), m)
+                    })
+                    .collect();
+                rows.push(self.row(
+                    "Anime4K mode",
+                    Some("Try A first; pick whichever looks best for the show"),
+                    self.choice("a4kmode", modes, s.anime4k_mode, |t, v, _| t.settings.anime4k_mode = v, cx),
+                ));
+                rows.push(self.row(
+                    "Anime4K quality",
+                    Some("Fast suits laptops and integrated graphics"),
+                    self.choice(
+                        "a4kq",
+                        vec![("High".into(), Anime4KQuality::High), ("Fast".into(), Anime4KQuality::Fast)],
+                        s.anime4k_quality,
+                        |t, v, _| t.settings.anime4k_quality = v,
+                        cx,
+                    ),
+                ));
+            }
+            Upscaler::CustomShader => {
+                let file = s.custom_shader.as_ref().map(|p| p.display().to_string());
+                rows.push(
+                    self.row(
+                        "Shader file",
+                        Some(
+                            file.as_deref()
+                                .unwrap_or("An mpv-style .glsl or .hook file (FSRCNNX, NNEDI3, SSimSuperRes, ...)"),
+                        ),
+                        self.text_button(
+                            "shaderfile",
+                            "Choose…",
+                            false,
+                            |_this, _, w, cx| {
+                                let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                    files: true,
+                                    directories: false,
+                                    multiple: false,
+                                    prompt: Some("Choose".into()),
+                                });
+                                cx.spawn_in(w, async move |this, cx| {
+                                    if let Ok(Ok(Some(p))) = rx.await
+                                        && let Some(p) = p.into_iter().next()
+                                    {
+                                        let _ = this.update(cx, |v, cx| {
+                                            v.settings.custom_shader = Some(p);
+                                            v.apply_settings(cx);
+                                        });
+                                    }
+                                })
+                                .detach();
+                            },
+                            cx,
+                        )
+                        .into_any_element(),
+                    ),
+                );
+            }
+            _ => {}
+        }
+        rows.push(self.toggle_row(
+            "krig",
+            "Better chroma (KrigBilateral)",
+            Some("Sharper colour edges, using the brightness detail"),
+            s.shader_chroma,
+            |t, _| t.settings.shader_chroma = !t.settings.shader_chroma,
+            cx,
+        ));
+        rows.push(self.toggle_row(
+            "cas",
+            "Sharpen (AMD CAS)",
+            Some("Contrast-adaptive sharpening after upscaling"),
+            s.shader_sharpen,
+            |t, _| t.settings.shader_sharpen = !t.settings.shader_sharpen,
+            cx,
+        ));
+        rows
     }
 
     /// A dropdown button; choosing an option calls `f(index)`.
@@ -418,8 +583,10 @@ impl PlayerView {
     fn tabs(&self, names: &[&str], current: usize, make: fn(usize) -> Dialog, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let mut col = div()
+            .id("dialog-tabs")
             .w(px(170.))
             .flex_none()
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(px(2.))
@@ -433,6 +600,8 @@ impl PlayerView {
                     .id(SharedString::from(format!("tab-{n}")))
                     .px_3()
                     .h(px(32.))
+                    // Keep full height in a short window; the list scrolls instead.
+                    .flex_none()
                     .flex()
                     .items_center()
                     .rounded(px(7.))
@@ -780,6 +949,7 @@ impl PlayerView {
                         ),
                     );
                 }
+                c = c.child(self.bar_controls_section(cx));
             }
             1 => {
                 c = c
@@ -790,6 +960,14 @@ impl PlayerView {
                         Some("Remembers the position of files you didn't finish"),
                         s.resume_playback,
                         |t, _| t.settings.resume_playback = !t.settings.resume_playback,
+                        cx,
+                    ))
+                    .child(self.toggle_row(
+                        "startpaused",
+                        "Start files paused",
+                        Some("Opened files wait for Play instead of starting right away"),
+                        s.start_paused,
+                        |t, _| t.settings.start_paused = !t.settings.start_paused,
                         cx,
                     ))
                     .child(self.toggle_row(
@@ -811,6 +989,36 @@ impl PlayerView {
                             ],
                             s.open_mode,
                             |t, v, _| t.settings.open_mode = v,
+                            cx,
+                        ),
+                    ))
+                    .child(self.row(
+                        "When MavPlayer is already open",
+                        Some("Opening files from a file manager or the command line"),
+                        self.choice(
+                            "whenrunning",
+                            vec![
+                                ("Open a new window".into(), RunningMode::NewWindow),
+                                ("Add to playlist and play".into(), RunningMode::PlayNow),
+                                ("Add to playlist".into(), RunningMode::Enqueue),
+                                ("Replace playlist and play".into(), RunningMode::Replace),
+                            ],
+                            s.when_running,
+                            |t, v, _| t.settings.when_running = v,
+                            cx,
+                        ),
+                    ))
+                    .child(self.row(
+                        "While dragging the progress bar",
+                        None,
+                        self.choice(
+                            "seekdrag",
+                            vec![
+                                ("Keep playing".into(), SeekDragMode::KeepPlaying),
+                                ("Pause until released".into(), SeekDragMode::Pause),
+                            ],
+                            s.seek_drag,
+                            |t, v, _| t.settings.seek_drag = v,
                             cx,
                         ),
                     ))
@@ -912,7 +1120,9 @@ impl PlayerView {
                     }, cx)))
                     .child(self.row("Deinterlacing", Some("Automatic only processes interlaced material (DVDs, TV)"), self.choice("deint", vec![("Automatic".into(), Deinterlace::Auto), ("Always".into(), Deinterlace::On), ("Off".into(), Deinterlace::Off)], s.deinterlace, |t, v, _| t.settings.deinterlace = v, cx)))
                     .child(self.toggle_row("tonemap", "HDR tone mapping", Some("Converts HDR10/HLG to standard range so it doesn't look washed out"), s.tone_map_hdr, |t, _| t.settings.tone_map_hdr = !t.settings.tone_map_hdr, cx))
-                    .child(self.row("Scaling quality", None, self.choice("scale", vec![("Nearest neighbor".into(), ScaleQuality::Nearest), ("Linear".into(), ScaleQuality::Linear), ("Good (bicubic)".into(), ScaleQuality::Good), ("Best (Lanczos)".into(), ScaleQuality::Best)], s.scale_quality, |t, v, _| t.settings.scale_quality = v, cx)));
+                    .child(self.section("Scaling"))
+                    .child(self.row("Downscaling", Some("For pictures larger than the window"), self.choice("scale", vec![("Nearest neighbor".into(), ScaleQuality::Nearest), ("Linear".into(), ScaleQuality::Linear), ("Good (bicubic)".into(), ScaleQuality::Good), ("Best (Lanczos)".into(), ScaleQuality::Best)], s.scale_quality, |t, v, _| t.settings.scale_quality = v, cx)))
+                    .children(self.upscaling_rows(cx));
             }
             3 => {
                 let mut devs: Vec<(String, Option<String>)> = vec![("System default".into(), None)];
@@ -1115,7 +1325,7 @@ impl PlayerView {
                                 "Clear",
                                 false,
                                 |this, _, _, cx| {
-                                    this.resume.positions.clear();
+                                    this.resume.clear();
                                     this.resume.save();
                                     this.osd("Resume positions cleared", cx);
                                 },
@@ -1146,13 +1356,97 @@ impl PlayerView {
                     );
             }
         }
-        let body = div()
-            .flex()
-            .h(px(520.))
-            .child(self.tabs(SETTINGS_TABS, tab, Dialog::Settings, cx))
-            .child(div().id("settings-scroll").flex_1().min_w_0().overflow_y_scroll().child(c))
-            .into_any_element();
-        self.modal("Preferences", 820., body, None, cx)
+        self.tabbed_modal("Preferences", 820., 520., (SETTINGS_TABS, tab, Dialog::Settings), c, cx)
+    }
+
+    /// Preferences → Interface → "Control bar": which controls the bottom
+    /// bar shows, and in what order.
+    fn bar_controls_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let enabled = &self.settings.bar_controls;
+        let mut col =
+            div().flex().flex_col().child(self.section("Control bar")).child(
+                div().pb_1().text_size(px(11.)).text_color(t.text_dim).child(
+                    "Play/Pause is always shown. A window too narrow for all of them hides some until it is wider.",
+                ),
+            );
+        let small_btn = |id: String, i: Icon, active: bool| {
+            div()
+                .id(SharedString::from(id))
+                .size(px(26.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .when(active, |d| d.cursor_pointer().hover(|s| s.bg(t.hover)))
+                .child(icon(i, px(14.), if active { t.text } else { t.text_disabled }))
+        };
+        for left in [true, false] {
+            col = col.child(div().pt_2().text_size(px(12.)).text_color(t.text_dim).child(if left {
+                "Left of the title"
+            } else {
+                "Right of the title"
+            }));
+            // Shown ones in their order, then the hidden ones.
+            let on: Vec<BarControl> = enabled.iter().copied().filter(|c| c.on_left() == left).collect();
+            let off = BarControl::ALL.into_iter().filter(|c| c.on_left() == left && !on.contains(c));
+            let n = on.len();
+            let items: Vec<(BarControl, bool)> = on.iter().map(|&c| (c, true)).chain(off.map(|c| (c, false))).collect();
+            for (i, (c, shown)) in items.into_iter().enumerate() {
+                let (up, down) = (shown && i > 0, shown && i + 1 < n);
+                let id = format!("{c:?}");
+                let control = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(small_btn(format!("bar-up-{id}"), Icon::Up, up).when(up, |d| {
+                        d.on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_bar_control(c, -1);
+                            this.apply_settings(cx);
+                        }))
+                    }))
+                    .child(small_btn(format!("bar-down-{id}"), Icon::Down, down).when(down, |d| {
+                        d.on_click(cx.listener(move |this, _, _, cx| {
+                            this.move_bar_control(c, 1);
+                            this.apply_settings(cx);
+                        }))
+                    }))
+                    .child(div().w(px(8.)))
+                    .child(self.toggle(format!("tg-bar-{id}"), shown, move |this, _| this.toggle_bar_control(c), cx))
+                    .into_any_element();
+                col = col.child(self.row(c.label(), None, control));
+            }
+        }
+        col.into_any_element()
+    }
+
+    /// Shows or hides `c` in the bottom bar. A control that comes back goes
+    /// to its usual place among the others.
+    fn toggle_bar_control(&mut self, c: BarControl) {
+        let list = &mut self.settings.bar_controls;
+        if let Some(i) = list.iter().position(|&x| x == c) {
+            list.remove(i);
+        } else {
+            let rank = |x: BarControl| BarControl::ALL.iter().position(|&a| a == x).unwrap_or(usize::MAX);
+            let at = list.iter().position(|&x| rank(x) > rank(c)).unwrap_or(list.len());
+            list.insert(at, c);
+        }
+    }
+
+    /// Moves `c` one place earlier (`-1`) or later (`1`) among the shown
+    /// controls on its side of the title.
+    fn move_bar_control(&mut self, c: BarControl, dir: i32) {
+        let list = &mut self.settings.bar_controls;
+        let Some(i) = list.iter().position(|&x| x == c) else { return };
+        let same_side = |x: &BarControl| x.on_left() == c.on_left();
+        let j = if dir < 0 {
+            list[..i].iter().rposition(same_side)
+        } else {
+            list[i + 1..].iter().position(same_side).map(|k| i + 1 + k)
+        };
+        if let Some(j) = j {
+            list.swap(i, j);
+        }
     }
 
     fn effects_dialog(&mut self, tab: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1477,13 +1771,7 @@ impl PlayerView {
                     ));
             }
         }
-        let body = div()
-            .flex()
-            .h(px(480.))
-            .child(self.tabs(EFFECT_TABS, tab, Dialog::Effects, cx))
-            .child(div().id("fx-scroll").flex_1().min_w_0().overflow_y_scroll().child(c))
-            .into_any_element();
-        self.modal("Effects & Filters", 760., body, None, cx)
+        self.tabbed_modal("Effects & Filters", 760., 480., (EFFECT_TABS, tab, Dialog::Effects), c, cx)
     }
 
     fn media_info_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {

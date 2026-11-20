@@ -5,7 +5,9 @@ use super::dialogs::Dialog;
 use super::menu::MenuItem as M;
 use super::player::{ASPECTS, PlayerView, SPEEDS};
 use super::widgets::format_time;
-use crate::engine::{ChannelMode, Deinterlace, HwDecode, MediaSource, Rotation, TrackKind};
+use crate::engine::{
+    self, Anime4KMode, ChannelMode, Deinterlace, HwDecode, MediaSource, Rotation, TrackKind, Upscaler,
+};
 use crate::icons::Icon;
 use crate::settings::{RepeatMode, SubStyle, ThemeMode};
 use gpui::{Action, Context};
@@ -439,10 +441,68 @@ impl PlayerView {
                 this.apply_settings(cx)
             })
             .checked(self.settings.tone_map_hdr),
+            M::submenu("Upscaling", self.upscaling_items()),
             M::Separator,
             act("Take Screenshot", Screenshot).shortcut("s").icon(Icon::Screenshot).enabled(self.player.has_frame()),
             M::action("Picture Adjustments…", |this, w, cx| this.show_dialog(Dialog::Effects(2), w, cx)),
         ]
+    }
+
+    /// Upscaler choices, with Anime4K's modes inline (as people switch
+    /// between them while watching).
+    fn upscaling_items(&self) -> Vec<M> {
+        let gpu = engine::gpu_upscaling_available();
+        let (cur, mode) = (self.settings.upscaler, self.settings.anime4k_mode);
+        let pick = |label: String, u: Upscaler, m: Option<Anime4KMode>, on: bool| {
+            M::action(label.clone(), move |this, _, cx| {
+                this.settings.upscaler = u;
+                if let Some(m) = m {
+                    this.settings.anime4k_mode = m;
+                }
+                this.apply_settings(cx);
+                this.osd(format!("Upscaling: {label}"), cx)
+            })
+            .selected(on)
+        };
+        let mut items: Vec<M> = Upscaler::ALL
+            .into_iter()
+            .filter(|u| (gpu || !u.needs_libplacebo()) && !matches!(u, Upscaler::Anime4K | Upscaler::CustomShader))
+            .map(|u| pick(u.label().into(), u, None, cur == u))
+            .collect();
+        if gpu {
+            items.push(M::Separator);
+            for m in Anime4KMode::ALL {
+                items.push(pick(
+                    format!("Anime4K {}", m.name()),
+                    Upscaler::Anime4K,
+                    Some(m),
+                    cur == Upscaler::Anime4K && mode == m,
+                ));
+            }
+            if self.settings.custom_shader.is_some() {
+                items.push(pick("Custom shader".into(), Upscaler::CustomShader, None, cur == Upscaler::CustomShader));
+            }
+            items.push(M::Separator);
+            items.push(
+                M::action("Better Chroma (KrigBilateral)", |this, _, cx| {
+                    this.settings.shader_chroma = !this.settings.shader_chroma;
+                    this.apply_settings(cx)
+                })
+                .checked(self.settings.shader_chroma)
+                .enabled(cur.needs_libplacebo()),
+            );
+            items.push(
+                M::action("Sharpen (AMD CAS)", |this, _, cx| {
+                    this.settings.shader_sharpen = !this.settings.shader_sharpen;
+                    this.apply_settings(cx)
+                })
+                .checked(self.settings.shader_sharpen)
+                .enabled(cur.needs_libplacebo()),
+            );
+        }
+        items.push(M::Separator);
+        items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(2), w, cx)));
+        items
     }
 
     fn menu_subtitle(&self) -> Vec<M> {
@@ -522,15 +582,6 @@ impl PlayerView {
     pub fn audio_popup(&self) -> Vec<M> {
         let mut v = vec![M::Header("Audio track".into())];
         v.extend(self.track_items(TrackKind::Audio, false));
-        v
-    }
-
-    pub fn speed_popup(&self) -> Vec<M> {
-        let speed = self.player.speed();
-        let mut v = vec![M::Header("Playback speed".into())];
-        v.extend(SPEEDS.iter().map(|&s| {
-            M::action(format!("{s}×"), move |this, _, cx| this.set_speed(s, cx)).selected((speed - s).abs() < 1e-3)
-        }));
         v
     }
 }

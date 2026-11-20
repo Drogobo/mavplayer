@@ -16,8 +16,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static BITMAP_IDS: AtomicU64 = AtomicU64::new(1);
 
+/// Largest subtitle bitmap accepted (a full 8K frame).
+const MAX_SUB_BITMAP_PIXELS: u64 = 7680 * 4320;
+
 struct ExternalTrack {
+    /// Sorted by start time.
     events: Arc<Vec<SubEvent>>,
+    /// The longest event, which bounds how far back a lookup must search.
+    max_len: f64,
 }
 
 pub struct SubStore {
@@ -73,10 +79,11 @@ impl SubStore {
         if let Some(i) = ext {
             let tracks = self.external.lock();
             if let Some(tr) = tracks.get(i) {
-                // Sorted by start time: only look at events that already began.
+                // Sorted by start time: only events that already began, and
+                // no earlier than the longest one could still be showing.
                 let evs = &tr.events;
                 let idx = evs.partition_point(|e| e.start <= t);
-                for e in evs[..idx].iter().rev().take(64) {
+                for e in evs[..idx].iter().rev().take_while(|e| e.start >= t - tr.max_len) {
                     if t < e.end {
                         out.push(e.clone());
                     }
@@ -141,19 +148,29 @@ unsafe fn convert_subtitle(sub: &ff::AVSubtitle, start: f64, end: f64, canvas: (
         let r = unsafe { &**sub.rects.add(i) };
         match r.type_ {
             ff::AVSubtitleType::SUBTITLE_BITMAP => {
-                if r.w <= 0 || r.h <= 0 || r.data[0].is_null() || r.data[1].is_null() {
+                // Guard against corrupt streams: the reads below trust these.
+                if r.w <= 0
+                    || r.h <= 0
+                    || r.data[0].is_null()
+                    || r.data[1].is_null()
+                    || r.linesize[0] < r.w
+                    || r.w as u64 * r.h as u64 > MAX_SUB_BITMAP_PIXELS
+                {
                     continue;
                 }
                 let (w, h) = (r.w as usize, r.h as usize);
                 let pal = r.data[1] as *const u32;
+                // The palette is AVPALETTE_COUNT (256) entries.
+                let nb_colors = r.nb_colors.clamp(0, 256) as usize;
+                let mut lut = [0u32; 256];
+                for (i, c) in lut.iter_mut().enumerate().take(nb_colors) {
+                    *c = unsafe { *pal.add(i) };
+                }
                 let mut bgra = vec![0u8; w * h * 4];
-                for y in 0..h {
-                    let row = unsafe { r.data[0].add(y * r.linesize[0] as usize) };
-                    for x in 0..w {
-                        let idx = unsafe { *row.add(x) } as usize;
-                        let c = if idx < r.nb_colors.max(0) as usize { unsafe { *pal.add(idx) } } else { 0 };
-                        let o = (y * w + x) * 4;
-                        bgra[o..o + 4].copy_from_slice(&c.to_le_bytes());
+                for (y, out_row) in bgra.chunks_exact_mut(w * 4).enumerate() {
+                    let row = unsafe { std::slice::from_raw_parts(r.data[0].add(y * r.linesize[0] as usize), w) };
+                    for (px, &idx) in out_row.as_chunks_mut::<4>().0.iter_mut().zip(row) {
+                        *px = lut[idx as usize].to_le_bytes();
                     }
                 }
                 bitmaps.push(SubBitmap {
@@ -354,7 +371,8 @@ pub fn load_external_async(ctx: Arc<SessionCtx>, path: PathBuf, select: bool) {
                     }
                     let idx = {
                         let mut ext = ctx.subs.external.lock();
-                        ext.push(ExternalTrack { events: Arc::new(events) });
+                        let max_len = events.iter().map(|e| e.end - e.start).fold(0.0, f64::max);
+                        ext.push(ExternalTrack { events: Arc::new(events), max_len });
                         ext.len() - 1
                     };
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned());

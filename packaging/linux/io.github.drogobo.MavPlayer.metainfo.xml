@@ -46,6 +46,12 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.2.0" date="2026-11-20">
+      <description>
+        <p>GPU upscaling with Anime4K, FSRCNNX, ArtCNN, RAVU, AMD FSR, NVIDIA Image Scaling or your own mpv shader, plus KrigBilateral chroma and AMD CAS sharpening.</p>
+        <p>Native PipeWire audio on Linux, media keys and desktop player controls, opening files in the running window, and faster startup.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-19">
       <description>
         <p>First release.</p>

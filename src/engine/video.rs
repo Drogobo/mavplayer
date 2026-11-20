@@ -6,10 +6,16 @@ use super::decoder::{DecodeResult, Decoder};
 use super::filters::Graph;
 use super::sync::VideoFrame;
 use super::types::*;
+use super::upscale::{self, Plan};
 use std::os::raw::c_int;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// How long the window size must stay put before a GPU upscaling graph is
+/// rebuilt for it (rebuilding takes a moment; during a drag it would stall).
+const RESIZE_SETTLE: Duration = Duration::from_millis(300);
 
 #[derive(Clone)]
 pub struct StreamInfo {
@@ -72,7 +78,16 @@ fn is_hdr(f: &Frame) -> bool {
         || trc == ff::AVColorTransferCharacteristic::AVCOL_TRC_ARIB_STD_B67 as c_int
 }
 
-/// The libavfilter chain for the current settings ("" = none needed).
+/// A video filter chain: the libavfilter description ("" = none needed) and
+/// the GPU upscaling at its end, if any.
+#[derive(PartialEq, Clone)]
+struct Chain {
+    desc: String,
+    upscale: Option<Plan>,
+}
+
+/// The libavfilter chain for the current settings. `upscale` is false when
+/// GPU upscaling failed for these settings.
 fn build_chain(
     adj: &VideoAdjust,
     cfg: &EngineConfig,
@@ -80,8 +95,16 @@ fn build_chain(
     frame: &Frame,
     interlaced: bool,
     target: (u32, u32),
-) -> String {
+    upscale: bool,
+) -> Chain {
     let mut f: Vec<String> = Vec::new();
+    // The picture's size and pixel aspect as it leaves each filter, for
+    // fitting the upscaled picture to the window.
+    let (mut w, mut h) = (frame.width(), frame.height());
+    let mut sar = {
+        let s = frame.raw().sample_aspect_ratio;
+        if s.num > 0 && s.den > 0 { av::q2d(s) } else { info.sar }
+    };
     match cfg.deinterlace {
         Deinterlace::Off => {}
         Deinterlace::Auto if !interlaced => {}
@@ -96,10 +119,6 @@ fn build_chain(
     }
     if cfg.tone_map_hdr && is_hdr(frame) && av::filter_available("zscale") && av::filter_available("tonemap") {
         // Tone mapping in linear float is expensive: do it at display size.
-        let sar = {
-            let s = frame.raw().sample_aspect_ratio;
-            if s.num > 0 && s.den > 0 { av::q2d(s) } else { info.sar }
-        };
         let (dw, dh) = super::present::output_size(frame.width(), frame.height(), sar, target, false);
         let (dw, dh) = (dw & !1, dh & !1);
         if dw < frame.width() as u32 || dh < frame.height() as u32 {
@@ -110,6 +129,7 @@ fn build_chain(
                 ScaleQuality::Best => "lanczos",
             };
             f.push(format!("zscale=w={dw}:h={dh}:f={filter},setsar=1"));
+            (w, h, sar) = (dw as i32, dh as i32, 1.0);
         }
         f.push(
             "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
@@ -118,11 +138,10 @@ fn build_chain(
     }
     if let Some([l, t, r, b]) = adj.crop {
         let (l, t, r, b) = (l.clamp(0.0, 0.45), t.clamp(0.0, 0.45), r.clamp(0.0, 0.45), b.clamp(0.0, 0.45));
-        f.push(format!(
-            "crop=w=trunc(iw*{w}/2)*2:h=trunc(ih*{h}/2)*2:x=iw*{l}:y=ih*{t}",
-            w = 1.0 - l - r,
-            h = 1.0 - t - b
-        ));
+        let (fw, fh) = (1.0 - l - r, 1.0 - t - b);
+        f.push(format!("crop=w=trunc(iw*{fw}/2)*2:h=trunc(ih*{fh}/2)*2:x=iw*{l}:y=ih*{t}"));
+        w = (w as f32 * fw / 2.0).trunc() as i32 * 2;
+        h = (h as f32 * fh / 2.0).trunc() as i32 * 2;
     }
     let user_rot = match adj.rotation {
         Rotation::None => 0,
@@ -135,6 +154,9 @@ fn build_chain(
         180 => f.push("hflip,vflip".into()),
         270 => f.push("transpose=cclock".into()),
         _ => {}
+    }
+    if (info.rotation + user_rot) % 180 == 90 {
+        (w, h, sar) = (h, w, 1.0 / sar);
     }
     if adj.hflip {
         f.push("hflip".into());
@@ -165,7 +187,13 @@ fn build_chain(
     if adj.negate {
         f.push("negate".into());
     }
-    f.join(",")
+    // Last, so the shaders see the finished picture and nothing after them
+    // works at display size.
+    let upscale = if upscale { upscale::plan(cfg, w, h, sar, target) } else { None };
+    if let Some(p) = &upscale {
+        f.push(p.desc.clone());
+    }
+    Chain { desc: f.join(","), upscale }
 }
 
 #[derive(PartialEq, Clone)]
@@ -173,8 +201,11 @@ struct GraphKey {
     w: i32,
     h: i32,
     fmt: c_int,
-    chain: String,
+    chain: Chain,
     sar: (i32, i32),
+    /// A seek starts a new graph: deinterlacers and denoisers hold frames
+    /// from before it, which would be shown under the new position.
+    serial: i32,
 }
 
 pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, stop: Arc<AtomicBool>) {
@@ -189,11 +220,38 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
     let mut saw_interlaced = false;
     let mut cfg = ctx.controls.config.lock().clone();
     let mut cfg_check = 0u32;
+    // The window size the chain is built for, and a newer one waiting to
+    // settle (see RESIZE_SETTLE).
+    let mut target = ctx.controls.target_size();
+    let mut pending_target = (target, Instant::now());
+    // GPU upscaling that failed to start; not retried until settings change.
+    let mut broken_upscale: Option<upscale::ShaderSetKey> = None;
 
     while ctx.alive() && !stop.load(Ordering::Acquire) {
         match dec.decode(&mut frame) {
             DecodeResult::Aborted => break,
             DecodeResult::Eof => {
+                // The last frames a deinterlacer still holds.
+                if let Some((k, g)) = graph.as_mut()
+                    && k.serial == dec.pkt_serial
+                {
+                    g.push_eof();
+                    let otb = g.out_time_base();
+                    while g.pull(&mut filtered) {
+                        let p = av::ts_to_secs(filtered.raw().pts, otb);
+                        if !p.is_finite() {
+                            filtered.unref();
+                            continue;
+                        }
+                        let sar = frame_sar(&filtered, &info);
+                        let dur = frame_duration(&filtered, otb, frame_dur);
+                        let vf = VideoFrame { frame: filtered.take(), pts: p, duration: dur, serial: k.serial, sar };
+                        if !push(&ctx, &dec, vf) {
+                            break;
+                        }
+                    }
+                }
+                graph = None;
                 ctx.video_finished.store(dec.finished, Ordering::Release);
                 ctx.wake_demuxer();
                 continue;
@@ -241,9 +299,18 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
             cfg = ctx.controls.config.lock().clone();
         }
         saw_interlaced |= frame.raw().flags & ff::AV_FRAME_FLAG_INTERLACED as c_int != 0;
-        let chain = build_chain(&adj, &cfg, &info, &frame, saw_interlaced, ctx.controls.target_size());
+        let t = ctx.controls.target_size();
+        if t != pending_target.0 {
+            pending_target = (t, Instant::now());
+        }
+        if t != target && (graph.is_none() || pending_target.1.elapsed() >= RESIZE_SETTLE) {
+            target = t;
+        }
+        let try_upscale = ctx.controls.target_known.load(Ordering::Relaxed)
+            && broken_upscale.as_ref().is_none_or(|k| *k != upscale::ShaderSetKey::of(&cfg));
+        let chain = build_chain(&adj, &cfg, &info, &frame, saw_interlaced, target, try_upscale);
 
-        if chain.is_empty() {
+        if chain.desc.is_empty() {
             graph = None;
             let sar = frame_sar(&frame, &info);
             let dur = frame_duration(&frame, tb, frame_dur);
@@ -258,12 +325,27 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
             w: frame.width(),
             h: frame.height(),
             fmt: frame.format(),
-            chain: chain.clone(),
+            chain,
             sar: unsafe { ((*frame.0).sample_aspect_ratio.num, (*frame.0).sample_aspect_ratio.den) },
+            serial,
         };
         if graph.as_ref().map(|(k, _)| k != &key).unwrap_or(true) {
-            graph = match make_graph(&frame, &info, &chain) {
-                Ok(g) => Some((key, g)),
+            let t0 = Instant::now();
+            graph = match make_graph(&frame, &info, &key.chain) {
+                Ok(g) => {
+                    if key.chain.upscale.is_some() {
+                        log::debug!("upscale: graph built in {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    Some((key, g))
+                }
+                Err(e) if key.chain.upscale.is_some() => {
+                    // Play on without it; the next frame builds the rest.
+                    log::warn!("GPU upscaling disabled: {e}");
+                    ctx.emit(PlayerEvent::Warning(format!("GPU upscaling failed: {e}")));
+                    broken_upscale = Some(upscale::ShaderSetKey::of(&cfg));
+                    frame.unref();
+                    continue;
+                }
                 Err(e) => {
                     log::warn!("video filters disabled: {e}");
                     ctx.emit(PlayerEvent::Warning(format!("Video filter error: {e}")));
@@ -271,13 +353,19 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
                 }
             };
         }
-        let Some((_, g)) = graph.as_mut() else {
+        let Some((k, g)) = graph.as_mut() else {
             let sar = frame_sar(&frame, &info);
             let dur = frame_duration(&frame, tb, frame_dur);
             let vf = VideoFrame { frame: frame.take(), pts, duration: dur, serial, sar };
             push(&ctx, &dec, vf);
             continue;
         };
+        // libplacebo times its output by frame durations: give untimed
+        // frames the stream's frame rate (or a tick).
+        if k.chain.upscale.is_some() && frame.raw().duration <= 0 {
+            let d = if frame_dur > 0.0 { (frame_dur / av::q2d(tb)).round() as i64 } else { 1 };
+            unsafe { (*frame.0).duration = d.max(1) };
+        }
         if let Err(e) = g.push(&mut frame) {
             log::debug!("{e}");
             graph = None;
@@ -307,7 +395,9 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
 fn push(ctx: &SessionCtx, dec: &Decoder, vf: VideoFrame) -> bool {
     let q = dec.queue.clone();
     let ok = ctx.frames.push(vf, |s| q.serial() != s);
-    if let Some(mut st) = ctx.shared.state.try_lock() {
+    if let Some(mut st) = ctx.shared.state.try_lock()
+        && ctx.is_current()
+    {
         st.decoded_frames += 1;
     }
     ok
@@ -323,7 +413,7 @@ fn frame_duration(f: &Frame, tb: ff::AVRational, fallback: f64) -> f64 {
     if d > 0 { d as f64 * av::q2d(tb) } else { fallback }
 }
 
-fn make_graph(frame: &Frame, info: &StreamInfo, chain: &str) -> anyhow::Result<Graph> {
+fn make_graph(frame: &Frame, info: &StreamInfo, chain: &Chain) -> anyhow::Result<Graph> {
     let f = frame.raw();
     let sar = if f.sample_aspect_ratio.num > 0 { f.sample_aspect_ratio } else { ff::AVRational { num: 1, den: 1 } };
     let tb = info.time_base;
@@ -343,7 +433,12 @@ fn make_graph(frame: &Frame, info: &StreamInfo, chain: &str) -> anyhow::Result<G
         f.color_range as c_int
     );
     let threads = std::thread::available_parallelism().map(|n| n.get().min(8) as i32).unwrap_or(4);
-    Graph::new("buffer", &args, "buffersink", chain, threads)
+    match &chain.upscale {
+        Some(plan) => Graph::with_setup("buffer", &args, "buffersink", &chain.desc, threads, &mut |f| {
+            upscale::setup_filter(f, plan)
+        }),
+        None => Graph::new("buffer", &args, "buffersink", &chain.desc, threads),
+    }
 }
 
 fn color_desc(f: &Frame) -> String {

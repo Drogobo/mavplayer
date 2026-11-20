@@ -62,6 +62,8 @@ if want appimage; then
     done
     install -Dm644 packaging/linux/io.github.drogobo.MavPlayer.svg \
         "$APPDIR/usr/share/icons/hicolor/scalable/apps/io.github.drogobo.MavPlayer.svg"
+    install -Dm644 LICENSE "$APPDIR/usr/share/licenses/mavplayer/LICENSE"
+    install -Dm644 third_party/shaders/LICENSES.txt "$APPDIR/usr/share/licenses/mavplayer/SHADER-LICENSES.txt"
     # AppRun: run the bundled binary. Desktop integration is built into the app
     # (first-run prompt, Media ▸ Desktop Integration, or `--integrate`).
     install -Dm755 packaging/appimage/AppRun "$APPDIR/AppRun"
