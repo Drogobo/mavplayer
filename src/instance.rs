@@ -90,7 +90,7 @@ pub fn listen(wait: Duration, on_request: impl Fn(Request) + Send + 'static) -> 
         if std::time::Instant::now() >= deadline {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(10));
     };
     let spawned = std::thread::Builder::new().name("instance".into()).spawn(move || {
         loop {

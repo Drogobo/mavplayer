@@ -10,7 +10,9 @@
 //!
 //! GPUI ends its event loop when the last window closes on Linux and Windows,
 //! so there the closing process starts a fresh `mavplayer --background` and
-//! quits. That also keeps the waiting process lean: it never played anything
+//! quits. The icon must not blink out meanwhile: the new process shows its
+//! tray icon first thing and reports "ready" on a pipe, and only then does
+//! the old one remove its own icon and exit (`finish_handover`). That also keeps the waiting process lean: it never played anything
 //! (about 100 MB of private memory on NVIDIA, mostly the GPU driver and
 //! GPUI's font database).
 //! On macOS the app simply stays running without windows.
@@ -48,15 +50,16 @@ pub fn channel() -> (Sender, UnboundedReceiver<Incoming>) {
 pub enum Start {
     /// With a window (a normal launch).
     Window { boot: Boot, fullscreen: bool },
-    /// In the tray, without a window (`--background`).
-    Background { settings: Settings },
+    /// In the tray, without a window (`--background`), with the tray icon
+    /// if `main` already set it up.
+    Background { settings: Settings, tray: Option<Tray> },
 }
 
 impl Start {
     pub fn settings(&self) -> &Settings {
         match self {
             Start::Window { boot, .. } => &boot.settings,
-            Start::Background { settings } => settings,
+            Start::Background { settings, .. } => settings,
         }
     }
 }
@@ -100,10 +103,17 @@ pub fn run(cx: &mut App, start: Start, primary: bool, tx: Sender, mut rx: Unboun
                 set_tray(true, false, cx);
             }
         }
-        Start::Background { .. } => {
+        Start::Background { tray, .. } => {
             crate::instance::set_background(true);
-            // Without a tray icon there would be no way to reach or quit this process.
-            start_tray(false, true, cx);
+            match tray {
+                Some(tray) => {
+                    let shell = cx.global_mut::<Shell>();
+                    shell.tray = Some(tray);
+                    shell.want_tray = true;
+                }
+                // Without a tray icon there would be no way to reach or quit this process.
+                None => start_tray(false, true, cx),
+            }
             log::debug!("startup: ready in the background at {:.0} ms", crate::ms_since_start());
         }
     }
@@ -239,16 +249,78 @@ fn last_window_closed(cx: &mut App) {
         // GPUI is ending its event loop: hand over to a fresh process.
         crate::instance::stop_accepting();
         match spawn_background() {
-            Ok(()) => log::debug!("window closed; a new MavPlayer takes over in the system tray"),
+            Ok(child) => {
+                log::debug!("window closed; a new MavPlayer takes over in the system tray");
+                // Keep the icon up past the end of GPUI (which drops the
+                // shell) until the new process shows its own.
+                let tray = cx.global_mut::<Shell>().tray.take();
+                HANDOVER.with(|h| *h.borrow_mut() = Some((tray, child)));
+            }
             Err(e) => log::warn!("could not keep running in the system tray: {e:#}"),
         }
         cx.quit();
     }
 }
 
-/// Starts `mavplayer --background`, detached from this process (and its terminal).
 #[cfg(not(target_os = "macos"))]
-fn spawn_background() -> anyhow::Result<()> {
+thread_local! {
+    /// This process's tray icon and the process taking over from it.
+    static HANDOVER: std::cell::RefCell<Option<(Option<Tray>, std::process::Child)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Line the process taking over writes once its tray icon is up.
+const READY: &str = "mavplayer-tray-ready";
+
+/// After GPUI has ended (from `main`): if a new process is taking over in
+/// the tray, waits until its icon is up (at most a few seconds), then removes
+/// this one's and exits at once, so the new process gets the instance socket
+/// without waiting for this one to tear down.
+pub fn finish_handover() {
+    #[cfg(not(target_os = "macos"))]
+    if let Some((tray, mut child)) = HANDOVER.with(|h| h.borrow_mut().take()) {
+        use std::io::BufRead;
+        let t0 = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(out) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let ready = std::io::BufReader::new(out).lines().map_while(Result::ok).any(|l| l.trim() == READY);
+                let _ = tx.send(ready);
+            });
+        }
+        let ready = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or(false);
+        log::debug!(
+            "the new MavPlayer {} after {:.0} ms",
+            if ready { "shows its tray icon" } else { "didn't report a tray icon" },
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        drop(tray);
+        std::process::exit(0);
+    }
+}
+
+/// Tells the process handing over to this one that our tray icon is up
+/// (`--handover`), then stops using the pipe, whose reader is about to exit.
+pub fn report_ready() {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{READY}");
+    let _ = out.flush();
+    drop(out);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        if null >= 0 {
+            libc::dup2(null, 1);
+            libc::close(null);
+        }
+    }
+}
+
+/// Starts `mavplayer --background --handover`, detached from this process
+/// (and its terminal), with its standard output piped back for `READY`.
+#[cfg(not(target_os = "macos"))]
+fn spawn_background() -> anyhow::Result<std::process::Child> {
     use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
     let mut cmd = if std::env::var_os("FLATPAK_ID").is_some() {
@@ -262,7 +334,7 @@ fn spawn_background() -> anyhow::Result<()> {
     } else {
         Command::new(&exe)
     };
-    cmd.arg("--background").stdin(Stdio::null()).stdout(Stdio::null());
+    cmd.args(["--background", "--handover"]).stdin(Stdio::null()).stdout(Stdio::piped());
     if log::log_enabled!(log::Level::Debug) {
         cmd.arg("-v");
     } else {
@@ -286,8 +358,14 @@ fn spawn_background() -> anyhow::Result<()> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    cmd.spawn()?;
-    Ok(())
+    Ok(cmd.spawn()?)
+}
+
+/// The tray icon, sending its clicks to `tx`.
+pub fn make_tray(tx: Sender) -> anyhow::Result<Tray> {
+    Tray::new(move |ev| {
+        let _ = tx.unbounded_send(Incoming::Tray(ev));
+    })
 }
 
 /// Shows or removes the tray icon, following the "Keep running in the system
@@ -319,11 +397,7 @@ fn start_tray(announce: bool, required: bool, cx: &mut App) {
     }
     shell.tray_starting = true;
     let tx = shell.tx.clone();
-    let make = move || {
-        Tray::new(move |ev| {
-            let _ = tx.unbounded_send(Incoming::Tray(ev));
-        })
-    };
+    let make = move || make_tray(tx);
     cx.spawn(async move |cx| {
         // Registering over D-Bus can take a moment: keep it off the UI thread.
         #[cfg(target_os = "linux")]

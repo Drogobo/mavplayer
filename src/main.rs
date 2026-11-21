@@ -39,11 +39,20 @@ struct Args {
     new_window: bool,
     /// Wait in the system tray without a window.
     background: bool,
+    /// Taking over from a MavPlayer whose window just closed (internal).
+    handover: bool,
     verbose: bool,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { sources: vec![], fullscreen: false, new_window: false, background: false, verbose: false };
+    let mut args = Args {
+        sources: vec![],
+        fullscreen: false,
+        new_window: false,
+        background: false,
+        handover: false,
+        verbose: false,
+    };
     let mut paths: Vec<PathBuf> = vec![];
     let mut only_files = false;
     for a in std::env::args().skip(1) {
@@ -61,6 +70,7 @@ fn parse_args() -> Args {
                 "-f" | "--fullscreen" => args.fullscreen = true,
                 "-n" | "--new-window" => args.new_window = true,
                 "--background" => args.background = true,
+                "--handover" => args.handover = true,
                 "-v" | "--verbose" => args.verbose = true,
                 "--integrate" => exit_with(integration::integrate().map(|p| format!("Installed {}", p.display()))),
                 "--remove-integration" | "--unintegrate" => {
@@ -137,7 +147,8 @@ fn main() {
         log::set_max_level(log::LevelFilter::Debug);
     }
     // Files on the command line win over --background.
-    let background = args.background && args.sources.is_empty();
+    let background = (args.background || args.handover) && args.sources.is_empty();
+    let handover = background && args.handover;
 
     let settings = settings::Settings::load();
     // Hand the files to an open window instead, if the settings say so. A
@@ -153,10 +164,21 @@ fn main() {
 
     // Requests from later launches, the OS and the tray icon, for the UI thread.
     let (tx, rx) = ui::shell::channel();
+    // Taking over from a MavPlayer whose window just closed: show the tray
+    // icon before anything else. That one removes its own only once ours is up.
+    let tray = handover.then(|| ui::shell::make_tray(tx.clone()));
+    if let Some(Err(e)) = &tray {
+        log::warn!("no system tray: {e:#}");
+    }
+    let tray = tray.and_then(Result::ok);
+    if handover {
+        ui::shell::report_ready();
+        log::debug!("startup: tray icon up at {:.0} ms", ms_since_start());
+    }
     let primary = {
         let tx = tx.clone();
-        // A MavPlayer closing into the tray starts this one and quits: wait for its socket.
-        let wait = std::time::Duration::from_secs(if background { 5 } else { 0 });
+        // That MavPlayer exits once our icon is up: wait for its socket.
+        let wait = std::time::Duration::from_secs(if handover { 5 } else { 0 });
         instance::listen(wait, move |req| {
             let _ = tx.unbounded_send(ui::shell::Incoming::Remote(req));
         })
@@ -171,7 +193,7 @@ fn main() {
     let boot = if background {
         // No file yet, but have the GPU ready for the first one.
         engine::prewarm(&settings.engine_config());
-        ui::shell::Start::Background { settings }
+        ui::shell::Start::Background { settings, tray }
     } else {
         // Start opening the first file now: it decodes while GPUI brings up the GPU.
         ui::shell::Start::Window {
@@ -208,4 +230,6 @@ fn main() {
         // no use windowless), unless it is to wait in the system tray.
         ui::shell::run(cx, boot, primary, tx, rx);
     });
+    // Hands the tray over to the process that waits in it, if one was started.
+    ui::shell::finish_handover();
 }

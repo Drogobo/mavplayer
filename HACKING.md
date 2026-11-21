@@ -341,7 +341,9 @@ process starts `mavplayer --background` and quits. That process loads
 everything a window needs (libraries, fonts, the GPU context, the hardware
 decoder), takes over the single-instance socket (`instance::listen` waits for
 the old one to let go) and shows the tray icon, but opens no window: GPUI only
-ends the loop when a window closes. Any later launch, with files or not, is
+ends the loop when a window closes. The icon is handed over without a gap: the
+new process shows its icon first thing and reports it on a pipe, and the old
+one keeps its own until then (`shell::finish_handover`), then exits at once. Any later launch, with files or not, is
 handed to it (`background_only` requests), and it opens a window in a few tens
 of milliseconds. On macOS the app stays running without windows instead.
 Without a working tray (GNOME without an AppIndicator extension, say) closing
