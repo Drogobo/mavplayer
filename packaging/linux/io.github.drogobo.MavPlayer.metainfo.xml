@@ -46,6 +46,12 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.2.1" date="2026-11-21">
+      <description>
+        <p>Optionally keep running in the system tray, so files open in a warm window almost instantly, and hardware decoding starts much sooner.</p>
+        <p>Rebindable keyboard shortcuts in Preferences, smarter subtitle and audio track choice, the playlist in fullscreen, and scrollbars on menus, the playlist and dialogs.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-20">
       <description>
         <p>GPU upscaling with Anime4K, FSRCNNX, ArtCNN, RAVU, AMD FSR, NVIDIA Image Scaling or your own mpv shader, plus KrigBilateral chroma and AMD CAS sharpening.</p>
