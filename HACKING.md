@@ -32,7 +32,7 @@ You can also point the build at any Papirus checkout with
 
 You need:
 
-- **Rust** 1.88 or newer (`rustup`, stable toolchain).
+- **Rust** 1.90 or newer (`rustup`, stable toolchain).
 - **FFmpeg 9** libraries and headers: libavcodec, libavformat, libavfilter,
   libswscale, libswresample, libavutil. The bindings are generated with bindgen,
   so **clang/libclang** is needed too.
@@ -262,6 +262,11 @@ audio.rs:   output callback pulls samples and drives the master clock: native
   read loop: seeks, track switches, pause, back-pressure, EOF.
 - **`decoder.rs`**: opens codecs, including hardware decoding through a
   `get_format` callback with software fallback, and runs the send/receive loop.
+  Hardware devices (CUDA, VAAPI, …) are opened once per process and shared by
+  every decoder, since opening one takes 100–500 ms; the first is opened in the
+  background as soon as the `Player` exists. On Linux, CUDA is tried before
+  VAAPI when VAAPI would only reach an NVIDIA GPU through the NVDEC wrapper
+  driver (it opens twice as slowly and decodes the same way).
 - **`video.rs` / `audio.rs` / `filters.rs`**: build libavfilter chains from the
   current settings. These do deinterlacing, tone mapping, crop, rotation, colour
   adjustment, the equalizer, normalization, tempo, and format conversion. The
@@ -320,6 +325,8 @@ files:
 | `dialogs.rs` | Preferences, Effects & Filters, Media Info, Open URL/Disc, Jump to Time, About, Shortcuts, Integration |
 | `actions.rs` | GPUI actions and the macOS native menu |
 | `keymap.rs` | Every rebindable command with its default keys (`COMMANDS`), the user's changes (`Settings::key_bindings`), applying them to GPUI, shortcut labels for menus |
+| `shell.rs` | What outlives the window: opening it, media from later launches and the OS, the tray icon, and waiting in the tray when the window closes |
+| `tray.rs` | The system tray icon and its menu (`ksni` on Linux, `tray-icon` on Windows and macOS) |
 | `theme.rs` | Light/dark palettes |
 | `widgets.rs` | Small helpers: `icon()`, tooltips, the draggable `scrollbar()`, time formatting/parsing |
 | `text_input.rs` | Single-line text field |
@@ -327,13 +334,26 @@ files:
 Video frames reach GPUI as `RenderImage`s. Old textures are released a few frames
 later with `window.drop_image`, because GPUI frees atlas textures immediately.
 
+**Keeping running in the tray.** On Linux and Windows, GPUI ends its event loop
+as soon as the last window closes, and an app can't be started again in the
+same process. So with "Keep running in the system tray" on, the closing
+process starts `mavplayer --background` and quits. That process loads
+everything a window needs (libraries, fonts, the GPU context, the hardware
+decoder), takes over the single-instance socket (`instance::listen` waits for
+the old one to let go) and shows the tray icon, but opens no window: GPUI only
+ends the loop when a window closes. Any later launch, with files or not, is
+handed to it (`background_only` requests), and it opens a window in a few tens
+of milliseconds. On macOS the app stays running without windows instead.
+Without a working tray (GNOME without an AppIndicator extension, say) closing
+the window quits as usual.
+
 ## Common changes
 
 **Add a keyboard shortcut / action**
 1. Add the action name to `actions!(…)` in `ui/actions.rs`.
 2. Add it to `COMMANDS` in `ui/keymap.rs` with a label, a group and its default
    keys (`"secondary-x"` means Ctrl on Linux/Windows and ⌘ on macOS). This is
-   what binds it, lists it in the Keyboard Shortcuts dialog and lets users
+   what binds it, lists it under Preferences → Keyboard Shortcuts and lets users
    change it. A unit test rejects default keys two commands share.
 3. Handle it in `PlayerView::register_actions` in `ui/player.rs`.
 4. Optionally add it to a menu in `ui/menus.rs` with `act("Label", MyAction)`,

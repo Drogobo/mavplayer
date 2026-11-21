@@ -24,12 +24,14 @@ pub enum Dialog {
     OpenUrl,
     OpenDisc,
     JumpTo,
-    Shortcuts,
     About,
     Integrate,
 }
 
-const SETTINGS_TABS: &[&str] = &["Interface", "Playback", "Video", "Audio", "Subtitles", "Network & Discs", "Advanced"];
+const SETTINGS_TABS: &[&str] =
+    &["Interface", "Playback", "Video", "Audio", "Subtitles", "Keyboard Shortcuts", "Network & Discs", "Advanced"];
+/// The Preferences category that lists (and edits) every keyboard shortcut.
+pub const SHORTCUTS_TAB: usize = 5;
 const EFFECT_TABS: &[&str] = &["Equalizer", "Audio Effects", "Picture", "Synchronization"];
 
 pub const EQ_PRESETS: &[(&str, [f32; 10])] = &[
@@ -70,14 +72,7 @@ impl PlayerView {
                 input.update(cx, |i, cx| i.set_text(now, cx));
                 window.focus(&input.focus_handle(cx));
             }
-            Dialog::Shortcuts => {
-                let input = self.input("shortcut_search", "Search commands or keys", window, cx);
-                input.update(cx, |i, cx| i.set_text(String::new(), cx));
-                self.capturing_key = None;
-                self.shortcut_note = None;
-                window.focus(&input.focus_handle(cx));
-            }
-            Dialog::Settings(_) => {
+            Dialog::Settings(tab) => {
                 for (k, v, ph) in [
                     ("audio_langs", self.settings.audio_langs.clone(), "e.g. en, ja"),
                     ("sub_langs", self.settings.sub_langs.clone(), "e.g. en, fr"),
@@ -87,7 +82,15 @@ impl PlayerView {
                     i.update(cx, |i, cx| i.set_text(v, cx));
                 }
                 self.refresh_audio_devices(cx);
-                window.focus(&self.focus);
+                self.capturing_key = None;
+                if tab == SHORTCUTS_TAB {
+                    let input = self.input("shortcut_search", "Search commands or keys", window, cx);
+                    input.update(cx, |i, cx| i.set_text(String::new(), cx));
+                    self.shortcut_note = None;
+                    window.focus(&input.focus_handle(cx));
+                } else {
+                    window.focus(&self.focus);
+                }
             }
             Dialog::OpenDisc => {
                 let drives = disc::optical_drives();
@@ -198,28 +201,42 @@ impl PlayerView {
         content: gpui::Div,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let pane = div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .child(
+                div()
+                    .id(SharedString::from(format!("{title}-options")))
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.options_scroll)
+                    .child(content),
+            )
+            .child(scrollbar("options-bar", &self.options_scroll, self.theme))
+            .into_any_element();
+        self.tabbed_pane(title, width, height, (names, current, make), pane, cx)
+    }
+
+    /// A tabbed modal whose right-hand side lays itself out (and scrolls
+    /// whatever part of it should scroll).
+    fn tabbed_pane(
+        &self,
+        title: &str,
+        width: f32,
+        height: f32,
+        (names, current, make): (&[&str], usize, fn(usize) -> Dialog),
+        pane: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let body = div()
             .flex()
             .h(px(height))
             .min_h_0()
             .child(self.tabs(names, current, make, cx))
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("{title}-options")))
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.options_scroll)
-                            .child(content),
-                    )
-                    .child(scrollbar("options-bar", &self.options_scroll, self.theme)),
-            )
+            .child(pane)
             .into_any_element();
         self.modal_impl(title, width, body, None, true, cx)
     }
@@ -727,7 +744,6 @@ impl PlayerView {
                 self.modal("Jump to Time", 380., body, Some(footer), cx)
             }
             Dialog::OpenDisc => self.disc_dialog(cx),
-            Dialog::Shortcuts => self.shortcuts_dialog(cx),
             Dialog::About => {
                 let body = div()
                     .p_6()
@@ -806,7 +822,9 @@ impl PlayerView {
 
     // ───────────────────────── keyboard shortcuts ─────────────────────────
 
-    fn shortcuts_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The Keyboard Shortcuts category: a search box over every command,
+    /// with its keys to remove, add or reset.
+    fn shortcuts_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let query = self.inputs.get("shortcut_search").map(|i| i.read(cx).text()).unwrap_or_default();
         let q = query.trim().to_lowercase();
@@ -880,11 +898,12 @@ impl PlayerView {
             (Some(n), None) => n.clone(),
             (None, None) => "+ adds a key, × removes one. Double-click the video for fullscreen.".to_string(),
         };
-        let body = div()
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
             .flex()
             .flex_col()
-            .h(px(540.))
-            .min_h_0()
             .child(header)
             .child(
                 div()
@@ -914,8 +933,7 @@ impl PlayerView {
                     .text_color(if self.capturing_key.is_some() { t.accent } else { t.text_dim })
                     .child(footer_text),
             )
-            .into_any_element();
-        self.modal_impl("Keyboard Shortcuts", 700., body, None, true, cx)
+            .into_any_element()
     }
 
     fn shortcut_row(
@@ -1068,6 +1086,10 @@ impl PlayerView {
     }
 
     fn settings_dialog(&mut self, tab: usize, cx: &mut Context<Self>) -> AnyElement {
+        if tab == SHORTCUTS_TAB {
+            let pane = self.shortcuts_pane(cx);
+            return self.tabbed_pane("Preferences", 820., 520., (SETTINGS_TABS, tab, Dialog::Settings), pane, cx);
+        }
         let s = self.settings.clone();
         let system: Vec<String> = engine::system_languages().iter().map(|l| engine::language_name(l)).collect();
         let sub_langs_hint = format!(
@@ -1175,21 +1197,6 @@ impl PlayerView {
                         |t, _| t.settings.hide_playlist_in_fullscreen = !t.settings.hide_playlist_in_fullscreen,
                         cx,
                     ))
-                    .child(self.section("Keyboard"))
-                    .child(
-                        self.row(
-                            "Keyboard shortcuts",
-                            Some("Search every shortcut and change or add keys"),
-                            self.text_button(
-                                "edit-shortcuts",
-                                "Customize…",
-                                false,
-                                |this, _, w, cx| this.show_dialog(Dialog::Shortcuts, w, cx),
-                                cx,
-                            )
-                            .into_any_element(),
-                        ),
-                    )
                     .child(self.section("Mouse"))
                     .child(self.toggle_row(
                         "clickpause",
@@ -1313,6 +1320,17 @@ impl PlayerView {
                             |t, v, _| t.settings.when_running = v,
                             cx,
                         ),
+                    ))
+                    .child(self.toggle_row(
+                        "tray",
+                        "Keep running in the system tray",
+                        Some("Closing the window leaves MavPlayer in the tray, so files open almost instantly. Quit from the tray icon's menu"),
+                        s.keep_in_tray,
+                        |t, cx| {
+                            t.settings.keep_in_tray = !t.settings.keep_in_tray;
+                            super::shell::set_tray(t.settings.keep_in_tray, true, cx);
+                        },
+                        cx,
                     ))
                     .child(self.row(
                         "While dragging the progress bar",
@@ -1551,7 +1569,7 @@ impl PlayerView {
                         ),
                     ));
             }
-            5 => {
+            6 => {
                 c = c
                     .child(self.section("Network"))
                     .child(self.row(

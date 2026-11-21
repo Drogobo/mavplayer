@@ -9,6 +9,8 @@ pub mod menu;
 pub mod menus;
 pub mod player;
 pub mod render;
+pub mod shell;
 pub mod text_input;
 pub mod theme;
+pub mod tray;
 pub mod widgets;

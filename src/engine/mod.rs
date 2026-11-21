@@ -454,6 +454,7 @@ fn advance(ctx: &SessionCtx) -> bool {
 impl Player {
     pub fn new(config: EngineConfig, wake: impl Fn() + Send + Sync + 'static) -> Self {
         upscale::prewarm(&config);
+        decoder::prewarm_hw(config.hwdec);
         let (tx, rx) = crossbeam_channel::unbounded();
         Player {
             controls: Arc::new(Controls {
@@ -751,6 +752,7 @@ impl Player {
 
     pub fn set_config(&self, cfg: EngineConfig) {
         upscale::prewarm(&cfg);
+        decoder::prewarm_hw(cfg.hwdec);
         *self.controls.config.lock() = cfg;
     }
 
@@ -840,6 +842,13 @@ pub fn init(verbose: bool) {
     unsafe {
         av::ff::avformat_network_init();
     }
+}
+
+/// Starts opening what the first file will need from the GPU (the hardware
+/// decoding device, and the Vulkan device for GPU upscaling) in the background.
+pub fn prewarm(config: &EngineConfig) {
+    upscale::prewarm(config);
+    decoder::prewarm_hw(config.hwdec);
 }
 
 /// Lists audio output devices by name.

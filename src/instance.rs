@@ -2,15 +2,22 @@
 //! already open" setting isn't "Open a new window", a launch with files sends
 //! them to the running window and exits before any window or GPU work.
 //!
+//! A MavPlayer waiting in the system tray (the "Keep running in the system
+//! tray" setting) takes every launch, even one without files or one that
+//! would otherwise open a new window: it opens its window again, which is far
+//! quicker than starting a new process.
+//!
 //! Transport: a Unix socket in the user's runtime directory (Linux, macOS),
 //! or a loopback TCP port plus a random token kept in the config folder
-//! (Windows). Requests are one JSON line, answered with `ok`.
+//! (Windows). Requests are one JSON line, answered with `ok` (or `no`, when
+//! a `background_only` request reaches a MavPlayer whose window is open).
 
 use crate::engine::types::MediaSource;
 use crate::settings::RunningMode;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_millis(1500);
@@ -22,14 +29,41 @@ const MAX_REQUEST: u64 = 4 << 20;
 pub struct Request {
     pub mode: RunningMode,
     pub sources: Vec<MediaSource>,
+    /// Open the window fullscreen (when it has to be opened).
+    #[serde(default)]
+    pub fullscreen: bool,
+    /// Only a MavPlayer in the background (no window open) should take this.
+    #[serde(default)]
+    pub background_only: bool,
     #[serde(default)]
     token: String,
 }
 
+/// This process has no window and waits in the system tray.
+static BACKGROUND: AtomicBool = AtomicBool::new(false);
+/// This process is quitting: later launches must start their own.
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
+pub fn set_background(on: bool) {
+    BACKGROUND.store(on, Ordering::Release);
+}
+
+/// Turns away every request from now on.
+pub fn stop_accepting() {
+    QUITTING.store(true, Ordering::Release);
+}
+
 /// Sends `sources` to a running MavPlayer. Returns true once it has them.
-pub fn forward(mode: RunningMode, sources: &[MediaSource]) -> bool {
+/// With `background_only`, only one waiting in the tray accepts.
+pub fn forward(mode: RunningMode, sources: &[MediaSource], fullscreen: bool, background_only: bool) -> bool {
     let Some(conn) = sys::connect() else { return false };
-    let req = Request { mode, sources: sources.iter().map(absolute).collect(), token: sys::client_token() };
+    let req = Request {
+        mode,
+        sources: sources.iter().map(absolute).collect(),
+        fullscreen,
+        background_only,
+        token: sys::client_token(),
+    };
     let Ok(line) = serde_json::to_string(&req) else { return false };
     exchange(conn, &line).is_some_and(|ack| ack.trim() == "ok")
 }
@@ -45,8 +79,19 @@ fn exchange(mut conn: impl Read + Write, line: &str) -> Option<String> {
 
 /// Accepts requests from later launches on a background thread, unless
 /// another MavPlayer is already doing so. Returns whether this one listens.
-pub fn listen(on_request: impl Fn(Request) + Send + 'static) -> bool {
-    let Some(listener) = sys::bind() else { return false };
+/// With a `wait`, keeps trying that long for the one listening now to quit
+/// (a MavPlayer closing into the tray hands over to a new process).
+pub fn listen(wait: Duration, on_request: impl Fn(Request) + Send + 'static) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    let listener = loop {
+        if let Some(l) = sys::bind() {
+            break l;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    };
     let spawned = std::thread::Builder::new().name("instance".into()).spawn(move || {
         loop {
             match listener.accept() {
@@ -81,6 +126,10 @@ fn serve(conn: sys::Stream) -> Option<Request> {
     let req: Request = serde_json::from_str(&line).map_err(|e| log::warn!("bad open request: {e}")).ok()?;
     if !sys::token_ok(&req.token) {
         log::warn!("ignored an open request with a wrong token");
+        return None;
+    }
+    if QUITTING.load(Ordering::Acquire) || (req.background_only && !BACKGROUND.load(Ordering::Acquire)) {
+        let _ = reader.get_mut().get_mut().write_all(b"no\n");
         return None;
     }
     let _ = reader.get_mut().get_mut().write_all(b"ok\n");

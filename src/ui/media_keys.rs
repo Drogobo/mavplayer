@@ -183,7 +183,7 @@ impl PlayerView {
             Event::SetVolume(v) => self.set_volume(v, cx),
             Event::OpenUri(u) => self.open_sources(vec![crate::playlist::source_for_arg(&u)], window, cx),
             Event::Raise => window.activate_window(),
-            Event::Quit => cx.quit(),
+            Event::Quit => super::shell::quit(cx),
             _ => {}
         }
         cx.notify();

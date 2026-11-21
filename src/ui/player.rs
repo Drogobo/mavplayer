@@ -27,9 +27,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// URLs/paths handed to us by the OS while running (macOS "Open With", dock drops).
-pub static OPEN_REQUESTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
 /// Called with a slider's new value (0..1).
 pub type SliderFn = Rc<dyn Fn(&mut PlayerView, f32, &mut Window, &mut Context<PlayerView>)>;
 
@@ -158,9 +155,9 @@ pub struct PlayerView {
     /// The user turned subtitles on or off this session: later files follow
     /// that instead of the "always show subtitles" setting.
     pub subs_on: Option<bool>,
-    /// The shortcuts dialog is waiting for the keystroke to add to this command.
+    /// The Keyboard Shortcuts page is waiting for the keystroke to add to this command.
     pub capturing_key: Option<&'static str>,
-    /// What the last change in the shortcuts dialog did (shown there).
+    /// What the last change on the Keyboard Shortcuts page did (shown there).
     pub shortcut_note: Option<String>,
     /// Scroll positions of the dialog areas that draw a scrollbar.
     pub modal_scroll: gpui::ScrollHandle,
@@ -210,16 +207,16 @@ impl Focusable for PlayerView {
 /// Everything that can start before the window exists. `main` creates this
 /// before GPUI sets up the GPU (which takes 100–200 ms on some drivers), so
 /// the first file is already opening, decoding and finding its audio device
-/// by the time the window appears.
+/// by the time the window appears. A MavPlayer waiting in the tray makes a
+/// new one each time it opens its window again (see `shell`).
 pub struct Boot {
     pub settings: Settings,
     player: Player,
     wake_pending: Arc<AtomicBool>,
     wake_rx: futures::channel::mpsc::UnboundedReceiver<()>,
-    icons_rx: futures::channel::mpsc::UnboundedReceiver<()>,
-    /// Media handed over by later launches (see `instance`).
-    remote_rx: futures::channel::mpsc::UnboundedReceiver<crate::instance::Request>,
-    /// This window is the one later launches hand media to.
+    /// The desktop icon theme has been resolved (first window only).
+    icons_rx: Option<futures::channel::mpsc::UnboundedReceiver<()>>,
+    /// This process is the one later launches hand media to.
     primary: bool,
     resume: ResumeStore,
     sources: Vec<MediaSource>,
@@ -228,16 +225,17 @@ pub struct Boot {
 }
 
 impl Boot {
-    pub fn start(settings: Settings, sources: Vec<MediaSource>) -> Self {
-        let (rtx, remote_rx) = futures::channel::mpsc::unbounded();
-        let primary = crate::instance::listen(move |req| {
-            let _ = rtx.unbounded_send(req);
-        });
+    pub fn start(settings: Settings, sources: Vec<MediaSource>, primary: bool) -> Self {
         icons::set_use_system_theme(settings.icon_theme == crate::settings::IconTheme::System);
-        // Icons from the desktop theme are resolved off the UI thread.
-        let (itx, icons_rx) = futures::channel::mpsc::unbounded::<()>();
-        icons::init_system_icons(move || {
-            let _ = itx.unbounded_send(());
+        // Icons from the desktop theme are resolved off the UI thread, once per process.
+        static ICONS: std::sync::Once = std::sync::Once::new();
+        let mut icons_rx = None;
+        ICONS.call_once(|| {
+            let (itx, irx) = futures::channel::mpsc::unbounded::<()>();
+            icons::init_system_icons(move || {
+                let _ = itx.unbounded_send(());
+            });
+            icons_rx = Some(irx);
         });
 
         let wake_pending = Arc::new(AtomicBool::new(false));
@@ -265,24 +263,14 @@ impl Boot {
                 true
             }
         };
-        Self { settings, player, wake_pending, wake_rx, icons_rx, remote_rx, primary, resume, sources, started }
+        Self { settings, player, wake_pending, wake_rx, icons_rx, primary, resume, sources, started }
     }
 }
 
 impl PlayerView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>, boot: Boot) -> Self {
-        let Boot {
-            settings,
-            player,
-            wake_pending,
-            wake_rx: mut rx,
-            icons_rx: mut irx,
-            remote_rx: mut remote,
-            primary,
-            resume,
-            sources,
-            started,
-        } = boot;
+        let Boot { settings, player, wake_pending, wake_rx: mut rx, icons_rx, primary, resume, sources, started } =
+            boot;
         log::debug!("startup: creating player view at {:.0} ms", crate::ms_since_start());
         // Engine → UI wake-ups. The engine sends one only after the previous
         // one was handled (`wake_pending`), so a wake-up that fails to reach
@@ -299,15 +287,6 @@ impl PlayerView {
                     }
                     log::debug!("engine wake-up could not reach the window; retrying");
                     cx.background_executor().timer(Duration::from_millis(16)).await;
-                }
-            }
-        })
-        .detach();
-        // Media handed over by later launches.
-        cx.spawn_in(window, async move |this, cx| {
-            while let Some(req) = remote.next().await {
-                if this.update_in(cx, |v, window, cx| v.open_remote(req, window, cx)).is_err() {
-                    break;
                 }
             }
         })
@@ -338,7 +317,7 @@ impl PlayerView {
         .detach();
 
         let mut subs = vec![];
-        // The shortcuts dialog records the next keystroke before any binding
+        // The Keyboard Shortcuts page records the next keystroke before any binding
         // can act on it.
         let me = cx.entity().downgrade();
         let wid = window.window_handle().window_id();
@@ -371,12 +350,14 @@ impl PlayerView {
         });
 
         // Repaint once the desktop icon theme has been resolved.
-        cx.spawn_in(window, async move |this, cx| {
-            if irx.next().await.is_some() {
-                let _ = this.update(cx, |_, cx| cx.notify());
-            }
-        })
-        .detach();
+        if let Some(mut irx) = icons_rx {
+            cx.spawn_in(window, async move |this, cx| {
+                if irx.next().await.is_some() {
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
+        }
 
         let theme = Theme::resolve(settings.theme, window);
         let focus = cx.focus_handle();
@@ -476,7 +457,7 @@ impl PlayerView {
         self.wake_pending.store(false, Ordering::Release);
         if let Some(f) = self.player.take_frame() {
             if self.frame.is_none()
-                && let Some(t0) = crate::START.get()
+                && let Some(t0) = crate::launch_instant()
             {
                 log::info!(
                     "first video frame {}x{} at {:.0} ms after launch",
@@ -678,11 +659,6 @@ impl PlayerView {
                 window.resize(want);
                 self.pending_fit = Some((want, tries - 1));
             }
-        }
-        let requests = OPEN_REQUESTS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
-        if !requests.is_empty() {
-            let sources = requests.iter().map(|u| playlist::source_for_arg(u)).collect();
-            self.open_sources(sources, window, cx);
         }
         if let Some(mut mk) = self.media_keys.take() {
             mk.update(self);
@@ -1772,10 +1748,10 @@ impl PlayerView {
             ZoomOut => |this, _w, cx| { this.zoom = (this.zoom / 1.1).max(0.25); let z = this.zoom; this.osd(format!("Zoom {:.0}%", z * 100.0), cx) },
             ZoomReset => |this, _w, cx| { this.zoom = 1.0; this.aspect = Aspect::Auto; this.osd("Zoom reset", cx) },
             FitWindow => |this, w, cx| this.fit_window(w, cx),
-            ShowShortcuts => |this, w, cx| this.show_dialog(Dialog::Shortcuts, w, cx),
+            ShowShortcuts => |this, w, cx| this.show_dialog(Dialog::Settings(super::dialogs::SHORTCUTS_TAB), w, cx),
             ShowAbout => |this, w, cx| this.show_dialog(Dialog::About, w, cx),
             CloseOverlay => |this, w, cx| { this.close_menu(cx); this.close_dialog(w, cx) },
-            Quit => |this, _w, cx| { this.save_state(); cx.quit() },
+            Quit => |this, _w, cx| { this.save_state(); super::shell::quit(cx) },
             Seek0 => |this, _w, cx| this.seek_fraction(0.0, cx),
             Seek1 => |this, _w, cx| this.seek_fraction(0.1, cx),
             Seek2 => |this, _w, cx| this.seek_fraction(0.2, cx),

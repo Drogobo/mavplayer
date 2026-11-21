@@ -41,6 +41,7 @@ The engine is an ffplay-style threaded pipeline, one set of threads per playback
 
 - `demux.rs` reads packets and routes them into per-kind `PacketQueue`s. It also handles seeks, track switches, pause, back-pressure and EOF.
 - `video.rs`, `audio.rs` and `subs.rs` decode on their own threads. Video and audio frames pass through libavfilter graphs built from the current settings (`filters.rs`).
+- `decoder.rs` opens hardware devices once per process and shares them across decoders (opening one takes 100–500 ms), and prewarms the first from `Player::new`. On Linux it tries CUDA before VAAPI when VAAPI would go through NVIDIA's NVDEC wrapper driver (`vaapi_is_nvdec`).
 - `present.rs` picks the frame due now against the master clock (`compute_target_delay`), converts it with swscale to BGRA at display size, and hands it to the UI.
 - `upscale.rs`: GPU upscalers (Settings → Video → Upscaling). When enlarging, `video.rs` appends FFmpeg's `libplacebo` filter at display size, with the bundled shaders passed as `custom_shader_bin`. It shares one Vulkan device per process, caches compiled shaders, waits for the window size to settle, and doesn't run before the UI reports a size. It is optional: if FFmpeg lacks libplacebo, only Bilinear (the GPU drawing the texture) and Nearest (swscale, in `present.rs`) are offered. `scripts/build-ffmpeg.sh` (Linux only, not macOS) and the Flatpak build libplacebo; the static build links it and glslang statically but only `dlopen`s the Vulkan loader.
 - The audio output callback consumes samples and **drives the master clock**. Video is the master only when there is no audio.
@@ -71,7 +72,9 @@ All state lives in one view, `PlayerView`. Its `impl` blocks are split by concer
 - `menu.rs`: the popup-menu widget.
 - `dialogs.rs`: all modals.
 - `actions.rs`: the `actions!` list and the macOS native menu.
-- `keymap.rs`: the `COMMANDS` table (every rebindable command, its group and default keys). `keymap::apply` rebuilds GPUI's keymap from it plus `Settings::key_bindings` (the user's overrides, set in the searchable Keyboard Shortcuts dialog), and menus/tooltips read labels via `shortcut_for`/`hint`. While that dialog records a key, a `cx.intercept_keystrokes` hook in `PlayerView::new` takes the keystroke before any binding fires.
+- `shell.rs`: what outlives the window: opening it, `Incoming` requests (later launches, the OS, the tray), and the tray hand-over (below).
+- `tray.rs`: the tray icon and its Open/Quit menu (`ksni` on Linux, `tray-icon` on Windows and macOS).
+- `keymap.rs`: the `COMMANDS` table (every rebindable command, its group and default keys). `keymap::apply` rebuilds GPUI's keymap from it plus `Settings::key_bindings` (the user's overrides, set in Preferences → Keyboard Shortcuts, `dialogs.rs` `shortcuts_pane`), and menus/tooltips read labels via `shortcut_for`/`hint`. While that page records a key, a `cx.intercept_keystrokes` hook in `PlayerView::new` takes the keystroke before any binding fires.
 
 To add a keyboard action:
 1. Add it to `actions!`.
@@ -85,6 +88,7 @@ To add a setting:
 3. Add a control in `dialogs.rs` → `settings_dialog` via `toggle_row`, `choice`, `stepper` or `input_box`.
 
 GPUI gotchas already hit in this codebase:
+- **The event loop ends when the last window closes** on Linux (Wayland and X11 `drop_window`) and Windows, and can't be restarted. `show: false` is ignored on Linux. So "Keep running in the system tray" works by hand-over: the closing process spawns `mavplayer --background` (via `flatpak-spawn` in Flatpak, the `$APPIMAGE` file for AppImages) and quits; the new process opens no window, which keeps GPUI's loop alive, takes the instance socket and the tray, and opens a window on request. Explicit quits go through `shell::quit` so they don't hand over.
 - **Nested `deferred()` panics** ("cannot call defer_draw during deferred drawing"). Submenus are therefore siblings inside one deferred layer, anchored to row bounds measured with a `canvas` (`OpenMenu::anchors`).
 - **Textures.** Video frames are `RenderImage`s. Replaced textures must go through `window.drop_image` a few frames later (`retired`), because GPUI frees atlas textures immediately.
 - **Wayland quirks.**
@@ -112,7 +116,7 @@ Don't launch test windows on the user's live desktop. On KDE/Wayland, run inside
 
 ```bash
 dbus-run-session -- bash -c '
-  kwin_wayland --virtual --width 1280 --height 800 --socket mavtest &
+  kwin_wayland --virtual --no-lockscreen --width 1280 --height 800 --socket mavtest &
   sleep 2
   WAYLAND_DISPLAY=mavtest MAVPLAYER_CONFIG_DIR=/tmp/mp-cfg cargo run -- video.mkv &
   sleep 4
@@ -122,4 +126,6 @@ dbus-run-session -- bash -c '
 Notes on this setup:
 - To isolate audio and data too, point `XDG_RUNTIME_DIR`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `XDG_CONFIG_HOME` at a scratch folder. Playback is then silent through the null sink.
 - Keep the socket path under 108 bytes.
+- `--no-lockscreen` matters: without it the nested KWin follows the real session's lock state, and every screenshot shows a lock screen while the desktop is locked.
+- The nested session has no tray host. To test the tray, run a stand-in `org.kde.StatusNotifierWatcher` on the isolated bus (a few lines of Python with `gi.repository.Gio`), then drive the item with `gdbus call` (`org.kde.StatusNotifierItem.Activate`, `com.canonical.dbusmenu.GetLayout -- 0 -1 '@as []'` and `Event`).
 - `MAVPLAYER_CONFIG_DIR` gives a throwaway `settings.json`. For example, `{"muted":true}` keeps a run quiet.

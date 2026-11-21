@@ -2,7 +2,7 @@
 name = "mavplayer"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "A fast, native media player for video, music, streams and DVDs"
 license = "GPL-3.0-or-later"
 authors = ["Drogobo"]
@@ -48,10 +48,19 @@ pipewire = { version = "0.10", features = ["v0_3_44"] }
 fontdb = { version = "0.16", default-features = false, features = ["std", "fs"] }
 fontconfig-parser = "0.5"
 memmap2 = "0.9"
+# System tray icon (StatusNotifierItem over D-Bus; KDE, and GNOME with the
+# AppIndicator extension). Same zbus and async-io as souvlaki's MPRIS.
+ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
+# setsid() for the process that takes over in the system tray.
+libc = "0.2"
 
 # The window handle the Windows media controls attach to.
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
+
+# System tray icon on Windows (notification area) and macOS (menu bar).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

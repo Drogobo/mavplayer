@@ -1,8 +1,8 @@
 //! Keyboard shortcuts: every command that can have one, its default keys,
 //! and the user's changes on top (`Settings::key_bindings`).
 //!
-//! `apply` (re)builds GPUI's keymap from this table. The Keyboard Shortcuts
-//! dialog edits the overrides, and menus look their shortcut labels up here.
+//! `apply` (re)builds GPUI's keymap from this table. Preferences → Keyboard
+//! Shortcuts edits the overrides, and menus look their shortcut labels up here.
 
 use super::actions::*;
 use gpui::{Action, App, KeyBinding, Keystroke};
@@ -26,7 +26,7 @@ fn bind_as<A: Action + Default>(keys: &str, ctx: Option<&str>) -> KeyBinding {
 
 macro_rules! commands {
     ($( $group:literal => [ $( $act:ident $(@$global:ident)?, $label:literal, [$($k:literal),*] ; )* ] )*) => {
-        /// Every rebindable command, in the order the shortcuts dialog lists them.
+        /// Every rebindable command, in the order Preferences lists them.
         pub const COMMANDS: &[Command] = &[ $( $( Command {
             id: stringify!($act),
             label: $label,

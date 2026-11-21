@@ -23,6 +23,7 @@ finish-args:
   - --share=network         # network streams
   - --own-name=org.mpris.MediaPlayer2.mavplayer     # media keys (MPRIS)
   - --own-name=org.mpris.MediaPlayer2.mavplayer.*   # ...for extra windows
+  - --talk-name=org.kde.StatusNotifierWatcher        # system tray icon
   - --filesystem=host:ro    # open files, sidecar subtitles, DVD folders
   - --filesystem=xdg-pictures/MavPlayer:create   # screenshots
   - --filesystem=xdg-music:ro

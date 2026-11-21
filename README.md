@@ -29,6 +29,9 @@ one click away.
   overlay on Windows, Now Playing on macOS).
 - Opening files while MavPlayer is open can start a new window, or add to the
   open window's playlist (and play), or replace it: your choice in settings.
+- Optionally keeps running in the system tray when you close the window
+  (Preferences ▸ Playback, off by default), so the next file you open plays
+  almost instantly. Click the tray icon to open the window; quit from its menu.
 
 **Video**: aspect ratio override, crop, zoom, rotate and flip, brightness /
 contrast / saturation / gamma / hue, sharpen, denoise, grayscale, invert.
@@ -124,6 +127,8 @@ mavplayer [OPTIONS] [FILE | FOLDER | URL | dvd://[TITLE][/DEVICE]] ...
 
   -f, --fullscreen          Start in fullscreen
   -n, --new-window          Open a new window even if MavPlayer is already open
+      --background          Start in the system tray without a window, so the
+                            first file opened plays almost instantly
       --integrate           Add this AppImage to the desktop's application menu
       --remove-integration  Remove that menu entry again
   -v, --verbose             Print diagnostics to stderr
@@ -138,9 +143,9 @@ image or folder), `mavplayer dvd://2/dev/sr1` (title 2 of the disc in `/dev/sr1`
 
 ### Keyboard shortcuts
 
-On macOS, <kbd>Ctrl</kbd> below means <kbd>⌘</kbd>. **Help ▸ Keyboard
-Shortcuts** (<kbd>F1</kbd>) lists them all in the app, where you can search
-them and add, remove or change keys. These are the defaults.
+On macOS, <kbd>Ctrl</kbd> below means <kbd>⌘</kbd>. **Preferences ▸
+Keyboard Shortcuts** (<kbd>F1</kbd>) lists them all, where you can search them
+and add, remove or change keys. These are the defaults.
 
 | Keys | Action |
 | --- | --- |

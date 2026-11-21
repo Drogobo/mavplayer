@@ -12,9 +12,7 @@ mod playlist;
 mod settings;
 mod ui;
 
-use gpui::{
-    App, AppContext, Application, Bounds, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions, px, size,
-};
+use gpui::{App, Application};
 use std::path::PathBuf;
 
 const HELP: &str = "\
@@ -26,6 +24,8 @@ USAGE:
 OPTIONS:
     -f, --fullscreen          Start in fullscreen
     -n, --new-window          Open a new window even if MavPlayer is already open
+        --background          Start in the system tray without a window, so
+                              the first file opened plays almost instantly
         --integrate           Add this AppImage to the desktop's application menu
         --remove-integration  Remove the application menu entry created by --integrate
     -v, --verbose             Print FFmpeg diagnostics to stderr
@@ -37,11 +37,13 @@ struct Args {
     sources: Vec<engine::MediaSource>,
     fullscreen: bool,
     new_window: bool,
+    /// Wait in the system tray without a window.
+    background: bool,
     verbose: bool,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { sources: vec![], fullscreen: false, new_window: false, verbose: false };
+    let mut args = Args { sources: vec![], fullscreen: false, new_window: false, background: false, verbose: false };
     let mut paths: Vec<PathBuf> = vec![];
     let mut only_files = false;
     for a in std::env::args().skip(1) {
@@ -58,6 +60,7 @@ fn parse_args() -> Args {
                 }
                 "-f" | "--fullscreen" => args.fullscreen = true,
                 "-n" | "--new-window" => args.new_window = true,
+                "--background" => args.background = true,
                 "-v" | "--verbose" => args.verbose = true,
                 "--integrate" => exit_with(integration::integrate().map(|p| format!("Installed {}", p.display()))),
                 "--remove-integration" | "--unintegrate" => {
@@ -95,11 +98,21 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
-pub static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static START: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
+
+/// When this launch began: the process start, or the moment a MavPlayer
+/// waiting in the tray started opening its window again.
+pub fn launch_instant() -> Option<std::time::Instant> {
+    *START.lock()
+}
+
+pub fn mark_launch() {
+    *START.lock() = Some(std::time::Instant::now());
+}
 
 /// Milliseconds since launch, for the startup timings printed with `-v`.
 pub fn ms_since_start() -> f64 {
-    START.get().map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
+    launch_instant().map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn exit_with(r: anyhow::Result<String>) -> ! {
@@ -116,30 +129,56 @@ fn exit_with(r: anyhow::Result<String>) -> ! {
 }
 
 fn main() {
-    let start = *START.get_or_init(std::time::Instant::now);
+    let start = std::time::Instant::now();
+    *START.lock() = Some(start);
     let args = parse_args();
     let verbose = args.verbose || std::env::var_os("MAVPLAYER_DEBUG").is_some();
     if verbose && log::set_boxed_logger(Box::new(StderrLog(start))).is_ok() {
         log::set_max_level(log::LevelFilter::Debug);
     }
-    engine::init(verbose);
+    // Files on the command line win over --background.
+    let background = args.background && args.sources.is_empty();
 
     let settings = settings::Settings::load();
-    // Hand the files to an open window instead, if the settings say so.
-    if !args.sources.is_empty()
-        && !args.new_window
-        && settings.when_running != settings::RunningMode::NewWindow
-        && instance::forward(settings.when_running, &args.sources)
-    {
-        log::debug!("startup: handed {} item(s) to the open window", args.sources.len());
+    // Hand the files to an open window instead, if the settings say so. A
+    // MavPlayer waiting in the tray takes any launch, files or not: opening
+    // its window is much quicker than starting up.
+    let hand_over =
+        !args.sources.is_empty() && !args.new_window && settings.when_running != settings::RunningMode::NewWindow;
+    if !background && instance::forward(settings.when_running, &args.sources, args.fullscreen, !hand_over) {
+        log::debug!("startup: handed {} item(s) to the running MavPlayer", args.sources.len());
         return;
     }
+    engine::init(verbose);
 
+    // Requests from later launches, the OS and the tray icon, for the UI thread.
+    let (tx, rx) = ui::shell::channel();
+    let primary = {
+        let tx = tx.clone();
+        // A MavPlayer closing into the tray starts this one and quits: wait for its socket.
+        let wait = std::time::Duration::from_secs(if background { 5 } else { 0 });
+        instance::listen(wait, move |req| {
+            let _ = tx.unbounded_send(ui::shell::Incoming::Remote(req));
+        })
+    };
+    if background && !primary {
+        log::debug!("startup: another MavPlayer is already running; nothing to do in the background");
+        return;
+    }
     // GPUI's font scan in Application::new() is slow on a cold cache: warm it in parallel first.
     #[cfg(target_os = "linux")]
     let fonts = font_prefetch::start();
-    // Start opening the first file now: it decodes while GPUI brings up the GPU.
-    let boot = ui::player::Boot::start(settings, args.sources);
+    let boot = if background {
+        // No file yet, but have the GPU ready for the first one.
+        engine::prewarm(&settings.engine_config());
+        ui::shell::Start::Background { settings }
+    } else {
+        // Start opening the first file now: it decodes while GPUI brings up the GPU.
+        ui::shell::Start::Window {
+            boot: ui::player::Boot::start(settings, args.sources, primary),
+            fullscreen: args.fullscreen,
+        }
+    };
     integration::ensure_window_icon();
     #[cfg(target_os = "linux")]
     if let Some(fonts) = fonts {
@@ -148,54 +187,25 @@ fn main() {
     let app = Application::new().with_assets(icons::Assets);
     log::debug!("startup: GPU and platform ready at {:.0} ms", ms_since_start());
     // Files opened from Finder / the dock while running (and URL schemes).
-    app.on_open_urls(|urls| {
-        let _ = ui::player::OPEN_REQUESTS.lock().map(|mut q| q.extend(urls));
-    });
+    {
+        let tx = tx.clone();
+        app.on_open_urls(move |urls| {
+            let _ = tx.unbounded_send(ui::shell::Incoming::Urls(urls));
+        });
+    }
+    // The dock icon clicked while MavPlayer waits in the background (macOS).
+    {
+        let tx = tx.clone();
+        app.on_reopen(move |_| {
+            let _ = tx.unbounded_send(ui::shell::Incoming::Reopen);
+        });
+    }
     app.run(move |cx: &mut App| {
-        ui::keymap::apply(cx, &boot.settings.key_bindings);
+        ui::keymap::apply(cx, &boot.settings().key_bindings);
         #[cfg(target_os = "macos")]
         ui::actions::set_native_menus(cx);
-
-        let fullscreen = args.fullscreen || boot.settings.start_fullscreen;
-        let (w, h) = boot.settings.window_size.unwrap_or((960.0, 600.0));
-        // Wide enough for every control chosen for the bottom bar. (GPUI can't
-        // change it later; the bar leaves controls out if it must.)
-        let min_w = ui::bar::min_window_width(&boot.settings.bar_controls);
-        let bounds = Bounds::centered(None, size(px(w.max(480.0).max(min_w)), px(h.max(320.0))), cx);
-        let options = WindowOptions {
-            window_bounds: Some(if fullscreen {
-                WindowBounds::Fullscreen(bounds)
-            } else {
-                WindowBounds::Windowed(bounds)
-            }),
-            titlebar: Some(TitlebarOptions {
-                title: Some("MavPlayer".into()),
-                appears_transparent: false,
-                traffic_light_position: None,
-            }),
-            app_id: Some(integration::APP_ID.to_string()),
-            window_min_size: Some(size(px(min_w), px(280.))),
-            window_decorations: Some(WindowDecorations::Server),
-            focus: true,
-            show: true,
-            ..Default::default()
-        };
-        log::debug!("startup: opening window at {:.0} ms", ms_since_start());
-        let window =
-            cx.open_window(options, move |window, cx| cx.new(|cx| ui::player::PlayerView::new(window, cx, boot)));
-        if let Err(e) = window {
-            eprintln!("mavplayer: could not open a window: {e:#}");
-            cx.quit();
-            return;
-        }
-        // Quit when the last window closes (all platforms, including macOS: a player has no use windowless).
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-        cx.activate(true);
-        log::debug!("startup: window open at {:.0} ms", ms_since_start());
+        // Quits when the last window closes (on every platform: a player has
+        // no use windowless), unless it is to wait in the system tray.
+        ui::shell::run(cx, boot, primary, tx, rx);
     });
 }

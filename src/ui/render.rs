@@ -300,10 +300,10 @@ impl PlayerView {
             .child(
                 btn("win-close", Icon::WindowClose, true)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(|this, _, w, cx| {
+                    .on_click(cx.listener(|this, _, w, _| {
+                        // Like the compositor's close button: quits, or waits in the tray.
                         this.save_state();
                         w.remove_window();
-                        cx.quit();
                     })),
             )
             .into_any_element()

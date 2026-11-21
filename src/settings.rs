@@ -174,6 +174,9 @@ pub struct Settings {
     pub start_paused: bool,
     pub open_mode: OpenMode,
     pub when_running: RunningMode,
+    /// Closing the window leaves MavPlayer running with a system tray icon,
+    /// so media opened later plays without a cold start.
+    pub keep_in_tray: bool,
     pub start_fullscreen: bool,
     pub seek_step: f64,
     pub seek_step_large: f64,
@@ -250,6 +253,7 @@ impl Default for Settings {
             start_paused: false,
             open_mode: OpenMode::Replace,
             when_running: RunningMode::NewWindow,
+            keep_in_tray: false,
             start_fullscreen: false,
             seek_step: 5.0,
             seek_step_large: 60.0,

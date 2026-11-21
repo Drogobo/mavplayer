@@ -25,7 +25,17 @@ fn hw_device_types() -> &'static [ff::AVHWDeviceType] {
     use ff::AVHWDeviceType::*;
     #[cfg(target_os = "linux")]
     {
-        &[AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VDPAU]
+        // On NVIDIA, VAAPI only reaches the GPU through the NVDEC wrapper
+        // driver, which takes twice as long as CUDA to open (about 450 ms
+        // against 200 ms on an RTX 2070) and decodes the same way.
+        static TYPES: std::sync::OnceLock<&'static [ff::AVHWDeviceType]> = std::sync::OnceLock::new();
+        TYPES.get_or_init(|| {
+            if vaapi_is_nvdec() {
+                &[AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_VDPAU]
+            } else {
+                &[AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VDPAU]
+            }
+        })
     }
     #[cfg(target_os = "windows")]
     {
@@ -38,6 +48,98 @@ fn hw_device_types() -> &'static [ff::AVHWDeviceType] {
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         &[]
+    }
+}
+
+/// Whether FFmpeg's default VAAPI device would be NVIDIA's NVDEC wrapper:
+/// libva is told to use it, or the first render node (the one FFmpeg opens)
+/// is an NVIDIA GPU. A laptop whose first node is its Intel or AMD GPU keeps
+/// VAAPI first, so the discrete GPU isn't woken up.
+#[cfg(target_os = "linux")]
+fn vaapi_is_nvdec() -> bool {
+    if let Some(name) = std::env::var_os("LIBVA_DRIVER_NAME") {
+        return name == "nvidia";
+    }
+    std::fs::read_to_string("/sys/class/drm/renderD128/device/vendor").is_ok_and(|v| v.trim() == "0x10de")
+}
+
+/// A hardware device context, shared by every decoder that uses it.
+struct HwDevice(*mut ff::AVBufferRef);
+// SAFETY: FFmpeg device contexts are reference counted and may be used from
+// any thread once created; decoders only take new references to them.
+unsafe impl Send for HwDevice {}
+
+impl Drop for HwDevice {
+    fn drop(&mut self) {
+        unsafe { ff::av_buffer_unref(&mut self.0) };
+    }
+}
+
+enum HwSlot {
+    Untried,
+    Unavailable,
+    Ready(HwDevice),
+}
+
+/// Hardware devices, created once per process instead of once per file:
+/// opening one takes 200–500 ms on some drivers, which every file (and
+/// every playlist step) would otherwise wait for. A device that fails to
+/// open isn't tried again.
+static HW_SLOTS: parking_lot::Mutex<Vec<(ff::AVHWDeviceType, Arc<parking_lot::Mutex<HwSlot>>)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+fn hw_slot(ty: ff::AVHWDeviceType) -> Arc<parking_lot::Mutex<HwSlot>> {
+    let mut slots = HW_SLOTS.lock();
+    if let Some((_, s)) = slots.iter().find(|(t, _)| *t == ty) {
+        return s.clone();
+    }
+    let s = Arc::new(parking_lot::Mutex::new(HwSlot::Untried));
+    slots.push((ty, s.clone()));
+    s
+}
+
+/// A new reference to the shared device of type `ty`, creating it on first
+/// use. Callers that arrive while it is being created wait for it.
+fn hw_device(ty: ff::AVHWDeviceType) -> Option<*mut ff::AVBufferRef> {
+    let slot = hw_slot(ty);
+    let mut slot = slot.lock();
+    if let HwSlot::Untried = *slot {
+        let t0 = std::time::Instant::now();
+        let mut dev: *mut ff::AVBufferRef = ptr::null_mut();
+        let r = unsafe { ff::av_hwdevice_ctx_create(&mut dev, ty, ptr::null(), ptr::null_mut(), 0) };
+        *slot = if r < 0 || dev.is_null() {
+            log::debug!("hw device {:?} unavailable: {}", ty, av::err_str(r));
+            HwSlot::Unavailable
+        } else {
+            log::debug!("hw device {:?} ready in {:.0} ms", ty, t0.elapsed().as_secs_f64() * 1000.0);
+            HwSlot::Ready(HwDevice(dev))
+        };
+    }
+    match &*slot {
+        HwSlot::Ready(d) => {
+            let r = unsafe { ff::av_buffer_ref(d.0) };
+            (!r.is_null()).then_some(r)
+        }
+        _ => None,
+    }
+}
+
+/// Starts opening the hardware decoding device in the background, so the
+/// first file doesn't wait for it (only when every file decodes in hardware).
+pub fn prewarm_hw(mode: HwDecode) {
+    if mode != HwDecode::Always {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("hwdec-init".into()).spawn(|| {
+        for &ty in hw_device_types() {
+            if let Some(mut dev) = hw_device(ty) {
+                unsafe { ff::av_buffer_unref(&mut dev) };
+                break;
+            }
+        }
+    });
+    if let Err(e) = spawned {
+        log::debug!("could not start hwdec-init: {e}");
     }
 }
 
@@ -71,12 +173,7 @@ fn try_setup_hw(ctx: *mut ff::AVCodecContext, codec: *const ff::AVCodec) -> Opti
             if cfg.device_type != ty || cfg.methods & ff::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as c_int == 0 {
                 continue;
             }
-            let mut dev: *mut ff::AVBufferRef = ptr::null_mut();
-            let r = unsafe { ff::av_hwdevice_ctx_create(&mut dev, ty, ptr::null(), ptr::null_mut(), 0) };
-            if r < 0 {
-                log::debug!("hw device {:?} unavailable: {}", ty, av::err_str(r));
-                break;
-            }
+            let Some(dev) = hw_device(ty) else { break };
             unsafe {
                 (*ctx).hw_device_ctx = dev; // ownership moves to the codec context
                 (*ctx).opaque = cfg.pix_fmt as c_int as isize as *mut _;
