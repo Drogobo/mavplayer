@@ -189,6 +189,77 @@ pub fn language_matches(lang: &str, pref: &str) -> bool {
     a == b || language_name(&a).eq_ignore_ascii_case(&language_name(&b))
 }
 
+/// A stream tag that names an actual language (not "und", "mul", …).
+pub fn is_known_language(lang: &str) -> bool {
+    let l = lang.trim().to_ascii_lowercase();
+    !l.is_empty() && !matches!(l.as_str(), "und" | "unk" | "mul" | "mis" | "zxx" | "qaa" | "none")
+}
+
+/// The desktop's languages, most preferred first, as ISO 639-1 codes
+/// ("en", "pt"): `LANGUAGE`/`LC_ALL`/`LC_MESSAGES`/`LANG` on Unix, the user's
+/// display languages on Windows and macOS.
+pub fn system_languages() -> Vec<String> {
+    static LANGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LANGS
+        .get_or_init(|| {
+            let mut v: Vec<String> = Vec::new();
+            for loc in sys_locale::get_locales() {
+                if let Some(l) = locale_language(&loc)
+                    && !v.contains(&l)
+                {
+                    v.push(l);
+                }
+            }
+            v
+        })
+        .clone()
+}
+
+/// "en-US", "pt_BR.UTF-8", "sr@latin" → "en", "pt", "sr". None for "C"/"POSIX".
+fn locale_language(loc: &str) -> Option<String> {
+    let l = loc.split(['-', '_', '.', '@']).next()?.trim().to_ascii_lowercase();
+    (l.len() >= 2 && l.len() <= 3 && l.chars().all(|c| c.is_ascii_alphabetic()) && l != "c" && l != "posix")
+        .then_some(l)
+}
+
+/// Chooses which subtitle track to show, or none.
+///
+/// `langs` is the preference order. `want` means subtitles were asked for
+/// (the "always show" setting, or the user turned them on); otherwise full
+/// subtitles only come on when the audio is in another language than the
+/// preferred subtitles, and forced ones (signs, foreign dialogue) when there
+/// are any.
+pub fn pick_subtitle(info: &MediaInfo, audio: Option<TrackId>, langs: &[String], want: bool) -> Option<TrackId> {
+    let subs: Vec<&Track> = info.tracks_of(TrackKind::Subtitle).collect();
+    let audio_lang = audio
+        .and_then(|a| info.tracks.iter().find(|t| t.id == a))
+        .and_then(|t| t.language.as_deref())
+        .filter(|l| is_known_language(l));
+    let is_lang = |t: &Track, l: &str| t.language.as_deref().is_some_and(|tl| language_matches(tl, l));
+    // Full subtitles before forced-only, plain before SDH, flagged default first.
+    let rank = |t: &&Track| (t.forced, t.hearing_impaired, !t.default);
+
+    for l in langs {
+        let Some(t) = subs.iter().copied().filter(|t| !t.forced && is_lang(t, l)).min_by_key(rank) else { continue };
+        let foreign_audio = audio_lang.is_some_and(|al| !language_matches(al, l));
+        if want || foreign_audio {
+            return Some(t.id);
+        }
+        // The audio is (probably) in this language: only forced subtitles.
+        break;
+    }
+    let forced: Vec<&Track> = subs.iter().copied().filter(|t| t.forced).collect();
+    let forced_pick = audio_lang
+        .and_then(|al| forced.iter().find(|t| is_lang(t, al)))
+        .or_else(|| langs.iter().find_map(|l| forced.iter().find(|t| is_lang(t, l))))
+        .or(forced.first());
+    if !want {
+        return forced_pick.map(|t| t.id);
+    }
+    // Asked for, but nothing in a preferred language: the best of the rest.
+    subs.iter().copied().min_by_key(rank).map(|t| t.id)
+}
+
 #[derive(Clone, Debug)]
 pub struct Chapter {
     pub start: f64,
@@ -640,4 +711,88 @@ pub struct SubBitmap {
     pub canvas_h: u32,
     /// BGRA pixels, premultiplication not applied.
     pub bgra: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(i: usize, kind: TrackKind, lang: &str) -> Track {
+        Track {
+            id: TrackId::Stream(i),
+            kind,
+            codec: String::new(),
+            language: Some(lang.to_string()).filter(|l| !l.is_empty()),
+            title: None,
+            default: false,
+            forced: false,
+            hearing_impaired: false,
+            width: 0,
+            height: 0,
+            fps: 0.0,
+            is_cover_art: false,
+            channels: 0,
+            channel_layout: String::new(),
+            sample_rate: 0,
+            bitrate: 0,
+            external_path: None,
+        }
+    }
+
+    fn media(tracks: Vec<Track>) -> MediaInfo {
+        MediaInfo { tracks, ..Default::default() }
+    }
+
+    fn langs(l: &[&str]) -> Vec<String> {
+        l.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn subtitles_follow_foreign_audio() {
+        let mut signs = track(3, TrackKind::Subtitle, "eng");
+        signs.forced = true;
+        let mut sdh = track(4, TrackKind::Subtitle, "eng");
+        sdh.hearing_impaired = true;
+        let m = media(vec![
+            track(0, TrackKind::Audio, "jpn"),
+            track(1, TrackKind::Audio, "eng"),
+            signs,
+            sdh,
+            track(5, TrackKind::Subtitle, "eng"),
+            track(6, TrackKind::Subtitle, "ger"),
+        ]);
+        let jpn = Some(TrackId::Stream(0));
+        let eng = Some(TrackId::Stream(1));
+        // Japanese audio: full English subtitles, not the signs or SDH track.
+        assert_eq!(pick_subtitle(&m, jpn, &langs(&["en"]), false), Some(TrackId::Stream(5)));
+        // English audio: just the forced signs, unless subtitles are wanted.
+        assert_eq!(pick_subtitle(&m, eng, &langs(&["en"]), false), Some(TrackId::Stream(3)));
+        assert_eq!(pick_subtitle(&m, eng, &langs(&["en"]), true), Some(TrackId::Stream(5)));
+        // The first preferred language that has subtitles wins.
+        assert_eq!(pick_subtitle(&m, jpn, &langs(&["fr", "de", "en"]), false), Some(TrackId::Stream(6)));
+    }
+
+    #[test]
+    fn subtitles_when_asked_for() {
+        // One untagged track: shown when asked for, whatever the preferences.
+        let m = media(vec![track(0, TrackKind::Audio, ""), track(1, TrackKind::Subtitle, "")]);
+        assert_eq!(pick_subtitle(&m, Some(TrackId::Stream(0)), &langs(&["en"]), false), None);
+        assert_eq!(pick_subtitle(&m, Some(TrackId::Stream(0)), &langs(&["en"]), true), Some(TrackId::Stream(1)));
+        assert_eq!(pick_subtitle(&m, None, &[], true), Some(TrackId::Stream(1)));
+        // No preferred language: the default-flagged track.
+        let mut fr = track(2, TrackKind::Subtitle, "fre");
+        fr.default = true;
+        let m = media(vec![track(1, TrackKind::Subtitle, "spa"), fr]);
+        assert_eq!(pick_subtitle(&m, None, &langs(&["en"]), true), Some(TrackId::Stream(2)));
+        assert_eq!(pick_subtitle(&media(vec![]), None, &[], true), None);
+    }
+
+    #[test]
+    fn locale_languages() {
+        assert_eq!(locale_language("en-US").as_deref(), Some("en"));
+        assert_eq!(locale_language("pt_BR.UTF-8").as_deref(), Some("pt"));
+        assert_eq!(locale_language("sr@latin").as_deref(), Some("sr"));
+        assert_eq!(locale_language("C"), None);
+        assert_eq!(locale_language("POSIX"), None);
+    }
 }

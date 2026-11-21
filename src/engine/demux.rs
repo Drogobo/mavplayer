@@ -221,20 +221,7 @@ fn choose_tracks(ic: &FormatCtx, info: &MediaInfo, cfg: &EngineConfig) -> Select
     let audio = pick_by_lang(info.tracks_of(TrackKind::Audio), &cfg.audio_langs)
         .map(|t| t.id)
         .or_else(|| best(ff::AVMediaType::AVMEDIA_TYPE_AUDIO, vidx).map(TrackId::Stream));
-    let audio_lang = audio.and_then(|a| info.tracks.iter().find(|t| t.id == a)).and_then(|t| t.language.clone());
-    let subs: Vec<&Track> = info.tracks_of(TrackKind::Subtitle).collect();
-    let subtitle = if let Some(t) = pick_by_lang(subs.iter().copied(), &cfg.sub_langs) {
-        // Preferred-language subs: only auto-enable when the audio is in a different language.
-        let same_lang =
-            audio_lang.as_deref().is_some_and(|al| t.language.as_deref().is_some_and(|sl| language_matches(al, sl)));
-        if cfg.subs_enabled_by_default || !same_lang { Some(t.id) } else { None }
-    } else if let Some(t) = subs.iter().find(|t| t.forced) {
-        Some(t.id)
-    } else if cfg.subs_enabled_by_default {
-        subs.iter().find(|t| t.default).or(subs.first()).map(|t| t.id)
-    } else {
-        None
-    };
+    let subtitle = super::types::pick_subtitle(info, audio, &cfg.sub_langs, cfg.subs_enabled_by_default);
     Selected { video, audio, subtitle }
 }
 

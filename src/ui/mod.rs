@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod bar;
 pub mod dialogs;
+pub mod keymap;
 pub mod media_keys;
 pub mod menu;
 pub mod menus;

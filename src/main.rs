@@ -152,8 +152,7 @@ fn main() {
         let _ = ui::player::OPEN_REQUESTS.lock().map(|mut q| q.extend(urls));
     });
     app.run(move |cx: &mut App| {
-        ui::actions::bind_keys(cx);
-        ui::text_input::bind_keys(cx);
+        ui::keymap::apply(cx, &boot.settings.key_bindings);
         #[cfg(target_os = "macos")]
         ui::actions::set_native_menus(cx);
 

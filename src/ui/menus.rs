@@ -14,8 +14,13 @@ use gpui::{Action, Context};
 
 pub const MENUBAR: &[&str] = &["Media", "Playback", "Audio", "Video", "Subtitle", "View", "Help"];
 
+/// A menu item that dispatches `a`, showing its current shortcut.
 fn act<A: Action + Clone>(label: &str, a: A) -> M {
-    M::action(label.to_string(), move |_, w, cx| w.dispatch_action(a.boxed_clone(), cx))
+    let item = M::action(label.to_string(), {
+        let a = a.clone();
+        move |_, w, cx| w.dispatch_action(a.boxed_clone(), cx)
+    });
+    item.shortcut_of(&a)
 }
 
 impl PlayerView {
@@ -36,7 +41,6 @@ impl PlayerView {
         let paused = self.player.paused();
         vec![
             act(if paused || !playing { "Play" } else { "Pause" }, TogglePause)
-                .shortcut("space")
                 .icon(if paused || !playing { Icon::Play } else { Icon::Pause })
                 .enabled(playing),
             act("Stop", Stop).icon(Icon::Stop).enabled(playing),
@@ -50,9 +54,9 @@ impl PlayerView {
             M::submenu("Subtitle", self.menu_subtitle()),
             M::submenu("View", self.menu_view()),
             M::Separator,
-            act("Fullscreen", ToggleFullscreen).shortcut("f").icon(Icon::Fullscreen),
-            act("Media Information", ShowMediaInfo).shortcut("i").icon(Icon::Info).enabled(playing),
-            act("Preferences…", ShowPreferences).shortcut("secondary-,").icon(Icon::Settings),
+            act("Fullscreen", ToggleFullscreen).icon(Icon::Fullscreen),
+            act("Media Information", ShowMediaInfo).icon(Icon::Info).enabled(playing),
+            act("Preferences…", ShowPreferences).icon(Icon::Settings),
         ]
     }
 
@@ -74,20 +78,14 @@ impl PlayerView {
             }));
         }
         let mut v = vec![
-            act("Open File…", OpenFile).shortcut("secondary-o").icon(Icon::OpenFile),
-            act("Open Folder…", OpenFolder).shortcut("secondary-f").icon(Icon::OpenFolder),
-            act("Open Disc…", OpenDisc).shortcut("secondary-d").icon(Icon::Disc),
-            act("Open URL…", OpenUrl).shortcut("secondary-u").icon(Icon::Url),
+            act("Open File…", OpenFile).icon(Icon::OpenFile),
+            act("Open Folder…", OpenFolder).icon(Icon::OpenFolder),
+            act("Open Disc…", OpenDisc).icon(Icon::Disc),
+            act("Open URL…", OpenUrl).icon(Icon::Url),
             M::submenu("Recent Media", recent).icon(Icon::Recent),
             M::Separator,
-            act("Load Subtitle File…", OpenSubtitle)
-                .shortcut("secondary-shift-o")
-                .icon(Icon::Subtitles)
-                .enabled(self.player.is_active()),
-            act("Save Playlist…", SavePlaylist)
-                .shortcut("secondary-s")
-                .icon(Icon::Save)
-                .enabled(!self.playlist.items.is_empty()),
+            act("Load Subtitle File…", OpenSubtitle).icon(Icon::Subtitles).enabled(self.player.is_active()),
+            act("Save Playlist…", SavePlaylist).icon(Icon::Save).enabled(!self.playlist.items.is_empty()),
         ];
         #[cfg(target_os = "linux")]
         if crate::integration::is_appimage() {
@@ -106,7 +104,7 @@ impl PlayerView {
             }
         }
         v.push(M::Separator);
-        v.push(act("Quit", Quit).shortcut("secondary-q"));
+        v.push(act("Quit", Quit));
         v
     }
 
@@ -139,16 +137,14 @@ impl PlayerView {
             })
             .unwrap_or_default();
         let mut v = vec![
-            act(if self.player.paused() || !active { "Play" } else { "Pause" }, TogglePause)
-                .shortcut("space")
-                .enabled(active),
-            act("Stop", Stop).shortcut("secondary-.").enabled(active),
-            act("Previous", PlayPrevious).shortcut("shift-n"),
-            act("Next", PlayNext).shortcut("n"),
+            act(if self.player.paused() || !active { "Play" } else { "Pause" }, TogglePause).enabled(active),
+            act("Stop", Stop).enabled(active),
+            act("Previous", PlayPrevious),
+            act("Next", PlayNext),
             M::Separator,
-            act("Jump Forward", SeekForward).shortcut("right").enabled(active),
-            act("Jump Backward", SeekBackward).shortcut("left").enabled(active),
-            act("Jump to Time…", JumpToTime).shortcut("secondary-t").enabled(active),
+            act("Jump Forward", SeekForward).enabled(active),
+            act("Jump Backward", SeekBackward).enabled(active),
+            act("Jump to Time…", JumpToTime).enabled(active),
             M::submenu("Chapters", chapters),
         ];
         if let Some((path, titles)) = &self.dvd_titles {
@@ -173,12 +169,12 @@ impl PlayerView {
         v.extend([
             M::Separator,
             M::submenu("Speed", speeds).icon(Icon::Speed),
-            act("Faster", SpeedUp).shortcut("]"),
-            act("Slower", SpeedDown).shortcut("["),
-            act("Normal Speed", SpeedReset).shortcut("backspace"),
+            act("Faster", SpeedUp),
+            act("Slower", SpeedDown),
+            act("Normal Speed", SpeedReset),
             M::Separator,
-            act("A-B Loop", ToggleAbLoop).shortcut("a").checked(self.ab_loop.0.is_some()).enabled(active),
-            act("Loop File", ToggleLoopFile).shortcut("shift-l").checked(self.loop_file),
+            act("A-B Loop", ToggleAbLoop).checked(self.ab_loop.0.is_some()).enabled(active),
+            act("Loop File", ToggleLoopFile).checked(self.loop_file),
             M::submenu(
                 "Repeat",
                 vec![
@@ -191,10 +187,10 @@ impl PlayerView {
                 ],
             )
             .icon(Icon::RepeatAll),
-            act("Shuffle", ToggleShuffle).shortcut("shift-s").checked(self.playlist.shuffle()),
+            act("Shuffle", ToggleShuffle).checked(self.playlist.shuffle()),
             M::Separator,
-            act("Next Frame", FrameStep).shortcut(".").enabled(active),
-            act("Previous Frame", FrameBackStep).shortcut(",").enabled(active),
+            act("Next Frame", FrameStep).enabled(active),
+            act("Previous Frame", FrameBackStep).enabled(active),
         ]);
         v
     }
@@ -203,7 +199,8 @@ impl PlayerView {
         let st = self.player.state();
         let cur = match kind {
             TrackKind::Audio => st.selected.audio,
-            TrackKind::Subtitle => st.selected.subtitle,
+            // Hidden subtitles read as off.
+            TrackKind::Subtitle => st.selected.subtitle.filter(|_| self.subs_visible),
             TrackKind::Video => st.selected.video,
         };
         let mut v: Vec<M> = Vec::new();
@@ -268,12 +265,12 @@ impl PlayerView {
                 ],
             ),
             M::Separator,
-            act("Volume Up", VolumeUp).shortcut("up"),
-            act("Volume Down", VolumeDown).shortcut("down"),
-            act("Mute", ToggleMute).shortcut("m").checked(self.player.muted()),
+            act("Volume Up", VolumeUp),
+            act("Volume Down", VolumeDown),
+            act("Mute", ToggleMute).checked(self.player.muted()),
             M::Separator,
-            act("Increase Audio Delay", AudioDelayIncrease).shortcut("secondary-="),
-            act("Decrease Audio Delay", AudioDelayDecrease).shortcut("secondary--"),
+            act("Increase Audio Delay", AudioDelayIncrease),
+            act("Decrease Audio Delay", AudioDelayDecrease),
             M::action("Reset Audio Delay", |this, _, cx| {
                 this.player.set_audio_delay(0.0);
                 this.osd("Audio delay 0 ms", cx)
@@ -293,7 +290,7 @@ impl PlayerView {
                 this.apply_settings(cx);
             })
             .checked(fx.night_mode),
-            act("Equalizer & Effects…", ShowEffects).shortcut("secondary-e"),
+            act("Equalizer & Effects…", ShowEffects),
         ]
     }
 
@@ -373,8 +370,8 @@ impl PlayerView {
         };
         vec![
             M::submenu("Video Track", self.track_items(TrackKind::Video, true)).icon(Icon::Video),
-            act("Fullscreen", ToggleFullscreen).shortcut("f").icon(Icon::Fullscreen),
-            act("Fit Window to Video", FitWindow).shortcut("secondary-0"),
+            act("Fullscreen", ToggleFullscreen).icon(Icon::Fullscreen),
+            act("Fit Window to Video", FitWindow),
             M::Separator,
             M::submenu("Aspect Ratio", aspects),
             M::submenu(
@@ -392,9 +389,9 @@ impl PlayerView {
             M::submenu("Zoom", {
                 let mut z = zooms;
                 z.push(M::Separator);
-                z.push(act("Zoom In", ZoomIn).shortcut("alt-="));
-                z.push(act("Zoom Out", ZoomOut).shortcut("alt--"));
-                z.push(act("Reset", ZoomReset).shortcut("alt-backspace"));
+                z.push(act("Zoom In", ZoomIn));
+                z.push(act("Zoom Out", ZoomOut));
+                z.push(act("Reset", ZoomReset));
                 z
             })
             .icon(Icon::ZoomIn),
@@ -443,7 +440,7 @@ impl PlayerView {
             .checked(self.settings.tone_map_hdr),
             M::submenu("Upscaling", self.upscaling_items()),
             M::Separator,
-            act("Take Screenshot", Screenshot).shortcut("s").icon(Icon::Screenshot).enabled(self.player.has_frame()),
+            act("Take Screenshot", Screenshot).icon(Icon::Screenshot).enabled(self.player.has_frame()),
             M::action("Picture Adjustments…", |this, w, cx| this.show_dialog(Dialog::Effects(2), w, cx)),
         ]
     }
@@ -509,18 +506,20 @@ impl PlayerView {
         let style = self.settings.sub_style;
         vec![
             M::submenu("Subtitle Track", self.track_items(TrackKind::Subtitle, true)).icon(Icon::Subtitles),
-            act("Load Subtitle File…", OpenSubtitle).shortcut("secondary-shift-o").enabled(self.player.is_active()),
-            act("Show Subtitles", ToggleSubtitles).shortcut("v").checked(self.subs_visible),
+            act("Load Subtitle File…", OpenSubtitle).enabled(self.player.is_active()),
+            act("Show Subtitles", ToggleSubtitles).checked(self.subs_shown()),
+            act("Next Language", CycleSubtitle).enabled(self.player.is_active()),
+            act("Previous Language", CycleSubtitleBack).enabled(self.player.is_active()),
             M::Separator,
-            act("Delay +100 ms", SubDelayIncrease).shortcut("x"),
-            act("Delay −100 ms", SubDelayDecrease).shortcut("z"),
+            act("Delay +100 ms", SubDelayIncrease),
+            act("Delay −100 ms", SubDelayDecrease),
             M::action("Reset Delay", |this, _, cx| {
                 this.sub_delay = 0.0;
                 this.osd("Subtitle delay 0 ms", cx)
             }),
             M::Separator,
-            act("Larger", SubScaleUp).shortcut("shift-g"),
-            act("Smaller", SubScaleDown).shortcut("shift-f"),
+            act("Larger", SubScaleUp),
+            act("Smaller", SubScaleDown),
             M::submenu(
                 "Style",
                 vec![
@@ -544,9 +543,9 @@ impl PlayerView {
             .selected(t == m)
         };
         vec![
-            act("Playlist", TogglePlaylist).shortcut("secondary-l").checked(self.show_playlist).icon(Icon::Playlist),
-            act("Menu Bar", ToggleMenubar).shortcut("secondary-m").checked(self.settings.show_menubar),
-            act("Fullscreen", ToggleFullscreen).shortcut("f"),
+            act("Playlist", TogglePlaylist).checked(self.playlist_shown()).icon(Icon::Playlist),
+            act("Menu Bar", ToggleMenubar).checked(self.settings.show_menubar),
+            act("Fullscreen", ToggleFullscreen),
             M::Separator,
             M::submenu(
                 "Theme",
@@ -557,17 +556,14 @@ impl PlayerView {
                 ],
             ),
             M::Separator,
-            act("Media Information", ShowMediaInfo).shortcut("i").icon(Icon::Info),
-            act("Equalizer & Effects…", ShowEffects).shortcut("secondary-e"),
-            act("Preferences…", ShowPreferences).shortcut("secondary-,").icon(Icon::Settings),
+            act("Media Information", ShowMediaInfo).icon(Icon::Info),
+            act("Equalizer & Effects…", ShowEffects),
+            act("Preferences…", ShowPreferences).icon(Icon::Settings),
         ]
     }
 
     fn menu_help(&self) -> Vec<M> {
-        vec![
-            act("Keyboard Shortcuts", ShowShortcuts).shortcut("f1"),
-            act("About MavPlayer", ShowAbout).icon(Icon::About),
-        ]
+        vec![act("Keyboard Shortcuts", ShowShortcuts), act("About MavPlayer", ShowAbout).icon(Icon::About)]
     }
 
     /// Popup for the subtitle button in the control bar.

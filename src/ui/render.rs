@@ -1,6 +1,7 @@
 //! Rendering of the main window.
 
 use super::actions::*;
+use super::keymap;
 use super::menu::MenuItem as M;
 use super::menus::MENUBAR;
 use super::player::{Aspect, Drag, PlayerView, SliderFn};
@@ -1146,7 +1147,6 @@ impl PlayerView {
             .filter(|&c| match c {
                 BarControl::Subtitles => has_subs,
                 BarControl::AudioTrack => audio_tracks > 1,
-                BarControl::Playlist => !overlay,
                 _ => true,
             })
             .collect();
@@ -1163,14 +1163,21 @@ impl PlayerView {
                     .icon_button(
                         "btn-prev",
                         Icon::Previous,
-                        "Previous (Shift+N)",
+                        &keymap::hint("Previous", &PlayPrevious),
                         t,
                         |this, _, w, cx| this.prev_item(w, cx),
                         cx,
                     )
                     .into_any_element(),
                 BarControl::Next => self
-                    .icon_button("btn-next", Icon::Next, "Next (N)", t, |this, _, w, cx| this.next_item(w, cx), cx)
+                    .icon_button(
+                        "btn-next",
+                        Icon::Next,
+                        &keymap::hint("Next", &PlayNext),
+                        t,
+                        |this, _, w, cx| this.next_item(w, cx),
+                        cx,
+                    )
                     .into_any_element(),
                 BarControl::Subtitles => {
                     popup_btn(self, "btn-subs", Icon::Subtitles, "Subtitles", |s| s.subtitle_popup(), cx)
@@ -1222,14 +1229,21 @@ impl PlayerView {
                     )))
                     .into_any_element(),
                 BarControl::Repeat => self
-                    .icon_button("btn-repeat", repeat_icon, "Repeat (R)", t, |this, _, _, cx| this.cycle_repeat(cx), cx)
+                    .icon_button(
+                        "btn-repeat",
+                        repeat_icon,
+                        &keymap::hint("Repeat", &CycleRepeat),
+                        t,
+                        |this, _, _, cx| this.cycle_repeat(cx),
+                        cx,
+                    )
                     .when(self.playlist.repeat != RepeatMode::Off, |d| d.bg(t.accent_soft))
                     .into_any_element(),
                 BarControl::Shuffle => self
                     .icon_button(
                         "btn-shuffle",
                         Icon::Shuffle,
-                        "Shuffle (Shift+S)",
+                        &keymap::hint("Shuffle", &ToggleShuffle),
                         t,
                         |this, _, _, cx| {
                             let s = !this.playlist.shuffle();
@@ -1245,15 +1259,12 @@ impl PlayerView {
                     .icon_button(
                         "btn-playlist",
                         Icon::Playlist,
-                        "Playlist (Ctrl+L)",
+                        &keymap::hint("Playlist", &TogglePlaylist),
                         t,
-                        |this, _, _, cx| {
-                            this.show_playlist = !this.show_playlist;
-                            cx.notify();
-                        },
+                        |this, _, w, cx| this.toggle_playlist(w, cx),
                         cx,
                     )
-                    .when(self.show_playlist, |d| d.bg(t.accent_soft))
+                    .when(self.playlist_shown(), |d| d.bg(t.accent_soft))
                     .into_any_element(),
                 BarControl::Settings => self
                     .icon_button(
@@ -1269,7 +1280,7 @@ impl PlayerView {
                     .icon_button(
                         "btn-fs",
                         if fullscreen { Icon::ExitFullscreen } else { Icon::Fullscreen },
-                        "Fullscreen (F)",
+                        &keymap::hint("Fullscreen", &ToggleFullscreen),
                         t,
                         |_, _, w, _| w.toggle_fullscreen(),
                         cx,
@@ -1284,7 +1295,7 @@ impl PlayerView {
                     .child(self.icon_button(
                         "btn-mute",
                         vol_icon,
-                        "Mute (M)",
+                        &keymap::hint("Mute", &ToggleMute),
                         t,
                         |this, _, _, cx| {
                             let m = !this.player.muted();
@@ -1577,7 +1588,16 @@ impl PlayerView {
                 .child(div().text_size(px(12.)).child("Drop files here to add them"))
                 .into_any_element()
         } else {
-            list.py_1().into_any_element()
+            let bar = self.pl_scroll.0.borrow().base_handle.clone();
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(list.py_1())
+                .child(super::widgets::scrollbar("playlist-bar", &bar, t))
+                .into_any_element()
         };
 
         div()
@@ -1647,6 +1667,7 @@ impl Render for PlayerView {
         self.ui_stats.1 += 1;
         self.avoid_direct_scanout(window);
         self.retire_textures(window);
+        self.track_fullscreen(window);
         let t = self.theme;
         let fullscreen = window.is_fullscreen();
         let client_decor = matches!(window.window_decorations(), Decorations::Client { .. }) && !fullscreen;
@@ -1658,7 +1679,7 @@ impl Render for PlayerView {
             .min_h_0()
             .flex()
             .child(self.video_area(window, cx))
-            .when(self.show_playlist && !fullscreen, |d| d.child(self.playlist_panel(cx)));
+            .when(self.playlist_shown(), |d| d.child(self.playlist_panel(cx)));
 
         let mut root = div()
             .id("root")

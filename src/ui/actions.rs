@@ -1,6 +1,8 @@
-//! Actions, key bindings and the native (macOS) application menu.
+//! Actions and the native (macOS) application menu.
 
-use gpui::{App, KeyBinding, actions};
+#[cfg(target_os = "macos")]
+use gpui::App;
+use gpui::actions;
 #[cfg(target_os = "macos")]
 use gpui::{Menu, MenuItem, SystemMenuType};
 
@@ -28,7 +30,9 @@ actions!(
         SpeedDown,
         SpeedReset,
         CycleAudio,
+        CycleAudioBack,
         CycleSubtitle,
+        CycleSubtitleBack,
         ToggleSubtitles,
         SubDelayIncrease,
         SubDelayDecrease,
@@ -80,171 +84,9 @@ actions!(
     ]
 );
 
+/// Key context of the player (everything but dialogs, menus and text fields).
+/// The key bindings themselves are in `keymap.rs`.
 pub const CTX: &str = "Player";
-
-/// (keystroke, human readable label) pairs; the label is shown in menus
-/// and the shortcuts dialog.
-pub fn bind_keys(cx: &mut App) {
-    let c = Some(CTX);
-    cx.bind_keys([
-        KeyBinding::new("space", TogglePause, c),
-        KeyBinding::new("k", TogglePause, c),
-        KeyBinding::new("p", TogglePause, c),
-        KeyBinding::new("secondary-.", Stop, c),
-        KeyBinding::new("n", PlayNext, c),
-        KeyBinding::new("shift-n", PlayPrevious, c),
-        KeyBinding::new(">", PlayNext, c),
-        KeyBinding::new("<", PlayPrevious, c),
-        KeyBinding::new("right", SeekForward, c),
-        KeyBinding::new("left", SeekBackward, c),
-        KeyBinding::new("l", SeekForward, c),
-        KeyBinding::new("j", SeekBackward, c),
-        KeyBinding::new("shift-right", SeekForwardSmall, c),
-        KeyBinding::new("shift-left", SeekBackwardSmall, c),
-        KeyBinding::new("secondary-right", SeekForwardLarge, c),
-        KeyBinding::new("secondary-left", SeekBackwardLarge, c),
-        KeyBinding::new("pageup", NextChapter, c),
-        KeyBinding::new("pagedown", PreviousChapter, c),
-        KeyBinding::new(".", FrameStep, c),
-        KeyBinding::new(",", FrameBackStep, c),
-        KeyBinding::new("up", VolumeUp, c),
-        KeyBinding::new("down", VolumeDown, c),
-        KeyBinding::new("m", ToggleMute, c),
-        KeyBinding::new("]", SpeedUp, c),
-        KeyBinding::new("[", SpeedDown, c),
-        KeyBinding::new("backspace", SpeedReset, c),
-        KeyBinding::new("b", CycleAudio, c),
-        KeyBinding::new("#", CycleAudio, c),
-        KeyBinding::new("c", CycleSubtitle, c),
-        KeyBinding::new("v", ToggleSubtitles, c),
-        KeyBinding::new("x", SubDelayIncrease, c),
-        KeyBinding::new("z", SubDelayDecrease, c),
-        KeyBinding::new("secondary-=", AudioDelayIncrease, c),
-        KeyBinding::new("secondary-+", AudioDelayIncrease, c),
-        KeyBinding::new("secondary--", AudioDelayDecrease, c),
-        KeyBinding::new("shift-g", SubScaleUp, c),
-        KeyBinding::new("shift-f", SubScaleDown, c),
-        KeyBinding::new("f", ToggleFullscreen, c),
-        KeyBinding::new("f11", ToggleFullscreen, c),
-        KeyBinding::new("alt-enter", ToggleFullscreen, c),
-        KeyBinding::new("escape", ExitFullscreen, c),
-        KeyBinding::new("s", Screenshot, c),
-        KeyBinding::new("i", ShowMediaInfo, c),
-        KeyBinding::new("secondary-i", ShowMediaInfo, c),
-        KeyBinding::new("a", ToggleAbLoop, c),
-        KeyBinding::new("shift-l", ToggleLoopFile, c),
-        KeyBinding::new("r", CycleRepeat, c),
-        KeyBinding::new("shift-s", ToggleShuffle, c),
-        KeyBinding::new("secondary-o", OpenFile, c),
-        KeyBinding::new("secondary-f", OpenFolder, c),
-        KeyBinding::new("secondary-u", OpenUrl, c),
-        KeyBinding::new("secondary-d", OpenDisc, c),
-        KeyBinding::new("secondary-shift-o", OpenSubtitle, c),
-        KeyBinding::new("secondary-s", SavePlaylist, c),
-        KeyBinding::new("secondary-,", ShowPreferences, c),
-        KeyBinding::new("secondary-p", ShowPreferences, c),
-        KeyBinding::new("secondary-e", ShowEffects, c),
-        KeyBinding::new("secondary-l", TogglePlaylist, c),
-        KeyBinding::new("secondary-m", ToggleMenubar, c),
-        KeyBinding::new("secondary-t", JumpToTime, c),
-        KeyBinding::new("secondary-g", JumpToTime, c),
-        KeyBinding::new("shift-a", CycleAspect, c),
-        KeyBinding::new("d", CycleDeinterlace, c),
-        KeyBinding::new("secondary-h", ToggleHwdec, c),
-        KeyBinding::new("secondary-r", RotateClockwise, c),
-        KeyBinding::new("alt-=", ZoomIn, c),
-        KeyBinding::new("alt-+", ZoomIn, c),
-        KeyBinding::new("alt--", ZoomOut, c),
-        KeyBinding::new("alt-backspace", ZoomReset, c),
-        KeyBinding::new("secondary-0", FitWindow, c),
-        KeyBinding::new("f1", ShowShortcuts, c),
-        KeyBinding::new("?", ShowShortcuts, c),
-        KeyBinding::new("secondary-q", Quit, None),
-        KeyBinding::new("escape", CloseOverlay, Some("Overlay")),
-        KeyBinding::new("1", Seek1, c),
-        KeyBinding::new("2", Seek2, c),
-        KeyBinding::new("3", Seek3, c),
-        KeyBinding::new("4", Seek4, c),
-        KeyBinding::new("5", Seek5, c),
-        KeyBinding::new("6", Seek6, c),
-        KeyBinding::new("7", Seek7, c),
-        KeyBinding::new("8", Seek8, c),
-        KeyBinding::new("9", Seek9, c),
-        KeyBinding::new("0", Seek0, c),
-        KeyBinding::new("home", Seek0, c),
-    ]);
-}
-
-/// Shortcut text for menus (platform-appropriate modifier names).
-pub fn shortcut(keys: &str) -> String {
-    let mac = cfg!(target_os = "macos");
-    keys.split(' ')
-        .map(|chord| {
-            chord
-                .split('-')
-                .map(|k| match k {
-                    "secondary" => if mac { "⌘" } else { "Ctrl" }.to_string(),
-                    "shift" => if mac { "⇧" } else { "Shift" }.to_string(),
-                    "alt" => if mac { "⌥" } else { "Alt" }.to_string(),
-                    "" => "-".to_string(),
-                    k if k.len() == 1 => k.to_uppercase(),
-                    k => {
-                        let mut c = k.chars();
-                        c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(if mac { "" } else { "+" })
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Everything in the shortcuts dialog.
-pub const SHORTCUTS: &[(&str, &str)] = &[
-    ("space / k", "Play / pause"),
-    ("left / right", "Seek 5 s (configurable)"),
-    ("shift-left / shift-right", "Seek 1 s (exact)"),
-    ("secondary-left / secondary-right", "Seek 60 s (configurable)"),
-    ("pageup / pagedown", "Next / previous chapter"),
-    ("1 … 9 / 0", "Jump to 10 % … 90 % / start"),
-    (". / ,", "Next / previous frame"),
-    ("up / down", "Volume up / down"),
-    ("m", "Mute"),
-    ("[ / ] / backspace", "Slower / faster / normal speed"),
-    ("n / shift-n", "Next / previous in playlist"),
-    ("b", "Cycle audio track"),
-    ("c / v", "Cycle subtitles / show-hide subtitles"),
-    ("z / x", "Subtitle delay −/+ 100 ms"),
-    ("secondary-- / secondary-=", "Audio delay −/+ 100 ms"),
-    ("shift-f / shift-g", "Subtitle size −/+"),
-    ("f / f11 / double-click", "Fullscreen"),
-    ("escape", "Leave fullscreen / close dialog"),
-    ("s", "Screenshot"),
-    ("i", "Media information"),
-    ("a", "A-B loop (set A, set B, clear)"),
-    ("shift-l", "Loop current file"),
-    ("r / shift-s", "Cycle repeat / toggle shuffle"),
-    ("shift-a", "Cycle aspect ratio"),
-    ("d", "Cycle deinterlacing"),
-    ("secondary-r", "Rotate 90°"),
-    ("alt-= / alt-- / alt-backspace", "Zoom in / out / reset"),
-    ("secondary-0", "Resize window to video"),
-    ("secondary-o", "Open file"),
-    ("secondary-f", "Open folder"),
-    ("secondary-u", "Open URL"),
-    ("secondary-d", "Open disc"),
-    ("secondary-shift-o", "Load subtitle file"),
-    ("secondary-s", "Save playlist"),
-    ("secondary-l", "Show / hide playlist"),
-    ("secondary-m", "Show / hide menu bar"),
-    ("secondary-t", "Jump to time"),
-    ("secondary-e", "Effects & filters"),
-    ("secondary-,", "Preferences"),
-    ("secondary-h", "Toggle hardware decoding"),
-    ("f1", "Keyboard shortcuts"),
-    ("secondary-q", "Quit"),
-];
 
 /// macOS gets a real menu bar; other platforms use the in-window one.
 #[cfg(target_os = "macos")]
@@ -308,6 +150,7 @@ pub fn set_native_menus(cx: &mut App) {
                 MenuItem::action("Mute", ToggleMute),
                 MenuItem::separator(),
                 MenuItem::action("Next Audio Track", CycleAudio),
+                MenuItem::action("Previous Audio Track", CycleAudioBack),
                 MenuItem::action("Increase Audio Delay", AudioDelayIncrease),
                 MenuItem::action("Decrease Audio Delay", AudioDelayDecrease),
                 MenuItem::separator(),
@@ -334,7 +177,8 @@ pub fn set_native_menus(cx: &mut App) {
         Menu {
             name: "Subtitles".into(),
             items: vec![
-                MenuItem::action("Next Subtitle Track", CycleSubtitle),
+                MenuItem::action("Next Subtitle Language", CycleSubtitle),
+                MenuItem::action("Previous Subtitle Language", CycleSubtitleBack),
                 MenuItem::action("Show / Hide Subtitles", ToggleSubtitles),
                 MenuItem::action("Load Subtitle File…", OpenSubtitle),
                 MenuItem::separator(),

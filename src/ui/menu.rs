@@ -2,11 +2,11 @@
 
 use super::player::PlayerView;
 use super::theme::Theme;
-use super::widgets::icon;
+use super::widgets::{icon, scrollbar, scrollbar_dragging};
 use crate::icons::Icon;
 use gpui::{
-    AnyElement, Bounds, Context, Corner, MouseButton, Pixels, Point, SharedString, Window, anchored, canvas, deferred,
-    div, point, prelude::*, px,
+    AnyElement, Bounds, Context, Corner, MouseButton, Pixels, Point, ScrollHandle, SharedString, Window, anchored,
+    canvas, deferred, div, point, prelude::*, px,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -53,9 +53,10 @@ impl MenuItem {
         let enabled = !items.is_empty();
         MenuItem::Submenu { label: label.into(), icon: None, enabled, items }
     }
-    pub fn shortcut(mut self, keys: &str) -> Self {
+    /// Shows the current shortcut of `action` (see `keymap`).
+    pub fn shortcut_of(mut self, action: &dyn gpui::Action) -> Self {
         if let MenuItem::Action { shortcut, .. } = &mut self {
-            *shortcut = Some(super::actions::shortcut(keys).into());
+            *shortcut = super::keymap::shortcut_for(action).map(Into::into);
         }
         self
     }
@@ -100,6 +101,23 @@ pub struct OpenMenu {
     /// Measured on-screen bounds of the open submenu row at each level, so
     /// submenu panels can be anchored next to it (GPUI can't nest `deferred`).
     pub anchors: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    /// Scroll position of the panel at each nesting level, with the submenu
+    /// path it belongs to (another submenu starts at the top).
+    pub scrolls: RefCell<Vec<(Vec<usize>, ScrollHandle)>>,
+}
+
+impl OpenMenu {
+    fn scroll(&self, level: usize) -> ScrollHandle {
+        let path: Vec<usize> = self.open_path.iter().take(level).copied().collect();
+        let mut s = self.scrolls.borrow_mut();
+        if s.len() <= level {
+            s.resize_with(level + 1, Default::default);
+        }
+        if s[level].0 != path {
+            s[level] = (path, ScrollHandle::new());
+        }
+        s[level].1.clone()
+    }
 }
 
 const ITEM_H: f32 = 28.0;
@@ -120,6 +138,7 @@ impl PlayerView {
             menubar_index,
             min_width: px(MENU_W),
             anchors: Default::default(),
+            scrolls: Default::default(),
         });
         cx.notify();
     }
@@ -134,6 +153,8 @@ impl PlayerView {
         let menu = self.menu.as_ref()?;
         let theme = self.theme;
         let win_w = window.viewport_size().width;
+        // Taller menus scroll rather than run off a short window.
+        let max_h = (window.viewport_size().height - px(16.)).clamp(px(120.), px(560.));
         let open_left = menu.pos.x + px(MENU_W * 2.0) > win_w;
         let mut layer = div().absolute().top_0().left_0().size_full().child(
             div()
@@ -164,6 +185,7 @@ impl PlayerView {
             &menu.open_path,
             theme,
             menu.min_width,
+            (max_h, menu.scroll(0)),
             &menu.anchors,
             cx,
         )));
@@ -178,17 +200,18 @@ impl PlayerView {
             } else {
                 (point(row.right() + px(4.), row.top() - px(5.)), Corner::TopLeft)
             };
-            layer = layer.child(
-                anchored().position(pos).anchor(corner).snap_to_window_with_margin(px(4.)).child(self.menu_panel(
+            layer = layer.child(anchored().position(pos).anchor(corner).snap_to_window_with_margin(px(4.)).child(
+                self.menu_panel(
                     sub,
                     level + 1,
                     &menu.open_path,
                     theme,
                     px(200.),
+                    (max_h, menu.scroll(level + 1)),
                     &menu.anchors,
                     cx,
-                )),
-            );
+                ),
+            ));
             items = sub;
         }
         Some(deferred(layer).with_priority(10).into_any_element())
@@ -202,6 +225,7 @@ impl PlayerView {
         open_path: &[usize],
         theme: Theme,
         min_width: Pixels,
+        (max_h, scroll): (Pixels, ScrollHandle),
         anchors: &Rc<RefCell<Vec<Bounds<Pixels>>>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -210,14 +234,12 @@ impl PlayerView {
                 || matches!(i, MenuItem::Action { icon: Some(_), .. })
                 || matches!(i, MenuItem::Submenu { icon: Some(_), .. })
         });
-        let mut panel = div()
-            .id(SharedString::from(format!("menu-panel-{level}")))
+        let frame = div()
+            .relative()
             .flex()
             .flex_col()
             .min_w(min_width)
-            .max_h(px(560.))
-            .overflow_y_scroll()
-            .py_1()
+            .max_h(max_h)
             .bg(theme.popup)
             .border_1()
             .border_color(theme.border)
@@ -226,12 +248,22 @@ impl PlayerView {
             .text_size(px(13.))
             .text_color(theme.text)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let mut panel = div()
+            .id(SharedString::from(format!("menu-panel-{level}")))
+            .flex()
+            .flex_col()
+            .flex_shrink()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .py_1();
         for (i, item) in items.iter().enumerate() {
             let open_here = open_path.get(level) == Some(&i);
             let path_prefix: Vec<usize> = open_path.iter().take(level).copied().collect();
             let el: AnyElement = match item {
-                MenuItem::Separator => div().h(px(1.)).my_1().mx_2().bg(theme.border).into_any_element(),
+                MenuItem::Separator => div().flex_none().h(px(1.)).my_1().mx_2().bg(theme.border).into_any_element(),
                 MenuItem::Header(t) => div()
+                    .flex_none()
                     .px_3()
                     .pt_1()
                     .pb(px(2.))
@@ -259,6 +291,7 @@ impl PlayerView {
                     div()
                         .id(SharedString::from(format!("mi-{level}-{i}")))
                         .h(px(ITEM_H))
+                        .flex_none()
                         .mx_1()
                         .px_2()
                         .gap_2()
@@ -272,6 +305,7 @@ impl PlayerView {
                         .when_some(shortcut.clone(), |d, sc| d.child(div().text_size(px(11.)).opacity(0.65).child(sc)))
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                             if *hovered
+                                && !scrollbar_dragging()
                                 && let Some(m) = this.menu.as_mut()
                                 && m.open_path.len() > pp.len()
                             {
@@ -298,6 +332,7 @@ impl PlayerView {
                         .id(SharedString::from(format!("ms-{level}-{i}")))
                         .relative()
                         .h(px(ITEM_H))
+                        .flex_none()
                         .mx_1()
                         .px_2()
                         .gap_2()
@@ -319,6 +354,7 @@ impl PlayerView {
                         row = row
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                 if *hovered
+                                    && !scrollbar_dragging()
                                     && let Some(m) = this.menu.as_mut()
                                     && m.open_path != pp
                                 {
@@ -361,7 +397,7 @@ impl PlayerView {
             };
             panel = panel.child(el);
         }
-        panel.into_any_element()
+        frame.child(panel).child(scrollbar(format!("menu-bar-{level}"), &scroll, theme)).into_any_element()
     }
 }
 

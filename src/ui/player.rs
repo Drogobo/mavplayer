@@ -138,7 +138,13 @@ pub struct PlayerView {
     pub drag: Option<Drag>,
     pub seek_hover: Option<f32>,
     pub scrub: Option<Scrub>,
+    /// The playlist beside the video in a window (saved in settings).
     pub show_playlist: bool,
+    /// The playlist in fullscreen, when "hide in fullscreen" gives fullscreen
+    /// its own state (it starts hidden every time).
+    pub fs_playlist: bool,
+    /// Fullscreen as of the last render.
+    pub in_fullscreen: bool,
     pub playlist_selected: Option<usize>,
     pub ab_loop: (Option<f64>, Option<f64>),
     pub loop_file: bool,
@@ -149,6 +155,16 @@ pub struct PlayerView {
     pub video_adjust: VideoAdjust,
     pub sub_delay: f64,
     pub subs_visible: bool,
+    /// The user turned subtitles on or off this session: later files follow
+    /// that instead of the "always show subtitles" setting.
+    pub subs_on: Option<bool>,
+    /// The shortcuts dialog is waiting for the keystroke to add to this command.
+    pub capturing_key: Option<&'static str>,
+    /// What the last change in the shortcuts dialog did (shown there).
+    pub shortcut_note: Option<String>,
+    /// Scroll positions of the dialog areas that draw a scrollbar.
+    pub modal_scroll: gpui::ScrollHandle,
+    pub options_scroll: gpui::ScrollHandle,
     pub dvd_titles: Option<(String, Vec<DvdTitle>)>,
     pub reading_disc: bool,
     pub fitted_for: Option<u64>,
@@ -322,6 +338,22 @@ impl PlayerView {
         .detach();
 
         let mut subs = vec![];
+        // The shortcuts dialog records the next keystroke before any binding
+        // can act on it.
+        let me = cx.entity().downgrade();
+        let wid = window.window_handle().window_id();
+        subs.push(cx.intercept_keystrokes(move |ev, window, cx| {
+            if window.window_handle().window_id() != wid || super::keymap::is_modifier_only(&ev.keystroke) {
+                return;
+            }
+            let Some(me) = me.upgrade() else { return };
+            if me.read(cx).capturing_key.is_none() {
+                return;
+            }
+            cx.stop_propagation();
+            let ks = ev.keystroke.clone();
+            me.update(cx, |v, cx| v.capture_keystroke(&ks, cx));
+        }));
         subs.push(cx.observe_window_appearance(window, |v, window, cx| {
             v.theme = Theme::resolve(v.settings.theme, window);
             cx.notify();
@@ -352,6 +384,8 @@ impl PlayerView {
         let mut v = Self {
             playlist: Playlist::new(settings.repeat, settings.shuffle),
             show_playlist: settings.show_playlist,
+            fs_playlist: false,
+            in_fullscreen: window.is_fullscreen(),
             player,
             resume,
             theme,
@@ -385,6 +419,11 @@ impl PlayerView {
             video_adjust: VideoAdjust::default(),
             sub_delay: 0.0,
             subs_visible: true,
+            subs_on: None,
+            capturing_key: None,
+            shortcut_note: None,
+            modal_scroll: gpui::ScrollHandle::new(),
+            options_scroll: gpui::ScrollHandle::new(),
             dvd_titles: None,
             reading_disc: false,
             fitted_for: None,
@@ -842,7 +881,7 @@ impl PlayerView {
         let Some(src) = st.source else { return };
         let pos = self.player.position();
         let paused = self.player.paused();
-        self.player.set_config(self.settings.engine_config());
+        self.player.set_config(self.engine_config());
         self.player.load(src, LoadOptions { start_at: Some(pos), start_paused: paused, ..Default::default() });
         cx.notify();
     }
@@ -949,7 +988,7 @@ impl PlayerView {
         }
         // A few workers (probing is mostly waiting on the disk), with results
         // shown as they arrive rather than after the whole list.
-        let cfg = self.settings.engine_config();
+        let cfg = self.engine_config();
         let queue = Arc::new(parking_lot::Mutex::new(VecDeque::from(todo)));
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
@@ -1024,7 +1063,7 @@ impl PlayerView {
     }
 
     fn probe_dvd_titles(&mut self, path: String, then_play: Option<()>, window: &mut Window, cx: &mut Context<Self>) {
-        let cfg = self.settings.engine_config();
+        let cfg = self.engine_config();
         let p = path.clone();
         let task = cx.background_executor().spawn(async move { disc::probe_titles(&p, &cfg, 99) });
         cx.spawn_in(window, async move |this, cx| {
@@ -1128,6 +1167,39 @@ impl PlayerView {
         window.is_fullscreen()
     }
 
+    /// Fullscreen has its own playlist state (starting hidden) when the
+    /// "hide in fullscreen" setting is on; otherwise it shares the window's.
+    fn fs_playlist_separate(&self, fullscreen: bool) -> bool {
+        fullscreen && self.settings.hide_playlist_in_fullscreen
+    }
+
+    /// Whether the playlist is shown (as of the last render's fullscreen state).
+    pub fn playlist_shown(&self) -> bool {
+        if self.fs_playlist_separate(self.in_fullscreen) { self.fs_playlist } else { self.show_playlist }
+    }
+
+    pub fn toggle_playlist(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.fs_playlist_separate(window.is_fullscreen()) {
+            self.fs_playlist = !self.fs_playlist;
+        } else {
+            self.show_playlist = !self.show_playlist;
+            self.settings.show_playlist = self.show_playlist;
+        }
+        cx.notify();
+    }
+
+    /// Called every render: entering fullscreen starts with the playlist
+    /// hidden (if set so); leaving it brings back the window's layout.
+    pub fn track_fullscreen(&mut self, window: &Window) {
+        let fs = window.is_fullscreen();
+        if fs != self.in_fullscreen {
+            self.in_fullscreen = fs;
+            if fs {
+                self.fs_playlist = false;
+            }
+        }
+    }
+
     pub fn input(
         &mut self,
         key: &'static str,
@@ -1192,6 +1264,7 @@ impl PlayerView {
             let _ = std::fs::create_dir_all(crate::settings::config_dir());
             let _ = std::fs::write(crate::integration::prompt_marker(), b"asked");
         }
+        self.capturing_key = None;
         if self.dialog.take().is_some() {
             self.settings.save();
         }
@@ -1199,8 +1272,17 @@ impl PlayerView {
         cx.notify();
     }
 
+    /// The engine settings, with this session's subtitle on/off choice.
+    pub fn engine_config(&self) -> crate::engine::EngineConfig {
+        let mut c = self.settings.engine_config();
+        if let Some(on) = self.subs_on {
+            c.subs_enabled_by_default = on;
+        }
+        c
+    }
+
     pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
-        self.player.set_config(self.settings.engine_config());
+        self.player.set_config(self.engine_config());
         icons::set_use_system_theme(self.settings.icon_theme == crate::settings::IconTheme::System);
         self.settings.save();
         cx.notify();
@@ -1232,7 +1314,47 @@ impl PlayerView {
         })
     }
 
-    fn cycle_track(&mut self, kind: TrackKind, cx: &mut Context<Self>) {
+    /// Subtitles are on screen (a track is chosen and not hidden).
+    pub fn subs_shown(&self) -> bool {
+        self.subs_visible && self.player.with_state(|s| s.selected.subtitle.is_some())
+    }
+
+    /// The subtitle track to show when the user asks for subtitles.
+    fn best_subtitle(&self) -> Option<TrackId> {
+        let langs = self.settings.engine_config().sub_langs;
+        self.player
+            .with_state(|s| s.media.as_ref().and_then(|m| engine::pick_subtitle(m, s.selected.audio, &langs, true)))
+    }
+
+    /// Show / hide subtitles. Showing picks the best track by itself when
+    /// none is chosen yet, and later files follow the choice.
+    fn toggle_subtitles(&mut self, cx: &mut Context<Self>) {
+        let cur = self.player.with_state(|s| s.selected.subtitle);
+        if self.subs_visible && cur.is_some() {
+            self.subs_visible = false;
+            self.subs_on = Some(false);
+            self.player.set_config(self.engine_config());
+            self.osd("Subtitles off", cx);
+            return;
+        }
+        let Some(id) = cur.or_else(|| self.best_subtitle()) else {
+            self.osd("No subtitles", cx);
+            return;
+        };
+        self.subs_on = Some(true);
+        self.player.set_config(self.engine_config());
+        if cur.is_none() {
+            self.select_track(TrackKind::Subtitle, Some(id), cx);
+        } else {
+            self.subs_visible = true;
+            let label = self.track_label(TrackKind::Subtitle, Some(id));
+            self.osd(format!("Subtitles: {label}"), cx);
+        }
+    }
+
+    /// Next (`step` 1) or previous (-1) track. Subtitles move between
+    /// languages; when they are off, this turns them on with the best one.
+    fn cycle_track(&mut self, kind: TrackKind, step: isize, cx: &mut Context<Self>) {
         let (ids, cur) = self.player.with_state(|s| {
             let ids: Vec<TrackId> = s
                 .media
@@ -1250,12 +1372,18 @@ impl PlayerView {
             self.osd(if kind == TrackKind::Audio { "No audio tracks" } else { "No subtitles" }, cx);
             return;
         }
-        let mut options: Vec<Option<TrackId>> = ids.into_iter().map(Some).collect();
+        let pos = ids.iter().position(|i| Some(*i) == cur);
+        let next = match pos {
+            Some(_) if kind == TrackKind::Subtitle && !self.subs_visible => cur,
+            Some(p) => Some(ids[(p as isize + step).rem_euclid(ids.len() as isize) as usize]),
+            None if kind == TrackKind::Subtitle => self.best_subtitle().or(Some(ids[0])),
+            None => Some(ids[0]),
+        };
         if kind == TrackKind::Subtitle {
-            options.push(None);
+            self.subs_on = Some(true);
+            self.player.set_config(self.engine_config());
         }
-        let pos = options.iter().position(|o| *o == cur).map(|p| (p + 1) % options.len()).unwrap_or(0);
-        self.select_track(kind, options[pos], cx);
+        self.select_track(kind, next, cx);
     }
 
     pub fn set_volume(&mut self, v: f64, cx: &mut Context<Self>) {
@@ -1555,13 +1683,11 @@ impl PlayerView {
                 this.set_speed(n, cx)
             },
             SpeedReset => |this, _w, cx| this.set_speed(1.0, cx),
-            CycleAudio => |this, _w, cx| this.cycle_track(TrackKind::Audio, cx),
-            CycleSubtitle => |this, _w, cx| this.cycle_track(TrackKind::Subtitle, cx),
-            ToggleSubtitles => |this, _w, cx| {
-                this.subs_visible = !this.subs_visible;
-                let v = this.subs_visible;
-                this.osd(if v { "Subtitles shown" } else { "Subtitles hidden" }, cx)
-            },
+            CycleAudio => |this, _w, cx| this.cycle_track(TrackKind::Audio, 1, cx),
+            CycleAudioBack => |this, _w, cx| this.cycle_track(TrackKind::Audio, -1, cx),
+            CycleSubtitle => |this, _w, cx| this.cycle_track(TrackKind::Subtitle, 1, cx),
+            CycleSubtitleBack => |this, _w, cx| this.cycle_track(TrackKind::Subtitle, -1, cx),
+            ToggleSubtitles => |this, _w, cx| this.toggle_subtitles(cx),
             SubDelayIncrease => |this, _w, cx| { this.sub_delay += 0.1; let d = this.sub_delay; this.osd(format!("Subtitle delay {:+.0} ms", d * 1000.0), cx) },
             SubDelayDecrease => |this, _w, cx| { this.sub_delay -= 0.1; let d = this.sub_delay; this.osd(format!("Subtitle delay {:+.0} ms", d * 1000.0), cx) },
             AudioDelayIncrease => |this, _w, cx| { let d = this.player.audio_delay() + 0.1; this.player.set_audio_delay(d); this.osd(format!("Audio delay {:+.0} ms", d * 1000.0), cx) },
@@ -1608,11 +1734,12 @@ impl PlayerView {
             SavePlaylist => |this, w, cx| this.save_playlist(w, cx),
             ShowPreferences => |this, w, cx| this.show_dialog(Dialog::Settings(0), w, cx),
             ShowEffects => |this, w, cx| this.show_dialog(Dialog::Effects(0), w, cx),
-            TogglePlaylist => |this, _w, _cx| { this.show_playlist = !this.show_playlist; this.settings.show_playlist = this.show_playlist },
+            TogglePlaylist => |this, w, cx| this.toggle_playlist(w, cx),
             ToggleMenubar => |this, _w, cx| {
                 this.settings.show_menubar = !this.settings.show_menubar;
                 this.settings.save();
-                if !this.settings.show_menubar { this.osd("Menu bar hidden — right-click or press Ctrl+M to bring it back", cx) }
+                if !this.settings.show_menubar { let k = super::keymap::shortcut_for(&ToggleMenubar).map(|k| format!(" or press {k}")).unwrap_or_default();
+                    this.osd(format!("Menu bar hidden — right-click{k} to bring it back"), cx)  }
             },
             JumpToTime => |this, w, cx| this.show_dialog(Dialog::JumpTo, w, cx),
             CycleAspect => |this, _w, cx| {

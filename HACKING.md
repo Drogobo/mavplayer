@@ -318,9 +318,10 @@ files:
 | `menus.rs` | Contents of the menu bar menus, context menu and control-bar popups |
 | `menu.rs` | The in-window popup menu widget (`MenuItem`, submenus) |
 | `dialogs.rs` | Preferences, Effects & Filters, Media Info, Open URL/Disc, Jump to Time, About, Shortcuts, Integration |
-| `actions.rs` | GPUI actions, key bindings, the shortcut list, the macOS native menu |
+| `actions.rs` | GPUI actions and the macOS native menu |
+| `keymap.rs` | Every rebindable command with its default keys (`COMMANDS`), the user's changes (`Settings::key_bindings`), applying them to GPUI, shortcut labels for menus |
 | `theme.rs` | Light/dark palettes |
-| `widgets.rs` | Small helpers: `icon()`, tooltips, time formatting/parsing |
+| `widgets.rs` | Small helpers: `icon()`, tooltips, the draggable `scrollbar()`, time formatting/parsing |
 | `text_input.rs` | Single-line text field |
 
 Video frames reach GPUI as `RenderImage`s. Old textures are released a few frames
@@ -330,11 +331,13 @@ later with `window.drop_image`, because GPUI frees atlas textures immediately.
 
 **Add a keyboard shortcut / action**
 1. Add the action name to `actions!(…)` in `ui/actions.rs`.
-2. Bind it in `bind_keys` (`"secondary-x"` means Ctrl on Linux/Windows and ⌘ on
-   macOS) and add a row to `SHORTCUTS`.
+2. Add it to `COMMANDS` in `ui/keymap.rs` with a label, a group and its default
+   keys (`"secondary-x"` means Ctrl on Linux/Windows and ⌘ on macOS). This is
+   what binds it, lists it in the Keyboard Shortcuts dialog and lets users
+   change it. A unit test rejects default keys two commands share.
 3. Handle it in `PlayerView::register_actions` in `ui/player.rs`.
 4. Optionally add it to a menu in `ui/menus.rs` with `act("Label", MyAction)`,
-   which shows the shortcut automatically.
+   which shows its current shortcut automatically.
 
 **Add a setting**
 1. Add a field to `Settings` in `settings.rs` and give it a default in

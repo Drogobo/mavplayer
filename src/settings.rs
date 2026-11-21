@@ -6,7 +6,7 @@ use crate::engine::{
     Upscaler,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +158,12 @@ pub struct Settings {
     pub double_click_fullscreen: bool,
     pub scroll_action: ScrollAction,
     pub show_playlist: bool,
+    /// Going fullscreen starts with the playlist hidden, whatever the window
+    /// showed (it can still be opened there; leaving restores the window's).
+    pub hide_playlist_in_fullscreen: bool,
+    /// Keyboard shortcuts changed from the defaults: command id (see
+    /// `ui::keymap::COMMANDS`) to its keystrokes. An empty list unbinds it.
+    pub key_bindings: BTreeMap<String, Vec<String>>,
     /// Controls shown in the bottom bar, in order.
     #[serde(deserialize_with = "de_bar_controls")]
     pub bar_controls: Vec<BarControl>,
@@ -214,7 +220,13 @@ pub struct Settings {
     pub window_size: Option<(f32, f32)>,
     pub recent: Vec<MediaSource>,
     pub last_dir: Option<PathBuf>,
+    /// Which defaults this file was written with (see `Settings::from_value`).
+    pub config_version: u32,
 }
+
+/// Bumped when a changed default should also reach settings files that
+/// still hold the old default (see `Settings::from_value`).
+const CONFIG_VERSION: u32 = 1;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -230,6 +242,8 @@ impl Default for Settings {
             double_click_fullscreen: true,
             scroll_action: ScrollAction::Volume,
             show_playlist: false,
+            hide_playlist_in_fullscreen: true,
+            key_bindings: BTreeMap::new(),
             bar_controls: BarControl::ALL.to_vec(),
             resume_playback: true,
             auto_play_next: true,
@@ -244,7 +258,7 @@ impl Default for Settings {
             exact_seeks: true,
             seek_drag: SeekDragMode::KeepPlaying,
             screenshot_dir: None,
-            hwdec: HwDecode::Auto,
+            hwdec: HwDecode::Always,
             deinterlace: Deinterlace::Auto,
             scale_quality: ScaleQuality::Good,
             upscaler: Upscaler::Bilinear,
@@ -276,12 +290,26 @@ impl Default for Settings {
             window_size: None,
             recent: Vec::new(),
             last_dir: None,
+            config_version: CONFIG_VERSION,
         }
     }
 }
 
 fn split_langs(s: &str) -> Vec<String> {
     s.split([',', ' ', ';']).map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+}
+
+/// The user's own subtitle languages, then the system's (so "auto" means
+/// the desktop language, and a list that matches nothing still falls back
+/// to it).
+fn sub_lang_prefs(own: &str) -> Vec<String> {
+    let mut v = split_langs(own);
+    for l in crate::engine::system_languages() {
+        if !v.iter().any(|x| crate::engine::language_matches(x, &l)) {
+            v.push(l);
+        }
+    }
+    v
 }
 
 impl Settings {
@@ -300,7 +328,7 @@ impl Settings {
             shader_sharpen: self.shader_sharpen,
             tone_map_hdr: self.tone_map_hdr,
             audio_langs: split_langs(&self.audio_langs),
-            sub_langs: split_langs(&self.sub_langs),
+            sub_langs: sub_lang_prefs(&self.sub_langs),
             subs_enabled_by_default: self.subs_enabled_by_default,
             auto_load_subs: self.auto_load_subs,
             sub_charset: Some(self.sub_charset.trim().to_string()).filter(|s| !s.is_empty()),
@@ -376,10 +404,17 @@ impl Settings {
         // Before upscaling had its own setting, choosing nearest-neighbour
         // scaling also enlarged with it: keep that for old settings files.
         let had_upscaler = v.get("upscaler").is_some();
+        let version = v.get("config_version").and_then(|x| x.as_u64()).unwrap_or(0);
         let mut s: Settings = serde_json::from_value(v)?;
         if !had_upscaler && s.scale_quality == ScaleQuality::Nearest {
             s.upscaler = Upscaler::Nearest;
         }
+        // Version 1: hardware decoding defaults to Always. Older files saved
+        // the old default (Automatic) whether or not anyone chose it.
+        if version < 1 && s.hwdec == HwDecode::Auto {
+            s.hwdec = HwDecode::Always;
+        }
+        s.config_version = CONFIG_VERSION;
         Ok(s)
     }
     pub fn save(&self) {
@@ -488,5 +523,15 @@ mod tests {
         assert_eq!(load(r#"{"scale_quality":"Good"}"#).upscaler, Upscaler::Bilinear);
         assert_eq!(load(r#"{"scale_quality":"Nearest","upscaler":"Bilinear"}"#).upscaler, Upscaler::Bilinear);
         assert_eq!(load(r#"{"upscaler":"Anime4K"}"#).upscaler, Upscaler::Anime4K);
+    }
+
+    #[test]
+    fn old_automatic_hwdec_becomes_always() {
+        let load = |j: &str| Settings::from_value(serde_json::from_str(j).unwrap()).unwrap();
+        assert_eq!(Settings::default().hwdec, HwDecode::Always);
+        assert_eq!(load(r#"{"hwdec":"Auto"}"#).hwdec, HwDecode::Always);
+        assert_eq!(load(r#"{"hwdec":"Off"}"#).hwdec, HwDecode::Off);
+        // Chosen after the change: kept.
+        assert_eq!(load(r#"{"hwdec":"Auto","config_version":1}"#).hwdec, HwDecode::Auto);
     }
 }

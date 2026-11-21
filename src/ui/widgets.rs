@@ -2,7 +2,12 @@
 
 use super::theme::Theme;
 use crate::icons::Icon;
-use gpui::{AnyView, App, Context, Hsla, IntoElement, Pixels, SharedString, Window, div, prelude::*, px, svg};
+use gpui::{
+    AnyView, App, Bounds, Context, DispatchPhase, HitboxBehavior, Hsla, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, ScrollHandle, SharedString, Window, canvas, div, fill, point, prelude::*, px,
+    svg,
+};
+use std::cell::RefCell;
 
 pub fn icon(i: Icon, size: Pixels, color: Hsla) -> impl IntoElement {
     svg().path(i.path()).size(size).flex_none().text_color(color)
@@ -33,6 +38,130 @@ impl Render for Tooltip {
 pub fn tooltip(text: impl Into<SharedString>, theme: Theme) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
     let text = text.into();
     move |_w, cx| cx.new(|_| Tooltip { text: text.clone(), theme }).into()
+}
+
+thread_local! {
+    /// The scrollbar being dragged (by id) and where on its thumb it was grabbed.
+    static SCROLL_DRAG: RefCell<Option<(SharedString, Pixels)>> = const { RefCell::new(None) };
+}
+
+/// A scrollbar thumb is being dragged (hover effects elsewhere should wait).
+pub fn scrollbar_dragging() -> bool {
+    SCROLL_DRAG.with(|d| d.borrow().is_some())
+}
+
+/// Width of the area a scrollbar takes at the right edge of its scroll area.
+pub const SCROLLBAR_W: f32 = 10.0;
+
+/// The thumb's place in `track` for a viewport of `view` over `max` more
+/// pixels of content, scrolled `scrolled` down: (top, height).
+fn thumb_geometry(track: Bounds<Pixels>, view: Pixels, max: Pixels, scrolled: Pixels) -> (Pixels, Pixels) {
+    let len = track.size.height;
+    let h = (len * (view / (view + max))).max(px(24.)).min(len);
+    let frac = (scrolled / max).clamp(0., 1.);
+    (track.top() + (len - h) * frac, h)
+}
+
+/// A vertical scrollbar for the scroll area tracked by `handle`: a thumb
+/// that can be dragged, with clicks on the track jumping there. Put it in a
+/// `relative()` parent next to the scroll area (not inside it, or it would
+/// scroll away); it fills that parent's right edge and draws nothing while
+/// everything fits. Wheel scrolling still reaches the area under it.
+pub fn scrollbar(id: impl Into<SharedString>, handle: &ScrollHandle, theme: Theme) -> impl IntoElement {
+    let id: SharedString = id.into();
+    let handle = handle.clone();
+    let h2 = handle.clone();
+    canvas(
+        move |bounds, window, _| {
+            // The scroll area is an earlier sibling, so its size is current.
+            (h2.max_offset().height > px(0.5))
+                .then(|| window.insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll))
+        },
+        move |bounds, hitbox, window, _| {
+            let Some(hitbox) = hitbox else { return };
+            let max = handle.max_offset().height;
+            let view = handle.bounds().size.height;
+            if max <= px(0.5) || view <= px(0.) {
+                return;
+            }
+            let track = Bounds::new(
+                point(bounds.left(), bounds.top() + px(3.)),
+                gpui::size(bounds.size.width, bounds.size.height - px(6.)),
+            );
+            let offset = handle.offset();
+            let (top, h) = thumb_geometry(track, view, max, -offset.y);
+            let dragging = SCROLL_DRAG.with(|d| d.borrow().as_ref().is_some_and(|(i, _)| *i == id));
+            let hovered = hitbox.is_hovered(window);
+            let w = if hovered || dragging { px(8.) } else { px(5.) };
+            let alpha = if dragging {
+                0.75
+            } else if hovered {
+                0.6
+            } else {
+                0.4
+            };
+            let thumb = Bounds::new(point(bounds.right() - w - px(2.), top), gpui::size(w, h));
+            window.paint_quad(fill(thumb, theme.text_dim.opacity(alpha)).corner_radii(w / 2.));
+
+            // Moves the thumb's top to `y - grab`.
+            let scroll_to = {
+                let handle = handle.clone();
+                move |y: Pixels, grab: Pixels| {
+                    let room = track.size.height - h;
+                    let frac = if room > px(0.) { ((y - grab - track.top()) / room).clamp(0., 1.) } else { 0. };
+                    handle.set_offset(point(offset.x, -(max * frac)));
+                }
+            };
+            let (id1, id2, id3) = (id.clone(), id.clone(), id.clone());
+            let hb = hitbox.clone();
+            let down = scroll_to.clone();
+            window.on_mouse_event(move |ev: &MouseDownEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble || ev.button != MouseButton::Left || !hb.is_hovered(window) {
+                    return;
+                }
+                let y = ev.position.y;
+                let grab = if y >= top && y <= top + h { y - top } else { h / 2. };
+                SCROLL_DRAG.with(|d| *d.borrow_mut() = Some((id1.clone(), grab)));
+                down(y, grab);
+                window.refresh();
+                cx.stop_propagation();
+            });
+            let hb = hitbox.clone();
+            window.on_mouse_event(move |ev: &MouseMoveEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let grab = SCROLL_DRAG.with(|d| d.borrow().as_ref().filter(|(i, _)| *i == id2).map(|(_, g)| *g));
+                match grab {
+                    Some(_) if !ev.dragging() => {
+                        SCROLL_DRAG.with(|d| *d.borrow_mut() = None);
+                        window.refresh();
+                    }
+                    Some(grab) => {
+                        scroll_to(ev.position.y, grab);
+                        window.refresh();
+                        cx.stop_propagation();
+                    }
+                    None if hb.is_hovered(window) != hovered => window.refresh(),
+                    None => {}
+                }
+            });
+            window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble
+                    && SCROLL_DRAG.with(|d| d.borrow().as_ref().is_some_and(|(i, _)| *i == id3))
+                {
+                    SCROLL_DRAG.with(|d| *d.borrow_mut() = None);
+                    window.refresh();
+                    cx.stop_propagation();
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .right_0()
+    .bottom_0()
+    .w(px(SCROLLBAR_W))
 }
 
 /// Playback speed slider range. The scale is logarithmic so 1× sits in the
@@ -131,6 +260,16 @@ mod tests {
         assert_eq!(format_speed(0.5), "0.5×");
         assert_eq!(format_speed(1.1500000000000001), "1.15×");
     }
+    #[test]
+    fn scrollbar_thumb() {
+        let track = Bounds::new(point(px(0.), px(100.)), gpui::size(px(10.), px(200.)));
+        // Content twice the viewport: half-height thumb, top to bottom.
+        assert_eq!(thumb_geometry(track, px(200.), px(200.), px(0.)), (px(100.), px(100.)));
+        assert_eq!(thumb_geometry(track, px(200.), px(200.), px(200.)), (px(200.), px(100.)));
+        // Very long content: the thumb keeps a usable size.
+        assert_eq!(thumb_geometry(track, px(200.), px(100000.), px(0.)).1, px(24.));
+    }
+
     #[test]
     fn time_roundtrip() {
         assert_eq!(format_time(3725.4), "1:02:05");

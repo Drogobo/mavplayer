@@ -1,9 +1,9 @@
 //! Modal dialogs: preferences, effects, media info, open URL / disc, etc.
 
-use super::actions::{SHORTCUTS, shortcut};
+use super::keymap::{self, Command};
 use super::menu::MenuItem as M;
 use super::player::PlayerView;
-use super::widgets::{format_size, format_time, icon, parse_time};
+use super::widgets::{SCROLLBAR_W, format_size, format_time, icon, parse_time, scrollbar};
 use crate::engine::{
     self, Anime4KMode, Anime4KQuality, AudioFx, ChannelMode, Deinterlace, EQ_BANDS, HwDecode, ScaleQuality, TrackKind,
     Upscaler, VideoAdjust, disc,
@@ -53,6 +53,9 @@ impl PlayerView {
     pub fn show_dialog(&mut self, d: Dialog, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         self.dialog = Some(d);
+        // Every dialog (and settings tab) opens scrolled to the top.
+        self.modal_scroll.set_offset(gpui::Point::default());
+        self.options_scroll.set_offset(gpui::Point::default());
         match d {
             Dialog::OpenUrl => {
                 let input = self.input("url", "https://… or a file path", window, cx);
@@ -65,6 +68,13 @@ impl PlayerView {
                 let input = self.input("jump", "h:mm:ss, mm:ss, seconds or 1h2m3s", window, cx);
                 let now = format_time(self.player.position());
                 input.update(cx, |i, cx| i.set_text(now, cx));
+                window.focus(&input.focus_handle(cx));
+            }
+            Dialog::Shortcuts => {
+                let input = self.input("shortcut_search", "Search commands or keys", window, cx);
+                input.update(cx, |i, cx| i.set_text(String::new(), cx));
+                self.capturing_key = None;
+                self.shortcut_note = None;
                 window.focus(&input.focus_handle(cx));
             }
             Dialog::Settings(_) => {
@@ -141,6 +151,7 @@ impl PlayerView {
                 None => self.osd("Couldn't understand that time", cx),
             },
             "volume" => self.finish_volume_edit(true, window, cx),
+            "shortcut_search" => {}
             _ => self.close_dialog(window, cx),
         }
     }
@@ -148,12 +159,17 @@ impl PlayerView {
     pub fn on_input_changed(&mut self, key: &'static str, cx: &mut Context<Self>) {
         let text = self.inputs.get(key).map(|i| i.read(cx).text()).unwrap_or_default();
         match key {
+            "shortcut_search" => {
+                self.modal_scroll.set_offset(gpui::Point::default());
+                cx.notify();
+                return;
+            }
             "audio_langs" => self.settings.audio_langs = text,
             "sub_langs" => self.settings.sub_langs = text,
             "sub_charset" => self.settings.sub_charset = text,
             _ => return,
         }
-        self.player.set_config(self.settings.engine_config());
+        self.player.set_config(self.engine_config());
     }
 
     // ───────────────────────── building blocks ─────────────────────────
@@ -189,11 +205,20 @@ impl PlayerView {
             .child(self.tabs(names, current, make, cx))
             .child(
                 div()
-                    .id(SharedString::from(format!("{title}-options")))
+                    .relative()
                     .flex_1()
                     .min_w_0()
-                    .overflow_y_scroll()
-                    .child(content),
+                    .flex()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{title}-options")))
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.options_scroll)
+                            .child(content),
+                    )
+                    .child(scrollbar("options-bar", &self.options_scroll, self.theme)),
             )
             .into_any_element();
         self.modal_impl(title, width, body, None, true, cx)
@@ -262,15 +287,27 @@ impl PlayerView {
                                     cx,
                                 )),
                         )
-                        .child(
+                        .child(if self_scrolling {
+                            div().id("modal-body").flex_1().min_h_0().flex().flex_col().child(body).into_any_element()
+                        } else {
                             div()
-                                .id("modal-body")
+                                .relative()
                                 .flex_1()
                                 .min_h_0()
-                                .when(self_scrolling, |d| d.flex().flex_col())
-                                .when(!self_scrolling, |d| d.overflow_y_scroll())
-                                .child(body),
-                        )
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .id("modal-body")
+                                        .flex_1()
+                                        .min_h_0()
+                                        .overflow_y_scroll()
+                                        .track_scroll(&self.modal_scroll)
+                                        .child(body),
+                                )
+                                .child(scrollbar("modal-bar", &self.modal_scroll, t))
+                                .into_any_element()
+                        })
                         .when_some(footer, |d, f| {
                             d.child(
                                 div()
@@ -690,29 +727,7 @@ impl PlayerView {
                 self.modal("Jump to Time", 380., body, Some(footer), cx)
             }
             Dialog::OpenDisc => self.disc_dialog(cx),
-            Dialog::Shortcuts => {
-                let mut grid = div().p_4().flex().flex_col();
-                for (keys, what) in SHORTCUTS {
-                    let k = keys.split(" / ").map(shortcut).collect::<Vec<_>>().join("  /  ");
-                    grid = grid.child(
-                        div()
-                            .flex()
-                            .py(px(5.))
-                            .border_b_1()
-                            .border_color(t.border.opacity(0.4))
-                            .child(
-                                div()
-                                    .w(px(260.))
-                                    .text_size(px(12.))
-                                    .font_family("monospace")
-                                    .text_color(t.accent)
-                                    .child(k),
-                            )
-                            .child(div().flex_1().text_size(px(13.)).child(*what)),
-                    );
-                }
-                self.modal("Keyboard Shortcuts", 620., grid.into_any_element(), None, cx)
-            }
+            Dialog::Shortcuts => self.shortcuts_dialog(cx),
             Dialog::About => {
                 let body = div()
                     .p_6()
@@ -789,8 +804,276 @@ impl PlayerView {
         })
     }
 
+    // ───────────────────────── keyboard shortcuts ─────────────────────────
+
+    fn shortcuts_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let query = self.inputs.get("shortcut_search").map(|i| i.read(cx).text()).unwrap_or_default();
+        let q = query.trim().to_lowercase();
+        let overrides = self.settings.key_bindings.clone();
+        let mut list = div().flex().flex_col().px_4().pb_3();
+        let mut group = "";
+        let mut shown = 0;
+        for c in keymap::COMMANDS {
+            let keys = keymap::keys_for(c, &overrides);
+            let hit = q.is_empty()
+                || c.label.to_lowercase().contains(&q)
+                || c.group.to_lowercase().contains(&q)
+                || keys.iter().any(|k| keymap::shortcut(k).to_lowercase().contains(&q) || k.to_lowercase() == q);
+            if !hit {
+                continue;
+            }
+            if c.group != group {
+                group = c.group;
+                list = list.child(self.section(group));
+            }
+            shown += 1;
+            list = list.child(self.shortcut_row(c, keys, overrides.contains_key(c.id), cx));
+        }
+        if shown == 0 {
+            list = list.child(
+                div()
+                    .py_8()
+                    .flex()
+                    .justify_center()
+                    .text_color(t.text_dim)
+                    .child(format!("Nothing matches “{}”", query.trim())),
+            );
+        }
+        let header = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py_3()
+            .border_b_1()
+            .border_color(t.border)
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(30.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(7.))
+                    .bg(t.surface_alt)
+                    .border_1()
+                    .border_color(t.border)
+                    .children(self.inputs.get("shortcut_search").cloned().map(|e| div().flex_1().child(e))),
+            )
+            .when(!overrides.is_empty(), |d| {
+                d.child(self.text_button(
+                    "keys-reset-all",
+                    "Reset All",
+                    false,
+                    |this, _, _, cx| {
+                        this.settings.key_bindings.clear();
+                        this.keymap_changed(Some("All shortcuts are back to their defaults".into()), cx);
+                    },
+                    cx,
+                ))
+            });
+        let footer_text = match (&self.shortcut_note, self.capturing_key) {
+            (_, Some(_)) => "Press the new key combination, or Esc to cancel".to_string(),
+            (Some(n), None) => n.clone(),
+            (None, None) => "+ adds a key, × removes one. Double-click the video for fullscreen.".to_string(),
+        };
+        let body = div()
+            .flex()
+            .flex_col()
+            .h(px(540.))
+            .min_h_0()
+            .child(header)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .child(
+                        div()
+                            .id("shortcut-list")
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.modal_scroll)
+                            .child(list),
+                    )
+                    .child(scrollbar("shortcut-bar", &self.modal_scroll, t)),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .px_4()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(t.border)
+                    .text_size(px(12.))
+                    .text_color(if self.capturing_key.is_some() { t.accent } else { t.text_dim })
+                    .child(footer_text),
+            )
+            .into_any_element();
+        self.modal_impl("Keyboard Shortcuts", 700., body, None, true, cx)
+    }
+
+    fn shortcut_row(
+        &self,
+        c: &'static Command,
+        keys: Vec<String>,
+        changed: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = self.theme;
+        let capturing = self.capturing_key == Some(c.id);
+        let small_btn = |id: String, ic: Icon, size: f32| {
+            div()
+                .id(SharedString::from(id))
+                .size(px(size))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.))
+                .cursor_pointer()
+                .hover(|s| s.bg(t.hover))
+                .child(icon(ic, px(size * 0.6), t.text_dim))
+        };
+        let mut chips = div().flex().flex_wrap().items_center().justify_end().gap_1();
+        for k in keys {
+            let label = keymap::shortcut(&k);
+            let k2 = k.clone();
+            chips = chips.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .h(px(24.))
+                    .pl_2()
+                    .pr(px(2.))
+                    .rounded(px(5.))
+                    .bg(t.surface_alt)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(px(12.))
+                    .child(label)
+                    .child(
+                        small_btn(format!("key-rm-{}-{k}", c.id), Icon::WindowClose, 18.)
+                            .tooltip(super::widgets::tooltip("Remove this shortcut", t))
+                            .on_click(cx.listener(move |this, _, _, cx| this.remove_key(c, &k2, cx))),
+                    ),
+            );
+        }
+        if capturing {
+            chips = chips.child(
+                div()
+                    .h(px(24.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(t.accent)
+                    .bg(t.accent_soft)
+                    .text_color(t.accent)
+                    .text_size(px(12.))
+                    .child("Press a key…"),
+            );
+        } else {
+            chips = chips.child(
+                small_btn(format!("key-add-{}", c.id), Icon::Add, 24.)
+                    .tooltip(super::widgets::tooltip("Add a shortcut", t))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.capturing_key = Some(c.id);
+                        this.shortcut_note = None;
+                        cx.notify();
+                    })),
+            );
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .py(px(4.))
+            .pr(px(SCROLLBAR_W))
+            .border_b_1()
+            .border_color(t.border.opacity(0.4))
+            .when(capturing, |d| d.bg(t.accent_soft.opacity(0.5)))
+            .child(div().flex_1().min_w_0().text_size(px(13.)).child(c.label))
+            .child(chips)
+            .child(div().w(px(24.)).flex_none().when(changed, |d| {
+                d.child(
+                    small_btn(format!("key-reset-{}", c.id), Icon::Reset, 24.)
+                        .tooltip(super::widgets::tooltip("Back to the default", t))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.settings.key_bindings.remove(c.id);
+                            let k = c.keys.iter().map(|k| keymap::shortcut(k)).collect::<Vec<_>>().join(", ");
+                            let k = if k.is_empty() { "no keys".to_string() } else { k };
+                            this.keymap_changed(Some(format!("“{}” is back to {k}", c.label)), cx);
+                        })),
+                )
+            }))
+            .into_any_element()
+    }
+
+    fn remove_key(&mut self, c: &'static Command, key: &str, cx: &mut Context<Self>) {
+        let mut keys = keymap::keys_for(c, &self.settings.key_bindings);
+        keys.retain(|k| k != key);
+        keymap::set_keys(c, keys, &mut self.settings.key_bindings);
+        self.keymap_changed(Some(format!("Removed {} from “{}”", keymap::shortcut(key), c.label)), cx);
+    }
+
+    /// The keystroke recorded for the command the dialog is waiting on. The
+    /// key moves there from any command that had it.
+    pub fn capture_keystroke(&mut self, ks: &gpui::Keystroke, cx: &mut Context<Self>) {
+        let Some(c) = self.capturing_key.take().and_then(keymap::command) else { return };
+        let m = &ks.modifiers;
+        if ks.key == "escape" && !(m.control || m.alt || m.shift || m.platform) {
+            self.shortcut_note = None;
+            cx.notify();
+            return;
+        }
+        let key = ks.unparse();
+        let mut moved_from = Vec::new();
+        for other in keymap::COMMANDS.iter().filter(|o| o.id != c.id) {
+            let mut keys = keymap::keys_for(other, &self.settings.key_bindings);
+            let before = keys.len();
+            keys.retain(|k| !keymap::same_keys(k, &key));
+            if keys.len() != before {
+                keymap::set_keys(other, keys, &mut self.settings.key_bindings);
+                moved_from.push(format!("“{}”", other.label));
+            }
+        }
+        let mut keys = keymap::keys_for(c, &self.settings.key_bindings);
+        if !keys.iter().any(|k| keymap::same_keys(k, &key)) {
+            keys.push(key.clone());
+        }
+        keymap::set_keys(c, keys, &mut self.settings.key_bindings);
+        let mut note = format!("{} now does “{}”", keymap::shortcut(&key), c.label);
+        if !moved_from.is_empty() {
+            note.push_str(&format!(" (taken from {})", moved_from.join(", ")));
+        }
+        self.keymap_changed(Some(note), cx);
+    }
+
+    fn keymap_changed(&mut self, note: Option<String>, cx: &mut Context<Self>) {
+        keymap::apply(cx, &self.settings.key_bindings);
+        // The native menu reads its key equivalents when it is built.
+        #[cfg(target_os = "macos")]
+        super::actions::set_native_menus(cx);
+        self.settings.save();
+        self.shortcut_note = note;
+        cx.notify();
+    }
+
     fn settings_dialog(&mut self, tab: usize, cx: &mut Context<Self>) -> AnyElement {
         let s = self.settings.clone();
+        let system: Vec<String> = engine::system_languages().iter().map(|l| engine::language_name(l)).collect();
+        let sub_langs_hint = format!(
+            "Most preferred first, then your system's ({}). Shown by themselves when the audio is in another language",
+            if system.is_empty() { "none found".to_string() } else { system.join(", ") }
+        );
         let mut c = div().flex_1().min_w_0().px_5().pb_4().flex().flex_col();
         match tab {
             0 => {
@@ -884,6 +1167,29 @@ impl PlayerView {
                         |t, _| t.settings.start_fullscreen = !t.settings.start_fullscreen,
                         cx,
                     ))
+                    .child(self.toggle_row(
+                        "fsplaylist",
+                        "Hide the playlist in fullscreen",
+                        Some("Fullscreen starts without it (it can still be opened there); the window keeps its own"),
+                        s.hide_playlist_in_fullscreen,
+                        |t, _| t.settings.hide_playlist_in_fullscreen = !t.settings.hide_playlist_in_fullscreen,
+                        cx,
+                    ))
+                    .child(self.section("Keyboard"))
+                    .child(
+                        self.row(
+                            "Keyboard shortcuts",
+                            Some("Search every shortcut and change or add keys"),
+                            self.text_button(
+                                "edit-shortcuts",
+                                "Customize…",
+                                false,
+                                |this, _, w, cx| this.show_dialog(Dialog::Shortcuts, w, cx),
+                                cx,
+                            )
+                            .into_any_element(),
+                        ),
+                    )
                     .child(self.section("Mouse"))
                     .child(self.toggle_row(
                         "clickpause",
@@ -1187,11 +1493,7 @@ impl PlayerView {
             4 => {
                 c = c
                     .child(self.section("Tracks"))
-                    .child(self.row(
-                        "Preferred subtitle languages",
-                        Some("Comma separated; used when the audio is in another language"),
-                        self.input_box("sub_langs"),
-                    ))
+                    .child(self.row("Preferred subtitle languages", Some(&sub_langs_hint), self.input_box("sub_langs")))
                     .child(self.toggle_row(
                         "subdef",
                         "Always show subtitles",

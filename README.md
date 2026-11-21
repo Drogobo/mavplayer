@@ -20,8 +20,8 @@ one click away.
 - Network streams: HTTP(S), HLS, RTSP, RTMP, SRT, FTP.
 - **DVDs** from a drive, a `VIDEO_TS` folder or an ISO image, with title,
   chapter and angle selection and automatic main-feature detection.
-- Hardware decoding (VA-API, NVDEC, D3D11VA/DXVA2, VideoToolbox) with automatic
-  fallback to software.
+- Hardware decoding (VA-API, NVDEC, D3D11VA/DXVA2, VideoToolbox), on by default,
+  with automatic fallback to software.
 - HDR10/HLG to SDR tone mapping, automatic deinterlacing, exact frame seeking,
   frame stepping, A-B loop, playback speed 0.25×–4× with pitch preserved.
 - Resumes files where you left off.
@@ -53,12 +53,18 @@ compression), stereo widening, channel swap, karaoke, audio delay, volume up to
 
 **Subtitles**: embedded text, ASS/SSA, PGS, VobSub and DVB subtitles; external
 SRT, ASS, SSA, VTT, SUB and more, loaded automatically when they sit next to the
-video; preferred languages, encoding detection, delay, size, position and style.
+video; preferred languages (falling back to your system language), encoding
+detection, delay, size, position and style. Showing subtitles picks the best
+track by itself, and they come on by themselves when the audio is in another
+language.
 
 **Interface**
 - Light and dark themes that follow the system; menus, context menu, keyboard
-  shortcuts for everything, drag and drop, mouse-wheel volume or seek.
-- Playlists (M3U/PLS load and save), shuffle, repeat, recent files.
+  shortcuts for everything (searchable and rebindable), drag and drop,
+  mouse-wheel volume or seek.
+- Playlists (M3U/PLS load and save), shuffle, repeat, recent files. The
+  playlist works in fullscreen too, starting hidden there unless you choose
+  otherwise.
 - Gapless playback: songs follow each other and loops repeat with no gap, down
   to the sample.
 - Uses your desktop's icon theme on Linux, falling back to built-in
@@ -133,7 +139,8 @@ image or folder), `mavplayer dvd://2/dev/sr1` (title 2 of the disc in `/dev/sr1`
 ### Keyboard shortcuts
 
 On macOS, <kbd>Ctrl</kbd> below means <kbd>⌘</kbd>. **Help ▸ Keyboard
-Shortcuts** (<kbd>F1</kbd>) lists them all in the app.
+Shortcuts** (<kbd>F1</kbd>) lists them all in the app, where you can search
+them and add, remove or change keys. These are the defaults.
 
 | Keys | Action |
 | --- | --- |
@@ -145,7 +152,9 @@ Shortcuts** (<kbd>F1</kbd>) lists them all in the app.
 | <kbd>.</kbd> <kbd>,</kbd> | Next / previous frame |
 | <kbd>[</kbd> <kbd>]</kbd> <kbd>Backspace</kbd> | Slower / faster / normal speed |
 | <kbd>N</kbd> / <kbd>Shift</kbd>+<kbd>N</kbd> | Next / previous playlist item |
-| <kbd>B</kbd> / <kbd>C</kbd> / <kbd>V</kbd> | Cycle audio track / subtitle track / show-hide subtitles |
+| <kbd>B</kbd> / <kbd>Shift</kbd>+<kbd>B</kbd> | Next / previous audio track |
+| <kbd>V</kbd> | Show / hide subtitles (picks a track if none is chosen) |
+| <kbd>C</kbd> / <kbd>Shift</kbd>+<kbd>C</kbd> | Next / previous subtitle language |
 | <kbd>Z</kbd> <kbd>X</kbd> | Subtitle delay −/+ 100 ms |
 | <kbd>S</kbd> / <kbd>I</kbd> / <kbd>A</kbd> | Screenshot / media info / A-B loop |
 | <kbd>1</kbd>…<kbd>9</kbd>, <kbd>0</kbd> | Jump to 10 %…90 %, start |

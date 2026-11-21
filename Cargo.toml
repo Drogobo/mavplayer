@@ -36,6 +36,7 @@ dirs = "6"
 unicode-segmentation = "1"
 # Media keys and now-playing info: MPRIS (Linux), SMTC (Windows), Now Playing (macOS).
 souvlaki = { version = "0.9", default-features = false, features = ["use_zbus"] }
+sys-locale = "0.3"
 
 # Native PipeWire audio output (cpal's ALSA host is the fallback).
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -70,14 +70,14 @@ All state lives in one view, `PlayerView`. Its `impl` blocks are split by concer
 - `menus.rs`: menu contents.
 - `menu.rs`: the popup-menu widget.
 - `dialogs.rs`: all modals.
-- `actions.rs`: the `actions!` list, key bindings, the `SHORTCUTS` table and the macOS native menu.
+- `actions.rs`: the `actions!` list and the macOS native menu.
+- `keymap.rs`: the `COMMANDS` table (every rebindable command, its group and default keys). `keymap::apply` rebuilds GPUI's keymap from it plus `Settings::key_bindings` (the user's overrides, set in the searchable Keyboard Shortcuts dialog), and menus/tooltips read labels via `shortcut_for`/`hint`. While that dialog records a key, a `cx.intercept_keystrokes` hook in `PlayerView::new` takes the keystroke before any binding fires.
 
 To add a keyboard action:
 1. Add it to `actions!`.
-2. Bind it in `bind_keys` (`secondary-` means Ctrl, or ⌘ on macOS).
-3. Add it to `SHORTCUTS`.
-4. Handle it in `register_actions`.
-5. Optionally add it to a menu with `act()`.
+2. Add it to `keymap::COMMANDS` with its default keys (`secondary-` means Ctrl, or ⌘ on macOS). Never call `cx.bind_keys` elsewhere: `apply` clears and rebuilds the whole keymap.
+3. Handle it in `register_actions`.
+4. Optionally add it to a menu with `act()` (it shows the current shortcut).
 
 To add a setting:
 1. Add a field to `Settings` in `settings.rs` (it is `#[serde(default)]`).
@@ -91,6 +91,8 @@ GPUI gotchas already hit in this codebase:
   - `cx.primary_display()` is always `None`, and `window.display()` is `None` until the surface enters an output. `fit_window` falls back to `cx.displays()`.
   - A resize issued before the compositor's first configure can be lost, so `pending_fit` re-applies it from `tick`.
   - The window icon comes only from a `.desktop` file matching the app ID (`io.github.drogobo.MavPlayer`). For unpackaged runs, `integration::ensure_window_icon()` writes a hidden icon-only entry.
+- **Flex children shrink.** Rows inside a height-limited flex column (menus, dialog lists) need `flex_none()`, or they squash instead of scrolling.
+- **Scrollbars.** GPUI has none. `widgets::scrollbar(id, &ScrollHandle, theme)` is an absolutely positioned sibling of the scroll area (inside a `relative()` parent). Track the area with `.track_scroll(&handle)`; for a `uniform_list` use `pl_scroll.0.borrow().base_handle`.
 - **Bundled SVGs.** Load them as `ImageSource::Resource(Resource::Embedded(..))`. `img("x.svg")` is parsed as a URI.
 
 ### Other modules
