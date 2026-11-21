@@ -94,9 +94,17 @@ impl PacketQueue {
 
     /// Blocking get. Returns `None` once the queue is aborted or `cancel` is set.
     pub fn get(&self, cancel: &AtomicBool) -> Option<QueuedPacket> {
+        self.get_until(cancel, None)
+    }
+
+    /// Like `get`, but gives up (`None`) at `deadline`.
+    pub fn get_until(&self, cancel: &AtomicBool, deadline: Option<std::time::Instant>) -> Option<QueuedPacket> {
         let mut g = self.inner.lock();
         loop {
             if self.is_aborted() || cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 return None;
             }
             if let Some(p) = g.pkts.pop_front() {

@@ -414,7 +414,10 @@ impl PlayerView {
         // Subtitles at the current position.
         let pos = self.player.position() - self.sub_delay;
         let mut subs = std::mem::take(&mut self.subs);
-        if self.subs_visible && active {
+        // A DVD with menus draws its subpictures itself (buttons and forced
+        // subtitles show even with subtitles off).
+        let dvd_nav = self.player.with_state(|s| s.dvd.is_some());
+        if (self.subs_visible() || dvd_nav) && active {
             self.player.subtitles_at(pos, &mut subs);
         } else {
             subs.clear();
@@ -519,7 +522,15 @@ impl PlayerView {
             .bg(t.video_bg)
             .child(picture)
             .when(active && !show_controls && self.menu.is_none(), |d| d.cursor(CursorStyle::None))
-            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.note_activity(cx)))
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                this.note_activity(cx);
+                // DVD menus: the button under the pointer lights up.
+                if this.dvd_buttons()
+                    && let Some((x, y)) = this.dvd_point(ev.position)
+                {
+                    this.dvd(crate::engine::DvdCommand::Hover(x, y), cx);
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, _| {
@@ -530,6 +541,15 @@ impl PlayerView {
             )
             .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
                 if ev.is_right_click() {
+                    return;
+                }
+                // A click on a DVD menu button presses it (instead of pausing).
+                if this.dvd_buttons()
+                    && let Some((x, y)) = this.dvd_point(ev.position())
+                    && this.player.dvd_command(crate::engine::DvdCommand::Click(x, y))
+                {
+                    window.focus(&this.focus);
+                    cx.notify();
                     return;
                 }
                 // The click (or a double-click's first click) opened what is
@@ -816,7 +836,7 @@ impl PlayerView {
         for (n, r) in self.settings.recent.iter().take(6).enumerate() {
             let src = r.clone();
             let ic = match r {
-                MediaSource::Dvd { .. } => Icon::Disc,
+                MediaSource::Dvd { .. } | MediaSource::Cd { .. } => Icon::Disc,
                 MediaSource::Url(_) => Icon::Url,
                 MediaSource::File(p)
                     if crate::playlist::AUDIO_EXTS.contains(
@@ -1664,6 +1684,10 @@ impl PlayerView {
 
 impl Render for PlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.rendered {
+            self.rendered = true;
+            log::debug!("startup: first render at {:.0} ms", crate::ms_since_start());
+        }
         self.ui_stats.1 += 1;
         self.avoid_direct_scanout(window);
         self.retire_textures(window);
@@ -1683,7 +1707,14 @@ impl Render for PlayerView {
 
         let mut root = div()
             .id("root")
-            .key_context(if overlay_open { "Overlay" } else { CTX })
+            .key_context(if overlay_open {
+                "Overlay"
+            } else if self.dvd_buttons() {
+                // Both: the player's shortcuts, with the disc's buttons on top.
+                "Player DvdMenu"
+            } else {
+                CTX
+            })
             .track_focus(&self.focus)
             .size_full()
             .relative()

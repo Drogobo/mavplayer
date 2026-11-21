@@ -53,6 +53,19 @@ pub fn stop_accepting() {
     QUITTING.store(true, Ordering::Release);
 }
 
+/// This process bound the instance socket.
+static LISTENING: AtomicBool = AtomicBool::new(false);
+
+/// Frees the socket's name for the next MavPlayer, which can then listen at
+/// once instead of waiting for this process to exit. Launches that come in
+/// meanwhile start their own window, as they would if none were running.
+pub fn release() {
+    if LISTENING.swap(false, Ordering::AcqRel) {
+        stop_accepting();
+        sys::release();
+    }
+}
+
 /// Sends `sources` to a running MavPlayer. Returns true once it has them.
 /// With `background_only`, only one waiting in the tray accepts.
 pub fn forward(mode: RunningMode, sources: &[MediaSource], fullscreen: bool, background_only: bool) -> bool {
@@ -92,6 +105,7 @@ pub fn listen(wait: Duration, on_request: impl Fn(Request) + Send + 'static) -> 
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    LISTENING.store(true, Ordering::Release);
     let spawned = std::thread::Builder::new().name("instance".into()).spawn(move || {
         loop {
             match listener.accept() {
@@ -119,6 +133,9 @@ fn serve(conn: sys::Stream) -> Option<Request> {
     let mut reader = BufReader::new(conn.take(MAX_REQUEST));
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
+    if line.is_empty() {
+        return None; // a later launch checking whether anyone listens
+    }
     if !line.ends_with('\n') {
         log::warn!("ignored an incomplete or oversized open request");
         return None;
@@ -154,6 +171,9 @@ fn absolute(s: &MediaSource) -> MediaSource {
                 title: *title,
                 angle: *angle,
             }
+        }
+        MediaSource::Cd { device, track } if std::path::Path::new(device).is_relative() => {
+            MediaSource::Cd { device: abs(std::path::Path::new(device)).to_string_lossy().into_owned(), track: *track }
         }
         other => other.clone(),
     }
@@ -232,6 +252,10 @@ mod sys {
         }
     }
 
+    pub fn release() {
+        let _ = std::fs::remove_file(socket_path());
+    }
+
     pub fn set_timeouts(s: &Stream) {
         let _ = s.set_read_timeout(Some(TIMEOUT));
         let _ = s.set_write_timeout(Some(TIMEOUT));
@@ -299,6 +323,10 @@ mod sys {
         std::fs::write(&path, format!("{port} {token}")).ok()?;
         let _ = TOKEN.set(token);
         Some(Listener(l))
+    }
+
+    pub fn release() {
+        let _ = std::fs::remove_file(info_path());
     }
 
     fn random_token() -> String {

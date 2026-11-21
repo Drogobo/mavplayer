@@ -52,6 +52,13 @@ actions!(
         OpenFolder,
         OpenUrl,
         OpenDisc,
+        DiscMenu,
+        DiscTitleMenu,
+        DiscUp,
+        DiscDown,
+        DiscLeft,
+        DiscRight,
+        DiscActivate,
         OpenSubtitle,
         SavePlaylist,
         ShowPreferences,
@@ -87,6 +94,8 @@ actions!(
 /// Key context of the player (everything but dialogs, menus and text fields).
 /// The key bindings themselves are in `keymap.rs`.
 pub const CTX: &str = "Player";
+/// Added to the player's key context while a DVD menu shows buttons.
+pub const DVD_CTX: &str = "DvdMenu";
 
 /// macOS gets a real menu bar; other platforms use the in-window one.
 #[cfg(target_os = "macos")]

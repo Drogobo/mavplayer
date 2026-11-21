@@ -18,7 +18,8 @@
       <li>Hardware-accelerated decoding with automatic software fallback</li>
       <li>HDR to SDR tone mapping, deinterlacing, aspect ratio, crop, zoom and rotation</li>
       <li>Embedded and external subtitles, with automatic loading of matching files</li>
-      <li>DVD playback with title and chapter navigation</li>
+      <li>DVD playback with interactive disc menus, or straight to the main feature</li>
+      <li>Audio CDs and CD images, with track names from CD-Text</li>
       <li>10-band equalizer, volume normalization, night mode and pitch-preserving speed control</li>
       <li>Playlists, shuffle, repeat, A-B loop and resume where you left off</li>
     </ul>
@@ -46,6 +47,13 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.2.3" date="2026-11-21">
+      <description>
+        <p>DVD menus: DVDs start at the disc's own menu, with buttons that work with the keyboard and the mouse, and play what the disc chooses next. Or play the main feature straight away.</p>
+        <p>Audio CDs, from a drive or a .cue/.bin image, with track names from CD-Text and gapless playback.</p>
+        <p>Big video frame buffers are reused instead of being allocated for every frame, and the Arch package builds again with CachyOS's default compiler flags.</p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-11-21">
       <description>
         <p>Optionally keep running in the system tray, so files open in a warm window almost instantly, and hardware decoding starts much sooner.</p>

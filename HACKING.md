@@ -40,10 +40,10 @@ You need:
 
 | System | Install |
 | --- | --- |
-| Arch / CachyOS / Manjaro | `sudo pacman -S rust clang pkgconf ffmpeg libpipewire alsa-lib libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig` |
-| Fedora (RPM Fusion for FFmpeg 9) | `sudo dnf install rust cargo clang pkgconf ffmpeg-devel pipewire-devel alsa-lib-devel libxkbcommon-x11-devel libxcb-devel wayland-devel vulkan-loader-devel fontconfig-devel` |
+| Arch / CachyOS / Manjaro | `sudo pacman -S rust clang pkgconf ffmpeg libdvdnav libpipewire alsa-lib libxkbcommon-x11 libxcb wayland vulkan-icd-loader fontconfig` |
+| Fedora (RPM Fusion for FFmpeg 9) | `sudo dnf install rust cargo clang pkgconf ffmpeg-devel libdvdnav-devel pipewire-devel alsa-lib-devel libxkbcommon-x11-devel libxcb-devel wayland-devel vulkan-loader-devel fontconfig-devel` |
 | Debian / Ubuntu | `sudo apt install build-essential clang pkg-config libpipewire-0.3-dev libasound2-dev libxkbcommon-x11-dev libxcb1-dev libwayland-dev libvulkan-dev libfontconfig1-dev`, then build FFmpeg 9 with `scripts/build-ffmpeg.sh` (distribution FFmpeg is usually older) |
-| macOS | `xcode-select --install`, `brew install ffmpeg pkg-config` |
+| macOS | `xcode-select --install`, `brew install ffmpeg libdvdnav pkg-config` |
 | Windows | Rust (MSVC), [LLVM](https://github.com/llvm/llvm-project/releases) (set `LIBCLANG_PATH`), and an FFmpeg 9 "shared" build such as BtbN's `ffmpeg-n9.0-latest-win64-gpl-shared-9.0.zip` with `FFMPEG_DIR` pointing at it; put its `bin` folder on `PATH` to run |
 
 Then:
@@ -62,10 +62,12 @@ If FFmpeg is installed somewhere `pkg-config` can't see, set
 ## Release packages
 
 All packages are built by [`.github/workflows/build.yml`](.github/workflows/build.yml)
-on every push. Pushing a tag such as `v0.2.0` also publishes a GitHub release with
-everything attached. To release: bump `version` in `Cargo.toml`,
-`packaging/arch/PKGBUILD` and the `<releases>` list in
-`packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml`, commit, then tag.
+when a tag such as `v0.2.0` is pushed, which also publishes a GitHub release
+with everything attached. Pull requests build too, and so does **Actions ▸
+Build ▸ Run workflow**; pushes to `main` don't. To release: bump `version` in
+`Cargo.toml`, `packaging/arch/PKGBUILD` and the `<releases>` list in
+`packaging/linux/io.github.drogobo.MavPlayer.metainfo.xml`, commit, tag, and
+push both.
 
 You can build each package locally.
 
@@ -262,9 +264,13 @@ audio.rs:   output callback pulls samples and drives the master clock: native
   read loop: seeks, track switches, pause, back-pressure, EOF.
 - **`decoder.rs`**: opens codecs, including hardware decoding through a
   `get_format` callback with software fallback, and runs the send/receive loop.
-  Hardware devices (CUDA, VAAPI, …) are opened once per process and shared by
-  every decoder, since opening one takes 100–500 ms; the first is opened in the
-  background as soon as the `Player` exists. On Linux, CUDA is tried before
+  Hardware devices (CUDA, VAAPI, …) are shared by every decoder, since opening
+  one takes 100–500 ms. One is opened in the background as soon as a file turns
+  out to have a video stream (`demux::open_input`, while the streams are
+  probed), and closed again once no decoder has used it for 30 seconds: a CUDA
+  device costs about 100 MB. A decoder that has reached the end of the file
+  closes its codec after 20 seconds without a seek (`Decoder::park`) and opens
+  it again on the next one. On Linux, CUDA is tried before
   VAAPI when VAAPI would only reach an NVIDIA GPU through the NVDEC wrapper
   driver (it opens twice as slowly and decodes the same way).
 - **`video.rs` / `audio.rs` / `filters.rs`**: build libavfilter chains from the
@@ -276,7 +282,8 @@ audio.rs:   output callback pulls samples and drives the master clock: native
   display size. The bundled mpv shaders (`third_party/shaders`, compiled in with
   `include_str!`) are concatenated into one hook file and passed as
   `custom_shader_bin`. One Vulkan device is shared by every graph (creating it
-  is slow on some drivers; `prewarm` starts it early), and compiled shaders are
+  is slow on some drivers; `prewarm` starts it when a video opens, and it is
+  closed after 30 seconds unused), and compiled shaders are
   cached under the user cache directory. Window resizes are debounced before the
   graph is rebuilt, and a graph that fails to build turns upscaling off for
   those settings with a warning instead of retrying every frame.
@@ -284,8 +291,61 @@ audio.rs:   output callback pulls samples and drives the master clock: native
   stepping, colour conversion, screenshots.
 - **`subs.rs`**: subtitle decoding (text, ASS, bitmap), external file loading
   with charset detection, sidecar discovery.
-- **`disc.rs` / `probe.rs`**: DVD folder/ISO/drive detection and title probing,
-  plus quick metadata probes for playlist entries.
+- **`disc.rs` / `probe.rs`**: disc detection (DVD folders, ISOs, drives, audio
+  CDs and `.cue` images; `read_disc` tells them apart for the Open Disc dialog)
+  and DVD title probing, plus quick metadata probes for playlist entries.
+- **`nav.rs` / `spu.rs`**: DVDs with their menus (see below).
+- **`cdda.rs`**: audio CDs (see below).
+
+**DVD menus.** `dvd://` with no title (`MediaSource::Dvd { title: 0 }`) is
+played through libdvdnav when the build has it, instead of FFmpeg's `dvdvideo`
+demuxer, which can only play titles. libdvdnav runs the disc's navigation
+program (first play, menus, button commands, what follows a title) and returns
+2048-byte MPEG-PS blocks, which `nav::NavIo` feeds to FFmpeg's `mpeg` demuxer
+through a custom AVIOContext (`av::custom_io_context`).
+
+- Playback is split into *segments*: one per menu domain, VTS or title.
+  libdvdnav's events (still frame, wait, VTS or title change, hop, stop) end
+  the read with EOF, and `nav::play_segment` handles them: a still or a wait
+  drains the decoders and holds the last picture; a jump flushes them. Each
+  segment gets its own `FormatCtx` whose streams are described by the disc's IFO
+  attributes, so the UI's track lists show the disc's languages, and decoders
+  restart for each segment.
+- Timestamps are rewritten into one continuous timeline. Each VOBU (from its
+  NAV packet's PCI) records the offset for its byte range, and packets look up
+  theirs by `pos`. The offset is rebased from `dvdnav_get_current_time` at the
+  start of a segment, after a jump and after a seek.
+- The disc chooses audio and subtitle streams (logical stream numbers, mapped
+  to physical ones). Choosing a track in the UI tells the VM too.
+- `spu.rs` decodes DVD subpictures itself, because FFmpeg's `dvdsub` decoder
+  can't draw menu button highlights. `Overlay` keeps the CLUT, the current
+  subpicture and the highlight (rectangle and palette from libdvdnav) and
+  redraws the subtitle bitmap when the selected button changes.
+- The UI sends input through `Player::dvd_command` (`DvdCommand`: arrows,
+  activate, hover and click in picture coordinates, menu calls, titles,
+  angles), and reads `PlaybackState::dvd` to know whether buttons are showing.
+  While they are, the player's key context is `Player DvdMenu`, whose arrow and
+  Enter bindings take precedence.
+- Resume positions aren't saved for DVDs played this way.
+
+`build.rs` sets `cfg(has_dvdnav)` when libdvdnav can be linked: with
+`static-ffmpeg`, when libavformat's static link line already includes
+`-ldvdnav`; otherwise when `pkg-config dvdnav` finds it.
+`MAVPLAYER_NO_DVDNAV=1` builds without it. Windows builds never have it, so
+run clippy that way too. Without it, DVDs play title by title
+through `dvdvideo` and the menu options are hidden (`dvd_menus_available`).
+
+**Audio CDs.** `MediaSource::Cd { device, track }` (track 0 is the whole disc,
+which the UI expands into one playlist entry per track). `cdda.rs` reads the
+TOC (and CD-Text through a raw READ TOC/PMA/ATIP command) and the raw 44.1 kHz
+16-bit stereo sectors, and `demux.rs` opens them with FFmpeg's `s16le` demuxer
+through a seekable custom IO, so seeking, gapless playback and the audio
+filters work as for files. Sectors are read in chunks; a chunk that fails is
+retried sector by sector, and unreadable sectors play as silence. Drives are read with
+the Linux `CDROM*` ioctls or Windows `IOCTL_CDROM_*` (untested). macOS mounts
+audio CDs as AIFF files, which are played as files. `.cue` sheets with
+`BINARY` or `MOTOROLA` `.bin` images are read the same way. The URL form is
+`cdda://[TRACK][/DEVICE]`.
 
 **Gapless transitions.** The UI queues what follows the current item with
 `Player::set_next` (the next playlist entry, or the same file when looping).
@@ -337,17 +397,47 @@ later with `window.drop_image`, because GPUI frees atlas textures immediately.
 **Keeping running in the tray.** On Linux and Windows, GPUI ends its event loop
 as soon as the last window closes, and an app can't be started again in the
 same process. So with "Keep running in the system tray" on, the closing
-process starts `mavplayer --background` and quits. That process loads
-everything a window needs (libraries, fonts, the GPU context, the hardware
-decoder), takes over the single-instance socket (`instance::listen` waits for
-the old one to let go) and shows the tray icon, but opens no window: GPUI only
-ends the loop when a window closes. The icon is handed over without a gap: the
-new process shows its icon first thing and reports it on a pipe, and the old
-one keeps its own until then (`shell::finish_handover`), then exits at once. Any later launch, with files or not, is
-handed to it (`background_only` requests), and it opens a window in a few tens
-of milliseconds. On macOS the app stays running without windows instead.
-Without a working tray (GNOME without an AppIndicator extension, say) closing
-the window quits as usual.
+process starts `mavplayer --background --handover` and quits. That process
+loads everything a window needs (libraries, fonts, the GPU context, the
+hardware decoder), takes over the single-instance socket and the tray icon,
+but opens no window: GPUI only ends the loop when a window closes. The
+hand-over (`shell::finish_handover`):
+
+1. The new process shows its icon first thing. On Linux the icon's D-Bus name
+   is fixed (`io.github.drogobo.MavPlayer.Tray`) and requested with
+   `ReplaceExisting`, so it passes straight from the old process to the new
+   one. Plasma's watcher only drops an item once its name has no owner, so
+   the icon never blinks. This needs a small patch to ksni (`dbus_name`, in
+   `third_party/ksni`). The new process then reports "ready" on its stdout pipe.
+2. The old process deletes the instance socket's file, closes the new
+   process's stdin and exits.
+3. On that cue the new process binds the socket at once (no polling for the
+   old one to exit) and brings up GPUI. It opens no hardware decoder or other
+   GPU device until a video is opened: waiting in the tray takes about 70 MB.
+
+Any later launch, with files or not, is handed to it (`background_only`
+requests), and it opens a window in a few tens of milliseconds. On macOS the
+app stays running without windows instead. Without a working tray (GNOME
+without an AppIndicator extension, say) closing the window quits as usual.
+
+**Memory.** Measured on Linux with an NVIDIA GPU:
+
+- GPUI's renderer, blade-graphics, is patched (`third_party/blade-graphics`)
+  never to enable Vulkan ray tracing, which NVIDIA's driver otherwise sets up
+  for 50 MB in every process.
+- `mem.rs` installs a global allocator that keeps a few freed blocks of 1 MB
+  or more for reuse at the same size (converted video frames), and fixes
+  glibc's mmap threshold at 1 MB. Without that, glibc's per-thread arenas held
+  30 to 70 MB of freed frames. Its thread returns idle memory and closes idle
+  GPU devices every second.
+- Frames downloaded from a hardware decoder come from a buffer pool
+  (`DownloadPool` in `decoder.rs`).
+- "Auto" decoder threads means at most 4 (8 for software decoding above
+  1080p), not FFmpeg's one per CPU. Each frame thread holds its own pictures.
+- Files and discs are read 3 seconds ahead (`LOCAL_READ_AHEAD_SECS`); the
+  network cache setting applies to streams only.
+- The UI keeps only the IDs of textures it retires (`retire_frame`), not their
+  pixels.
 
 ## Common changes
 

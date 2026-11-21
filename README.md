@@ -18,8 +18,14 @@ one click away.
   AVI, WebM, MPEG-TS/M2TS, VOB, FLV, WMV, OGG, FLAC, MP3, AAC, Opus, WAV, AC-3,
   DTS and many more; H.264, HEVC, AV1, VP9, MPEG-2/4 and other codecs.
 - Network streams: HTTP(S), HLS, RTSP, RTMP, SRT, FTP.
-- **DVDs** from a drive, a `VIDEO_TS` folder or an ISO image, with title,
-  chapter and angle selection and automatic main-feature detection.
+- **DVDs** from a drive, a `VIDEO_TS` folder or an ISO image, with their
+  **menus**: buttons work with the arrow keys and Enter or with the mouse, and
+  the disc picks titles, audio and subtitles and decides what plays next, as on
+  a DVD player. Or skip the menus and play the main feature or any title
+  directly, with chapter and angle selection. (Menus need libdvdnav, which the
+  Windows build doesn't have; it plays titles directly.)
+- **Audio CDs** from a drive or a `.cue`/`.bin` image, with track names from
+  CD-Text or the cue sheet, and gapless playback from one track to the next.
 - Hardware decoding (VA-API, NVDEC, D3D11VA/DXVA2, VideoToolbox), on by default,
   with automatic fallback to software.
 - HDR10/HLG to SDR tone mapping, automatic deinterlacing, exact frame seeking,
@@ -58,8 +64,8 @@ compression), stereo widening, channel swap, karaoke, audio delay, volume up to
 SRT, ASS, SSA, VTT, SUB and more, loaded automatically when they sit next to the
 video; preferred languages (falling back to your system language), encoding
 detection, delay, size, position and style. Showing subtitles picks the best
-track by itself, and they come on by themselves when the audio is in another
-language.
+track by itself, and whether they are on is remembered for later videos and
+launches: only you turn them on or off.
 
 **Interface**
 - Light and dark themes that follow the system; menus, context menu, keyboard
@@ -123,7 +129,7 @@ MavPlayer will use it automatically. Check that doing so is legal where you live
 ## Usage
 
 ```
-mavplayer [OPTIONS] [FILE | FOLDER | URL | dvd://[TITLE][/DEVICE]] ...
+mavplayer [OPTIONS] [FILE | FOLDER | URL | dvd://[TITLE][/DEVICE] | cdda://[TRACK][/DEVICE]] ...
 
   -f, --fullscreen          Start in fullscreen
   -n, --new-window          Open a new window even if MavPlayer is already open
@@ -139,7 +145,13 @@ mavplayer [OPTIONS] [FILE | FOLDER | URL | dvd://[TITLE][/DEVICE]] ...
 Examples: `mavplayer movie.mkv`, `mavplayer ~/Music/Album/`,
 `mavplayer https://example.com/live.m3u8`, `mavplayer dvd://` (the disc in the
 default drive), `mavplayer MOVIE.iso` or `mavplayer /path/to/VIDEO_TS` (a DVD
-image or folder), `mavplayer dvd://2/dev/sr1` (title 2 of the disc in `/dev/sr1`).
+image or folder), `mavplayer dvd://2/dev/sr1` (title 2 of the disc in `/dev/sr1`),
+`mavplayer cdda://` (the audio CD in the default drive), `mavplayer cdda://3`
+(from its third track), `mavplayer album.cue` (a CD image).
+
+`dvd://` with no title starts at the disc's menu. To skip menus by default,
+turn off **Preferences ▸ Network & Discs ▸ Start DVDs at the disc menu**;
+**Media ▸ Open Disc…** (<kbd>Ctrl</kbd>+<kbd>D</kbd>) offers both either way.
 
 ### Keyboard shortcuts
 
@@ -164,6 +176,8 @@ and add, remove or change keys. These are the defaults.
 | <kbd>S</kbd> / <kbd>I</kbd> / <kbd>A</kbd> | Screenshot / media info / A-B loop |
 | <kbd>1</kbd>…<kbd>9</kbd>, <kbd>0</kbd> | Jump to 10 %…90 %, start |
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> / <kbd>U</kbd> / <kbd>D</kbd> | Open file / URL / disc |
+| <kbd>Shift</kbd>+<kbd>M</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> | DVD menu / DVD title menu |
+| Arrow keys, <kbd>Enter</kbd> | Move between and press DVD menu buttons (while a menu shows) |
 | <kbd>Ctrl</kbd>+<kbd>L</kbd> / <kbd>E</kbd> / <kbd>,</kbd> | Playlist / effects / preferences |
 
 ### Where settings live

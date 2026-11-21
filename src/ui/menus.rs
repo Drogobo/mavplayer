@@ -6,7 +6,8 @@ use super::menu::MenuItem as M;
 use super::player::{ASPECTS, PlayerView, SPEEDS};
 use super::widgets::format_time;
 use crate::engine::{
-    self, Anime4KMode, ChannelMode, Deinterlace, HwDecode, MediaSource, Rotation, TrackKind, Upscaler,
+    self, Anime4KMode, ChannelMode, Deinterlace, DvdCommand, DvdDomain, DvdMenu, HwDecode, MediaSource, Rotation,
+    TrackKind, Upscaler,
 };
 use crate::icons::Icon;
 use crate::settings::{RepeatMode, SubStyle, ThemeMode};
@@ -39,7 +40,8 @@ impl PlayerView {
     pub fn context_menu(&self, cx: &mut Context<Self>) -> Vec<M> {
         let playing = self.player.is_active();
         let paused = self.player.paused();
-        vec![
+        let disc = self.disc_menu();
+        let mut v = vec![
             act(if paused || !playing { "Play" } else { "Pause" }, TogglePause)
                 .icon(if paused || !playing { Icon::Play } else { Icon::Pause })
                 .enabled(playing),
@@ -57,7 +59,46 @@ impl PlayerView {
             act("Fullscreen", ToggleFullscreen).icon(Icon::Fullscreen),
             act("Media Information", ShowMediaInfo).icon(Icon::Info).enabled(playing),
             act("Preferences…", ShowPreferences).icon(Icon::Settings),
-        ]
+        ];
+        if let Some(d) = disc {
+            v.insert(5, M::submenu("Disc", d).icon(Icon::Disc));
+        }
+        v
+    }
+
+    /// The DVD menu commands while a disc plays with its menus.
+    fn disc_menu(&self) -> Option<Vec<M>> {
+        let d = self.player.with_state(|s| s.dvd.clone())?;
+        let menu = |label: &str, m: DvdMenu| M::action(label.to_string(), move |this, w, cx| this.dvd_menu(m, w, cx));
+        let titles: Vec<M> = (1..=d.titles)
+            .map(|n| {
+                M::action(format!("Title {n}"), move |this, _, cx| this.dvd(DvdCommand::PlayTitle(n), cx))
+                    .selected(d.title == n)
+            })
+            .collect();
+        let mut v = vec![
+            act("Disc Menu", DiscMenu),
+            act("Title Menu", DiscTitleMenu),
+            menu("Audio Menu", DvdMenu::Audio),
+            menu("Subtitle Menu", DvdMenu::Subtitle),
+            menu("Chapter Menu", DvdMenu::Chapter),
+            M::action(if d.domain == DvdDomain::Title { "Up a Level" } else { "Resume" }, |this, _, cx| {
+                this.dvd(DvdCommand::Back, cx)
+            }),
+            M::Separator,
+            M::submenu("Titles", titles),
+        ];
+        if d.angles > 1 {
+            let angles = (1..=d.angles)
+                .map(|n| {
+                    M::action(format!("Angle {n}"), move |this, _, cx| this.dvd(DvdCommand::Angle(n), cx))
+                        .selected(d.angle == n)
+                })
+                .collect();
+            v.push(menu("Angle Menu", DvdMenu::Angle));
+            v.push(M::submenu("Camera Angle", angles));
+        }
+        Some(v)
     }
 
     fn menu_media(&self, _cx: &mut Context<Self>) -> Vec<M> {
@@ -147,7 +188,12 @@ impl PlayerView {
             act("Jump to Time…", JumpToTime).enabled(active),
             M::submenu("Chapters", chapters),
         ];
-        if let Some((path, titles)) = &self.dvd_titles {
+        if let Some(d) = self.disc_menu() {
+            v.push(M::submenu("Disc", d).icon(Icon::Disc));
+        } else if matches!(st.source, Some(MediaSource::Dvd { .. })) && engine::dvd_menus_available() {
+            v.push(act("Disc Menu", DiscMenu).icon(Icon::Disc));
+        }
+        if let Some((path, titles)) = self.dvd_titles.as_ref().filter(|_| st.dvd.is_none()) {
             let cur = match &st.source {
                 Some(MediaSource::Dvd { title, .. }) => *title,
                 _ => 0,
@@ -200,7 +246,7 @@ impl PlayerView {
         let cur = match kind {
             TrackKind::Audio => st.selected.audio,
             // Hidden subtitles read as off.
-            TrackKind::Subtitle => st.selected.subtitle.filter(|_| self.subs_visible),
+            TrackKind::Subtitle => st.selected.subtitle.filter(|_| self.subs_visible()),
             TrackKind::Video => st.selected.video,
         };
         let mut v: Vec<M> = Vec::new();

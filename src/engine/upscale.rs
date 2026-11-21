@@ -188,7 +188,7 @@ pub fn setup_filter(ctx: *mut ff::AVFilterContext, plan: &Plan) -> anyhow::Resul
             return Ok(());
         }
         if let Some(dev) = device() {
-            (*ctx).hw_device_ctx = ff::av_buffer_ref(dev);
+            (*ctx).hw_device_ctx = dev; // ownership moves to the filter
         }
         let src = plan.shaders.source()?;
         if src.iter().any(|b| !b.is_ascii_whitespace()) {
@@ -229,45 +229,80 @@ fn shader_cache() -> Option<&'static str> {
 
 struct Device(*mut ff::AVBufferRef);
 unsafe impl Send for Device {}
-unsafe impl Sync for Device {}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        unsafe { ff::av_buffer_unref(&mut self.0) };
+    }
+}
+
+enum Slot {
+    Untried,
+    Unavailable,
+    /// The device, and when it was last seen in use.
+    Ready(Device, std::time::Instant),
+}
 
 /// One Vulkan device for the whole process. Creating one takes a second or
 /// more on some drivers; without it each libplacebo filter makes its own.
+static DEVICE: parking_lot::Mutex<Slot> = parking_lot::Mutex::new(Slot::Untried);
+
+/// A new reference to the shared Vulkan device, creating it on first use.
 fn device() -> Option<*mut ff::AVBufferRef> {
-    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| {
-            let t0 = std::time::Instant::now();
-            let mut buf = ptr::null_mut();
-            let r = unsafe {
-                ff::av_hwdevice_ctx_create(
-                    &mut buf,
-                    ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
-                    ptr::null(),
-                    ptr::null_mut(),
-                    0,
-                )
-            };
-            if r < 0 || buf.is_null() {
-                log::warn!("no Vulkan device for GPU upscaling: {}", av::err_str(r));
-                return None;
-            }
+    let mut slot = DEVICE.lock();
+    if let Slot::Untried = *slot {
+        let t0 = std::time::Instant::now();
+        let mut buf = ptr::null_mut();
+        let r = unsafe {
+            ff::av_hwdevice_ctx_create(
+                &mut buf,
+                ff::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        *slot = if r < 0 || buf.is_null() {
+            log::warn!("no Vulkan device for GPU upscaling: {}", av::err_str(r));
+            Slot::Unavailable
+        } else {
             log::debug!("upscale: Vulkan device ready in {:.0} ms", t0.elapsed().as_secs_f64() * 1000.0);
-            Some(Device(buf))
-        })
-        .as_ref()
-        .map(|d| d.0)
+            Slot::Ready(Device(buf), std::time::Instant::now())
+        };
+    }
+    match &mut *slot {
+        Slot::Ready(d, used) => {
+            *used = std::time::Instant::now();
+            let r = unsafe { ff::av_buffer_ref(d.0) };
+            (!r.is_null()).then_some(r)
+        }
+        _ => None,
+    }
+}
+
+/// Closes the Vulkan device once no filter has held it for `idle` (call it
+/// every second or so). It is tens of MB of driver memory.
+pub fn release_idle(idle: std::time::Duration) {
+    let Some(mut slot) = DEVICE.try_lock() else { return };
+    let Slot::Ready(d, used) = &mut *slot else { return };
+    if unsafe { ff::av_buffer_get_ref_count(d.0) } > 1 {
+        *used = std::time::Instant::now();
+    } else if used.elapsed() >= idle {
+        log::debug!("upscale: closing the idle Vulkan device");
+        *slot = Slot::Untried;
+    }
 }
 
 /// Starts creating the Vulkan device in the background when a GPU upscaler
 /// is chosen, so the first picture doesn't wait for it.
 pub fn prewarm(cfg: &EngineConfig) {
-    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if cfg.upscaler.needs_libplacebo() && available() && !STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if cfg.upscaler.needs_libplacebo() && available() {
         std::thread::Builder::new()
             .name("vulkan-init".into())
             .spawn(|| {
-                device();
+                if let Some(mut d) = device() {
+                    unsafe { ff::av_buffer_unref(&mut d) };
+                }
             })
             .ok();
     }
@@ -327,9 +362,17 @@ mod tests {
     fn shader_graph_upscales_frames() {
         use super::super::av::Frame;
         use super::super::filters::Graph;
-        if !available() || device().is_none() {
-            eprintln!("skipped: no libplacebo/Vulkan");
-            return;
+        match device() {
+            Some(mut d) if available() => unsafe { ff::av_buffer_unref(&mut d) },
+            Some(mut d) => {
+                unsafe { ff::av_buffer_unref(&mut d) };
+                eprintln!("skipped: no libplacebo/Vulkan");
+                return;
+            }
+            None => {
+                eprintln!("skipped: no libplacebo/Vulkan");
+                return;
+            }
         }
         for (u, mode) in [
             (Upscaler::Anime4K, Anime4KMode::A),

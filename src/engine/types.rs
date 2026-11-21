@@ -16,6 +16,13 @@ pub enum MediaSource {
         title: u32,
         angle: u32,
     },
+    /// An audio CD track: `device` is a drive (`/dev/sr0`, `D:`) or a
+    /// `.cue` image of an audio CD. Track 0 means "the whole disc" (the UI
+    /// expands it into one item per track).
+    Cd {
+        device: String,
+        track: u32,
+    },
 }
 
 impl MediaSource {
@@ -35,6 +42,8 @@ impl MediaSource {
                     .unwrap_or_else(|| path.clone());
                 if *title == 0 { format!("DVD ({base})") } else { format!("DVD ({base}) – Title {title}") }
             }
+            MediaSource::Cd { track: 0, .. } => "Audio CD".into(),
+            MediaSource::Cd { track, .. } => format!("Audio CD – Track {track}"),
         }
     }
 
@@ -44,6 +53,7 @@ impl MediaSource {
             MediaSource::File(p) => p.display().to_string(),
             MediaSource::Url(u) => u.clone(),
             MediaSource::Dvd { path, title, .. } => format!("dvd://{title}/{path}"),
+            MediaSource::Cd { device, track } => format!("cdda://{track}/{device}"),
         }
     }
 }
@@ -189,12 +199,6 @@ pub fn language_matches(lang: &str, pref: &str) -> bool {
     a == b || language_name(&a).eq_ignore_ascii_case(&language_name(&b))
 }
 
-/// A stream tag that names an actual language (not "und", "mul", …).
-pub fn is_known_language(lang: &str) -> bool {
-    let l = lang.trim().to_ascii_lowercase();
-    !l.is_empty() && !matches!(l.as_str(), "und" | "unk" | "mul" | "mis" | "zxx" | "qaa" | "none")
-}
-
 /// The desktop's languages, most preferred first, as ISO 639-1 codes
 /// ("en", "pt"): `LANGUAGE`/`LC_ALL`/`LC_MESSAGES`/`LANG` on Unix, the user's
 /// display languages on Windows and macOS.
@@ -222,42 +226,22 @@ fn locale_language(loc: &str) -> Option<String> {
         .then_some(l)
 }
 
-/// Chooses which subtitle track to show, or none.
+/// Chooses the subtitle track to show when subtitles are on.
 ///
-/// `langs` is the preference order. `want` means subtitles were asked for
-/// (the "always show" setting, or the user turned them on); otherwise full
-/// subtitles only come on when the audio is in another language than the
-/// preferred subtitles, and forced ones (signs, foreign dialogue) when there
-/// are any.
-pub fn pick_subtitle(info: &MediaInfo, audio: Option<TrackId>, langs: &[String], want: bool) -> Option<TrackId> {
+/// `langs` is the preference order. The audio language doesn't matter: the
+/// user turned subtitles on, so they get full subtitles even when the audio
+/// is in the same language. Full subtitles come before forced-only ones,
+/// plain before SDH, flagged default first; with nothing in a preferred
+/// language, the best of the rest.
+pub fn pick_subtitle(info: &MediaInfo, langs: &[String]) -> Option<TrackId> {
     let subs: Vec<&Track> = info.tracks_of(TrackKind::Subtitle).collect();
-    let audio_lang = audio
-        .and_then(|a| info.tracks.iter().find(|t| t.id == a))
-        .and_then(|t| t.language.as_deref())
-        .filter(|l| is_known_language(l));
     let is_lang = |t: &Track, l: &str| t.language.as_deref().is_some_and(|tl| language_matches(tl, l));
-    // Full subtitles before forced-only, plain before SDH, flagged default first.
     let rank = |t: &&Track| (t.forced, t.hearing_impaired, !t.default);
-
-    for l in langs {
-        let Some(t) = subs.iter().copied().filter(|t| !t.forced && is_lang(t, l)).min_by_key(rank) else { continue };
-        let foreign_audio = audio_lang.is_some_and(|al| !language_matches(al, l));
-        if want || foreign_audio {
-            return Some(t.id);
-        }
-        // The audio is (probably) in this language: only forced subtitles.
-        break;
-    }
-    let forced: Vec<&Track> = subs.iter().copied().filter(|t| t.forced).collect();
-    let forced_pick = audio_lang
-        .and_then(|al| forced.iter().find(|t| is_lang(t, al)))
-        .or_else(|| langs.iter().find_map(|l| forced.iter().find(|t| is_lang(t, l))))
-        .or(forced.first());
-    if !want {
-        return forced_pick.map(|t| t.id);
-    }
-    // Asked for, but nothing in a preferred language: the best of the rest.
-    subs.iter().copied().min_by_key(rank).map(|t| t.id)
+    langs
+        .iter()
+        .find_map(|l| subs.iter().copied().filter(|t| is_lang(t, l)).min_by_key(rank))
+        .or_else(|| subs.iter().copied().min_by_key(rank))
+        .map(|t| t.id)
 }
 
 #[derive(Clone, Debug)]
@@ -350,6 +334,76 @@ pub struct PlaybackState {
     pub dropped_frames: u64,
     pub decoded_frames: u64,
     pub seeking: bool,
+    /// Where a DVD played with its menus is (`None` for anything else).
+    pub dvd: Option<DvdState>,
+}
+
+/// The part of a DVD that is playing.
+#[cfg_attr(not(has_dvdnav), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DvdDomain {
+    /// The disc's opening program (warnings, logos).
+    FirstPlay,
+    /// A menu.
+    Menu,
+    /// A title (film, episode, extra).
+    Title,
+}
+
+/// A DVD played with its menus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DvdState {
+    pub domain: DvdDomain,
+    /// Buttons on screen (menus; some titles have them too).
+    pub buttons: u32,
+    /// The highlighted button (1-based, 0 when none).
+    pub button: u32,
+    /// Current title and chapter (0 outside titles).
+    pub title: u32,
+    pub chapter: u32,
+    pub titles: u32,
+    pub angle: u32,
+    pub angles: u32,
+}
+
+impl DvdState {
+    /// Arrow keys, Enter and the mouse go to the disc's buttons.
+    pub fn takes_input(&self) -> bool {
+        self.buttons > 0
+    }
+}
+
+/// The menus a DVD can have (not every disc has all of them).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DvdMenu {
+    /// The disc's main (title) menu.
+    Title,
+    /// The menu of the title playing (often the same as the main menu).
+    Root,
+    Subtitle,
+    Audio,
+    Angle,
+    Chapter,
+}
+
+/// Remote-control input for a DVD played with its menus.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DvdCommand {
+    Up,
+    Down,
+    Left,
+    Right,
+    Activate,
+    /// Highlights the button under this point of the picture (in the
+    /// video's own pixels, e.g. 0..720 × 0..480).
+    Hover(f32, f32),
+    /// Activates the button under this point.
+    Click(f32, f32),
+    Menu(DvdMenu),
+    /// Back: from a menu, resume the title; otherwise the menu above.
+    Back,
+    PlayTitle(u32),
+    Angle(u32),
 }
 
 impl Default for PlaybackState {
@@ -366,6 +420,7 @@ impl Default for PlaybackState {
             dropped_frames: 0,
             decoded_frames: 0,
             seeking: false,
+            dvd: None,
         }
     }
 }
@@ -635,12 +690,16 @@ pub struct EngineConfig {
     pub tone_map_hdr: bool,
     pub audio_langs: Vec<String>,
     pub sub_langs: Vec<String>,
-    pub subs_enabled_by_default: bool,
+    /// Subtitles are on: each file starts with its best subtitle track.
+    pub show_subs: bool,
     pub auto_load_subs: bool,
     pub sub_charset: Option<String>,
     pub network_cache_secs: f64,
     pub decoder_threads: u32,
     pub dvd_region: u32,
+    /// Play DVDs with their menus (when libdvdnav is available).
+    #[cfg_attr(not(has_dvdnav), allow(dead_code))]
+    pub dvd_menus: bool,
     pub user_agent: String,
 }
 
@@ -661,12 +720,13 @@ impl Default for EngineConfig {
             tone_map_hdr: true,
             audio_langs: vec![],
             sub_langs: vec![],
-            subs_enabled_by_default: false,
+            show_subs: false,
             auto_load_subs: true,
             sub_charset: None,
             network_cache_secs: 10.0,
             decoder_threads: 0,
             dvd_region: 0,
+            dvd_menus: true,
             user_agent: format!("MavPlayer/{}", env!("CARGO_PKG_VERSION")),
         }
     }
@@ -748,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn subtitles_follow_foreign_audio() {
+    fn subtitles_ignore_audio_language() {
         let mut signs = track(3, TrackKind::Subtitle, "eng");
         signs.forced = true;
         let mut sdh = track(4, TrackKind::Subtitle, "eng");
@@ -761,30 +821,29 @@ mod tests {
             track(5, TrackKind::Subtitle, "eng"),
             track(6, TrackKind::Subtitle, "ger"),
         ]);
-        let jpn = Some(TrackId::Stream(0));
-        let eng = Some(TrackId::Stream(1));
-        // Japanese audio: full English subtitles, not the signs or SDH track.
-        assert_eq!(pick_subtitle(&m, jpn, &langs(&["en"]), false), Some(TrackId::Stream(5)));
-        // English audio: just the forced signs, unless subtitles are wanted.
-        assert_eq!(pick_subtitle(&m, eng, &langs(&["en"]), false), Some(TrackId::Stream(3)));
-        assert_eq!(pick_subtitle(&m, eng, &langs(&["en"]), true), Some(TrackId::Stream(5)));
+        // Full English subtitles, not the signs or SDH track, whatever the audio.
+        assert_eq!(pick_subtitle(&m, &langs(&["en"])), Some(TrackId::Stream(5)));
         // The first preferred language that has subtitles wins.
-        assert_eq!(pick_subtitle(&m, jpn, &langs(&["fr", "de", "en"]), false), Some(TrackId::Stream(6)));
+        assert_eq!(pick_subtitle(&m, &langs(&["fr", "de", "en"])), Some(TrackId::Stream(6)));
+        // Forced-only in a preferred language beats nothing in it.
+        let mut fr = track(7, TrackKind::Subtitle, "fre");
+        fr.forced = true;
+        let m = media(vec![fr, track(8, TrackKind::Subtitle, "spa")]);
+        assert_eq!(pick_subtitle(&m, &langs(&["fr"])), Some(TrackId::Stream(7)));
     }
 
     #[test]
-    fn subtitles_when_asked_for() {
-        // One untagged track: shown when asked for, whatever the preferences.
+    fn subtitles_without_preferred_language() {
+        // One untagged track: shown whatever the preferences.
         let m = media(vec![track(0, TrackKind::Audio, ""), track(1, TrackKind::Subtitle, "")]);
-        assert_eq!(pick_subtitle(&m, Some(TrackId::Stream(0)), &langs(&["en"]), false), None);
-        assert_eq!(pick_subtitle(&m, Some(TrackId::Stream(0)), &langs(&["en"]), true), Some(TrackId::Stream(1)));
-        assert_eq!(pick_subtitle(&m, None, &[], true), Some(TrackId::Stream(1)));
+        assert_eq!(pick_subtitle(&m, &langs(&["en"])), Some(TrackId::Stream(1)));
+        assert_eq!(pick_subtitle(&m, &[]), Some(TrackId::Stream(1)));
         // No preferred language: the default-flagged track.
         let mut fr = track(2, TrackKind::Subtitle, "fre");
         fr.default = true;
         let m = media(vec![track(1, TrackKind::Subtitle, "spa"), fr]);
-        assert_eq!(pick_subtitle(&m, None, &langs(&["en"]), true), Some(TrackId::Stream(2)));
-        assert_eq!(pick_subtitle(&media(vec![]), None, &[], true), None);
+        assert_eq!(pick_subtitle(&m, &langs(&["en"])), Some(TrackId::Stream(2)));
+        assert_eq!(pick_subtitle(&media(vec![]), &[]), None);
     }
 
     #[test]

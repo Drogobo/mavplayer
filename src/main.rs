@@ -8,18 +8,27 @@ mod font_prefetch;
 mod icons;
 mod instance;
 mod integration;
+mod mem;
 mod playlist;
 mod settings;
 mod ui;
 
 use gpui::{App, Application};
+
+/// The system allocator, keeping a few big blocks (video frames) for reuse.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[global_allocator]
+static ALLOC: mem::Alloc = mem::Alloc;
 use std::path::PathBuf;
 
 const HELP: &str = "\
-MavPlayer — play video, music, streams and DVDs
+MavPlayer — play video, music, streams, DVDs and audio CDs
 
 USAGE:
-    mavplayer [OPTIONS] [FILE | FOLDER | URL | dvd://[TITLE][/DEVICE]] ...
+    mavplayer [OPTIONS] [FILE | FOLDER | URL | dvd://[TITLE][/DEVICE] | cdda://[TRACK][/DEVICE]] ...
+
+    dvd:// starts at the disc's menu (title 0); dvd://TITLE plays one title.
+    cdda:// plays every track of an audio CD; a .cue file plays a CD image.
 
 OPTIONS:
     -f, --fullscreen          Start in fullscreen
@@ -139,6 +148,7 @@ fn exit_with(r: anyhow::Result<String>) -> ! {
 }
 
 fn main() {
+    mem::tune();
     let start = std::time::Instant::now();
     *START.lock() = Some(start);
     let args = parse_args();
@@ -161,6 +171,7 @@ fn main() {
         return;
     }
     engine::init(verbose);
+    mem::start();
 
     // Requests from later launches, the OS and the tray icon, for the UI thread.
     let (tx, rx) = ui::shell::channel();
@@ -191,8 +202,9 @@ fn main() {
     #[cfg(target_os = "linux")]
     let fonts = font_prefetch::start();
     let boot = if background {
-        // No file yet, but have the GPU ready for the first one.
-        engine::prewarm(&settings.engine_config());
+        // No file yet, and no GPU devices for one: the hardware decoder alone
+        // would more than double the memory this process sits in the tray with.
+        // The first file opens them.
         ui::shell::Start::Background { settings, tray }
     } else {
         // Start opening the first file now: it decodes while GPUI brings up the GPU.
@@ -232,4 +244,14 @@ fn main() {
     });
     // Hands the tray over to the process that waits in it, if one was started.
     ui::shell::finish_handover();
+    // Leave without running the exit handlers. Engine threads may still be
+    // freeing the last file's decoders, and CUDA's handler tears the driver
+    // down under them: NVDEC's cleanup then crashes. Settings and resume
+    // positions were saved when the window closed.
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        unsafe { libc::_exit(0) }
+    }
 }

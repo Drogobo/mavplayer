@@ -141,6 +141,7 @@ fn main() {
     println!("cargo:rerun-if-changed=packaging/windows/mavplayer.ico");
 
     link_clang_runtime_on_macos();
+    detect_dvdnav();
 
     #[cfg(windows)]
     {
@@ -159,6 +160,40 @@ fn main() {
 /// into clang's runtime (`__isPlatformVersionAtLeast`). C programs get that
 /// library automatically, but rustc links with `-nodefaultlibs`, so a static
 /// FFmpeg needs it added by hand.
+/// DVD menus call libdvdnav directly (FFmpeg's `dvdvideo` demuxer uses it
+/// too, but only plays titles). Enables `cfg(has_dvdnav)` when it can be
+/// linked: from the static FFmpeg's own link flags, or as a shared library
+/// found with pkg-config. Without it DVDs play title by title.
+fn detect_dvdnav() {
+    println!("cargo::rustc-check-cfg=cfg(has_dvdnav)");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=MAVPLAYER_NO_DVDNAV");
+    if env::var_os("MAVPLAYER_NO_DVDNAV").is_some() {
+        return;
+    }
+    let pkg_config = |args: &[&str]| -> Option<String> {
+        let exe = env::var("PKG_CONFIG").unwrap_or_else(|_| "pkg-config".into());
+        let out = std::process::Command::new(exe).args(args).output().ok()?;
+        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    if env::var_os("CARGO_FEATURE_STATIC_FFMPEG").is_some() {
+        // ffmpeg-sys links libavformat's private libraries, libdvdnav among them.
+        if pkg_config(&["--static", "--libs", "libavformat"]).is_some_and(|l| l.contains("-ldvdnav")) {
+            println!("cargo:rustc-cfg=has_dvdnav");
+        }
+        return;
+    }
+    if let Some(libs) = pkg_config(&["--libs", "dvdnav"]) {
+        for tok in libs.split_whitespace() {
+            if let Some(dir) = tok.strip_prefix("-L") {
+                println!("cargo:rustc-link-search=native={dir}");
+            }
+        }
+        println!("cargo:rustc-link-lib=dylib=dvdnav");
+        println!("cargo:rustc-cfg=has_dvdnav");
+    }
+}
+
 fn link_clang_runtime_on_macos() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") || env::var_os("CARGO_FEATURE_STATIC_FFMPEG").is_none()
     {

@@ -115,6 +115,8 @@ commands! {
         OpenFolder, "Open folder…", ["secondary-f"];
         OpenUrl, "Open URL…", ["secondary-u"];
         OpenDisc, "Open disc…", ["secondary-d"];
+        DiscMenu, "Disc menu (DVD)", ["shift-m"];
+        DiscTitleMenu, "Disc title menu (DVD)", ["shift-t"];
         SavePlaylist, "Save playlist…", ["secondary-s"];
         ShowMediaInfo, "Media information", ["i", "secondary-i"];
     ]
@@ -185,6 +187,13 @@ pub fn apply(cx: &mut App, overrides: &BTreeMap<String, Vec<String>>) {
         current.insert(c.id, keys);
     }
     bindings.push(KeyBinding::new("escape", CloseOverlay, Some("Overlay")));
+    // A DVD menu's buttons take the arrow keys and Enter (after the rest,
+    // so they win over seeking and volume while it shows).
+    bindings.push(KeyBinding::new("up", DiscUp, Some(DVD_CTX)));
+    bindings.push(KeyBinding::new("down", DiscDown, Some(DVD_CTX)));
+    bindings.push(KeyBinding::new("left", DiscLeft, Some(DVD_CTX)));
+    bindings.push(KeyBinding::new("right", DiscRight, Some(DVD_CTX)));
+    bindings.push(KeyBinding::new("enter", DiscActivate, Some(DVD_CTX)));
     cx.clear_key_bindings();
     cx.bind_keys(bindings);
     super::text_input::bind_keys(cx);

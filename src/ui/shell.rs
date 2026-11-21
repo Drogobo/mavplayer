@@ -10,11 +10,17 @@
 //!
 //! GPUI ends its event loop when the last window closes on Linux and Windows,
 //! so there the closing process starts a fresh `mavplayer --background` and
-//! quits. The icon must not blink out meanwhile: the new process shows its
-//! tray icon first thing and reports "ready" on a pipe, and only then does
-//! the old one remove its own icon and exit (`finish_handover`). That also keeps the waiting process lean: it never played anything
+//! quits. That also keeps the waiting process lean: it never played anything
 //! (about 100 MB of private memory on NVIDIA, mostly the GPU driver and
-//! GPUI's font database).
+//! GPUI's font database). The hand-over (`finish_handover`):
+//! 1. The new process shows its tray icon first thing. On Linux it takes over
+//!    the old icon's D-Bus name, so Plasma never sees the icon go (see
+//!    `tray.rs`). It reports "ready" on its stdout pipe.
+//! 2. The old process frees the instance socket's name, closes the new one's
+//!    stdin, removes its icon and exits.
+//! 3. The new process, seeing its stdin close, listens on the socket straight
+//!    away and brings up GPUI.
+//!
 //! On macOS the app simply stays running without windows.
 
 use super::player::{Boot, PlayerView};
@@ -273,9 +279,8 @@ thread_local! {
 const READY: &str = "mavplayer-tray-ready";
 
 /// After GPUI has ended (from `main`): if a new process is taking over in
-/// the tray, waits until its icon is up (at most a few seconds), then removes
-/// this one's and exits at once, so the new process gets the instance socket
-/// without waiting for this one to tear down.
+/// the tray, waits until its icon is up (at most a few seconds), then lets it
+/// have the instance socket and removes this one's icon.
 pub fn finish_handover() {
     #[cfg(not(target_os = "macos"))]
     if let Some((tray, mut child)) = HANDOVER.with(|h| h.borrow_mut().take()) {
@@ -294,23 +299,35 @@ pub fn finish_handover() {
             if ready { "shows its tray icon" } else { "didn't report a tray icon" },
             t0.elapsed().as_secs_f64() * 1000.0
         );
+        crate::instance::release();
+        // Its cue to listen on the socket.
+        drop(child.stdin.take());
         drop(tray);
-        std::process::exit(0);
+        // `main` then exits at once (on Linux without the exit handlers).
     }
 }
 
 /// Tells the process handing over to this one that our tray icon is up
-/// (`--handover`), then stops using the pipe, whose reader is about to exit.
+/// (`--handover`), then waits (briefly) for it to free the instance socket,
+/// which it signals by closing our stdin.
 pub fn report_ready() {
-    use std::io::Write;
+    use std::io::{Read, Write};
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{READY}");
     let _ = out.flush();
     drop(out);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = std::io::stdin().lock().read_to_end(&mut Vec::new());
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+    // The pipe's reader has exited: don't let a later write fail.
     #[cfg(target_os = "linux")]
     unsafe {
-        let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if null >= 0 {
+            libc::dup2(null, 0);
             libc::dup2(null, 1);
             libc::close(null);
         }
@@ -318,7 +335,8 @@ pub fn report_ready() {
 }
 
 /// Starts `mavplayer --background --handover`, detached from this process
-/// (and its terminal), with its standard output piped back for `READY`.
+/// (and its terminal), with its standard output piped back for `READY` and
+/// its standard input kept open until it may take the instance socket.
 #[cfg(not(target_os = "macos"))]
 fn spawn_background() -> anyhow::Result<std::process::Child> {
     use std::process::{Command, Stdio};
@@ -334,7 +352,7 @@ fn spawn_background() -> anyhow::Result<std::process::Child> {
     } else {
         Command::new(&exe)
     };
-    cmd.args(["--background", "--handover"]).stdin(Stdio::null()).stdout(Stdio::piped());
+    cmd.args(["--background", "--handover"]).stdin(Stdio::piped()).stdout(Stdio::piped());
     if log::log_enabled!(log::Level::Debug) {
         cmd.arg("-v");
     } else {

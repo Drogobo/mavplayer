@@ -19,12 +19,17 @@
 
 mod audio;
 pub mod av;
+pub mod cdda;
 mod decoder;
 mod demux;
 pub mod disc;
 mod filters;
+#[cfg(has_dvdnav)]
+mod nav;
 mod present;
 pub mod probe;
+#[cfg(has_dvdnav)]
+mod spu;
 mod subs;
 mod sync;
 pub mod types;
@@ -32,6 +37,11 @@ mod upscale;
 mod video;
 
 pub use types::*;
+
+/// Whether DVDs can be played with their menus (this build has libdvdnav).
+pub fn dvd_menus_available() -> bool {
+    cfg!(has_dvdnav)
+}
 
 /// Whether the GPU upscalers (libplacebo: EWA Lanczos and shaders) are
 /// available in this FFmpeg build.
@@ -176,6 +186,12 @@ pub struct SessionCtx {
     standby_flag: AtomicBool,
     /// The session this one was preloaded to follow (0 if none).
     pub follows: u64,
+    /// A DVD played with its menus: the disc's navigator.
+    #[cfg(has_dvdnav)]
+    pub nav: Mutex<Option<Arc<nav::Nav>>>,
+    /// Draws DVD subpictures (menu buttons) instead of FFmpeg's decoder.
+    #[cfg(has_dvdnav)]
+    pub spu_overlay: Mutex<Option<Arc<spu::Overlay>>>,
 }
 
 impl SessionCtx {
@@ -403,6 +419,10 @@ fn new_session(controls: &Arc<Controls>, shared: &Arc<Shared>, source: &MediaSou
         standby_flag: AtomicBool::new(standby.is_some()),
         standby: Mutex::new(standby),
         follows,
+        #[cfg(has_dvdnav)]
+        nav: Mutex::new(None),
+        #[cfg(has_dvdnav)]
+        spu_overlay: Mutex::new(None),
     };
     let speed = controls.speed();
     ctx.aclk.set_speed(speed);
@@ -453,8 +473,6 @@ fn advance(ctx: &SessionCtx) -> bool {
 
 impl Player {
     pub fn new(config: EngineConfig, wake: impl Fn() + Send + Sync + 'static) -> Self {
-        upscale::prewarm(&config);
-        decoder::prewarm_hw(config.hwdec);
         let (tx, rx) = crossbeam_channel::unbounded();
         Player {
             controls: Arc::new(Controls {
@@ -751,8 +769,10 @@ impl Player {
     }
 
     pub fn set_config(&self, cfg: EngineConfig) {
-        upscale::prewarm(&cfg);
-        decoder::prewarm_hw(cfg.hwdec);
+        // GPU upscaling just turned on for the video playing.
+        if self.session.as_ref().is_some_and(|s| s.ctx.video_active.load(Ordering::Acquire)) {
+            upscale::prewarm(&cfg);
+        }
         *self.controls.config.lock() = cfg;
     }
 
@@ -825,6 +845,21 @@ impl Player {
         }
     }
 
+    /// Remote-control input for a DVD played with its menus. Returns false
+    /// when nothing took it (not such a DVD, or the disc refused it).
+    pub fn dvd_command(&self, cmd: DvdCommand) -> bool {
+        #[cfg(has_dvdnav)]
+        if let Some(s) = &self.session
+            && let Some(nav) = s.ctx.nav.lock().clone()
+        {
+            let ok = nav.command(cmd);
+            s.ctx.wake_demuxer();
+            return ok;
+        }
+        let _ = cmd;
+        false
+    }
+
     pub fn has_frame(&self) -> bool {
         self.session.as_ref().map(|s| s.ctx.last_frame.lock().is_some()).unwrap_or(false)
     }
@@ -844,11 +879,11 @@ pub fn init(verbose: bool) {
     }
 }
 
-/// Starts opening what the first file will need from the GPU (the hardware
-/// decoding device, and the Vulkan device for GPU upscaling) in the background.
-pub fn prewarm(config: &EngineConfig) {
-    upscale::prewarm(config);
-    decoder::prewarm_hw(config.hwdec);
+/// Closes GPU devices (hardware decoding, GPU upscaling) that nothing has
+/// used for `idle`. Call it every second or so.
+pub fn release_idle_devices(idle: std::time::Duration) {
+    decoder::release_idle_hw(idle);
+    upscale::release_idle(idle);
 }
 
 /// Lists audio output devices by name.

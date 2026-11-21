@@ -203,7 +203,10 @@ pub struct Settings {
     pub audio_fx: AudioFx,
     // Subtitles
     pub sub_langs: String,
-    pub subs_enabled_by_default: bool,
+    /// Subtitles are on. Only the user changes it (the subtitle button, V,
+    /// the track menus, Preferences), and it carries over to later files and launches.
+    #[serde(alias = "subs_enabled_by_default")]
+    pub show_subtitles: bool,
     pub auto_load_subs: bool,
     pub sub_scale: f32,
     pub sub_margin: f32,
@@ -213,6 +216,8 @@ pub struct Settings {
     pub network_cache_secs: f64,
     pub dvd_region: u32,
     pub dvd_device: Option<String>,
+    /// Start DVDs at the disc's own menu (otherwise straight into the main feature).
+    pub dvd_menus: bool,
     // Advanced
     pub decoder_threads: u32,
     // Remembered state
@@ -277,7 +282,7 @@ impl Default for Settings {
             audio_langs: String::new(),
             audio_fx: AudioFx::default(),
             sub_langs: String::new(),
-            subs_enabled_by_default: false,
+            show_subtitles: false,
             auto_load_subs: true,
             sub_scale: 1.0,
             sub_margin: 0.05,
@@ -286,6 +291,7 @@ impl Default for Settings {
             network_cache_secs: 10.0,
             dvd_region: 0,
             dvd_device: None,
+            dvd_menus: true,
             decoder_threads: 0,
             volume: 1.0,
             muted: false,
@@ -333,12 +339,13 @@ impl Settings {
             tone_map_hdr: self.tone_map_hdr,
             audio_langs: split_langs(&self.audio_langs),
             sub_langs: sub_lang_prefs(&self.sub_langs),
-            subs_enabled_by_default: self.subs_enabled_by_default,
+            show_subs: self.show_subtitles,
             auto_load_subs: self.auto_load_subs,
             sub_charset: Some(self.sub_charset.trim().to_string()).filter(|s| !s.is_empty()),
             network_cache_secs: self.network_cache_secs,
             decoder_threads: self.decoder_threads,
             dvd_region: self.dvd_region,
+            dvd_menus: self.dvd_menus,
             ..EngineConfig::default()
         }
     }

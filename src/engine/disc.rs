@@ -1,5 +1,5 @@
-//! DVD-Video helpers: recognising discs/images/folders, finding optical
-//! drives and listing titles. Playback itself goes through FFmpeg's
+//! Disc helpers: recognising DVDs (discs, images, folders) and audio CD
+//! images, finding optical drives and listing DVD titles. Playback itself goes through FFmpeg's
 //! `dvdvideo` demuxer (libdvdnav/libdvdread, plus libdvdcss when present).
 
 use super::demux;
@@ -103,18 +103,30 @@ pub fn optical_drives() -> Vec<OpticalDrive> {
                         path: p.display().to_string(),
                         label: e.file_name().to_string_lossy().into_owned(),
                     });
+                } else if super::cdda::mounted_cd_tracks(&p).is_some() {
+                    v.push(OpticalDrive {
+                        path: p.display().to_string(),
+                        label: format!("Audio CD ({})", e.file_name().to_string_lossy()),
+                    });
                 }
             }
         }
     }
     #[cfg(target_os = "windows")]
     {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetDriveTypeW(root: *const u16) -> u32;
+        }
+        const DRIVE_CDROM: u32 = 5;
         for letter in b'C'..=b'Z' {
             let root = format!("{}:\\", letter as char);
-            if Path::new(&root).join("VIDEO_TS").is_dir() {
+            let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+            let optical = unsafe { GetDriveTypeW(wide.as_ptr()) } == DRIVE_CDROM;
+            if optical || Path::new(&root).join("VIDEO_TS").is_dir() {
                 v.push(OpticalDrive {
                     path: format!("{}:", letter as char),
-                    label: format!("DVD in drive {}:", letter as char),
+                    label: format!("Disc drive {}:", letter as char),
                 });
             }
         }
@@ -156,5 +168,44 @@ pub fn main_title(titles: &[DvdTitle]) -> Option<u32> {
 }
 
 pub fn is_disc_source(p: &Path) -> Option<MediaSource> {
+    if super::cdda::is_cue(p) {
+        // A cue sheet of an audio CD image (not one for a FLAC or WAV album,
+        // whose audio file plays by itself).
+        return super::cdda::read_toc(&p.to_string_lossy())
+            .ok()
+            .map(|_| MediaSource::Cd { device: p.display().to_string(), track: 0 });
+    }
     dvd_root(p).map(|path| MediaSource::Dvd { path, title: 0, angle: 1 })
+}
+
+/// What is in an optical drive.
+#[derive(Clone, Debug)]
+pub enum DiscContent {
+    Dvd(Vec<DvdTitle>),
+    AudioCd(super::cdda::CdToc),
+    /// An audio CD the system mounted as files (macOS), in track order.
+    MountedCd(Vec<std::path::PathBuf>),
+    Unreadable,
+}
+
+/// Looks at the disc in `path` (a drive, image or folder). Slow on
+/// physical discs (it may spin one up): call it from a background thread.
+pub fn read_disc(path: &str, cfg: &EngineConfig) -> DiscContent {
+    let p = Path::new(path);
+    if let Some(files) = super::cdda::mounted_cd_tracks(p) {
+        return DiscContent::MountedCd(files);
+    }
+    let is_cue = super::cdda::is_cue(p);
+    // A drive with an audio CD answers the TOC request quickly; trying the
+    // DVD reader first would wait for it to give up on a disc without files.
+    if is_cue || !p.is_dir() && !path.to_ascii_lowercase().ends_with(".iso") {
+        if let Ok(toc) = super::cdda::read_toc(path) {
+            return DiscContent::AudioCd(toc);
+        }
+        if is_cue {
+            return DiscContent::Unreadable;
+        }
+    }
+    let titles = probe_titles(path, cfg, 99);
+    if titles.is_empty() { DiscContent::Unreadable } else { DiscContent::Dvd(titles) }
 }

@@ -113,6 +113,26 @@ mod imp {
         }
     }
 
+    /// The item's D-Bus name. It stays the same from one process to the next:
+    /// the process taking over in the tray requests it with
+    /// `ReplaceExisting`, the name passes straight to it, and Plasma (whose
+    /// watcher drops an item only once its name has no owner) keeps the icon
+    /// as it is. A host that tracks items by unique name (the GNOME
+    /// extension) shows the new item next to the old one until that exits.
+    /// A separate config folder gets its own name, as it gets its own socket.
+    fn bus_name() -> String {
+        let base = format!("{}.Tray", crate::integration::APP_ID);
+        match std::env::var_os("MAVPLAYER_CONFIG_DIR") {
+            Some(d) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                d.hash(&mut h);
+                format!("{base}.c{:016x}", h.finish())
+            }
+            None => base,
+        }
+    }
+
     /// ARGB32 in network byte order, as StatusNotifierItem wants.
     fn argb_icon(size: u32) -> Option<ksni::Icon> {
         let (mut px, w, h) = super::icon_rgba(size).ok()?;
@@ -127,10 +147,14 @@ mod imp {
     impl Tray {
         pub fn new(on_event: Handler) -> anyhow::Result<Self> {
             let icons = [16, 22, 24, 32, 48, 64].into_iter().filter_map(argb_icon).collect();
-            // A Flatpak sandbox may not own the item's usual bus name.
+            // A Flatpak sandbox may not own the item's usual bus name (it
+            // can own `bus_name`, which is under the app ID).
             let sandboxed = std::env::var_os("FLATPAK_ID").is_some() || std::path::Path::new("/.flatpak-info").exists();
-            let handle =
-                Item { on_event, icons }.disable_dbus_name(sandboxed).spawn().map_err(|e| anyhow::anyhow!("{e}"))?;
+            let handle = Item { on_event, icons }
+                .disable_dbus_name(sandboxed)
+                .dbus_name(Some(bus_name()))
+                .spawn()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(Self(handle))
         }
     }

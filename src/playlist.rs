@@ -228,6 +228,7 @@ impl Playlist {
                 MediaSource::File(p) => p.display().to_string(),
                 MediaSource::Url(u) => u.clone(),
                 MediaSource::Dvd { path, title, .. } => format!("dvd://{title}/{path}"),
+                MediaSource::Cd { device, track } => format!("cdda://{track}/{device}"),
             };
             if entry.contains(['\r', '\n']) {
                 continue; // can't be represented in M3U
@@ -298,6 +299,10 @@ fn scan_dir(dir: &Path, out: &mut Vec<MediaSource>, depth: u32, seen: &mut HashS
             }
         } else if is_media_path(&p) {
             out.push(source_for_path(&p));
+        } else if crate::engine::cdda::is_cue(&p)
+            && let Some(cd) = disc::is_disc_source(&p)
+        {
+            out.push(cd);
         }
     }
 }
@@ -325,6 +330,9 @@ pub fn source_for_arg(arg: &str) -> MediaSource {
         };
         return MediaSource::Dvd { path, title, angle: 1 };
     }
+    if lower.starts_with("cdda://") {
+        return cdda_source(&arg[7..]);
+    }
     if let Some(p) = file_uri_path(arg) {
         return source_for_path(&p);
     }
@@ -332,6 +340,31 @@ pub fn source_for_arg(arg: &str) -> MediaSource {
         return MediaSource::Url(arg.to_string());
     }
     source_for_path(Path::new(arg))
+}
+
+/// `cdda://[TRACK][/DEVICE]` (track 0 or none: the whole disc), plus the
+/// desktop's `cdda://sr0/…` form (GIO), which names the drive first.
+fn cdda_source(rest: &str) -> MediaSource {
+    let rest = crate::engine::percent_decode(rest);
+    let (head, tail) = rest.split_once('/').unwrap_or((&rest, ""));
+    let is_drive_name = |h: &str| h.starts_with("sr") && h.len() > 2 && h[2..].chars().all(|c| c.is_ascii_digit());
+    let (track, device) = if head.chars().all(|c| c.is_ascii_digit()) {
+        (head.parse().unwrap_or(0), tail.to_string())
+    } else if is_drive_name(head) {
+        // "Track 3.wav" → 3
+        let n: String = tail.chars().filter(|c| c.is_ascii_digit()).collect();
+        (n.parse().unwrap_or(0), format!("/dev/{head}"))
+    } else {
+        (0, rest.to_string())
+    };
+    let device = if device.is_empty() {
+        default_dvd_device()
+    } else if cfg!(unix) && !device.starts_with('/') {
+        format!("/{device}")
+    } else {
+        device
+    };
+    MediaSource::Cd { device, track }
 }
 
 pub fn default_dvd_device() -> String {
@@ -421,6 +454,19 @@ mod tests {
 
     fn names(p: &Playlist) -> Vec<String> {
         p.items.iter().map(|i| i.source.display_name()).collect()
+    }
+
+    #[test]
+    fn cdda_urls() {
+        let cd = |a: &str| match source_for_arg(a) {
+            MediaSource::Cd { device, track } => (device, track),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(cd("cdda://3/dev/sr1"), ("/dev/sr1".into(), 3));
+        assert_eq!(cd("cdda:///dev/sr1"), ("/dev/sr1".into(), 0));
+        assert_eq!(cd("cdda://sr0/"), ("/dev/sr0".into(), 0));
+        assert_eq!(cd("cdda://sr0/Track%207.wav"), ("/dev/sr0".into(), 7));
+        assert_eq!(cd("cdda://2").1, 2);
     }
 
     #[test]

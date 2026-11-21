@@ -624,8 +624,6 @@ dependencies = [
 [[package]]
 name = "blade-graphics"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e71cfb73b98eb9f58ee84048aa1bdf4e7497fd20c141b57523499fa066b48fed"
 dependencies = [
  "ash",
  "ash-window",
@@ -3144,8 +3142,6 @@ dependencies = [
 [[package]]
 name = "ksni"
 version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bcc1cb43797140f74b711f1c4a49f48a7a7429f211c5fb78264e7bcd1e99caf"
 dependencies = [
  "arc-swap",
  "async-executor",
@@ -3406,7 +3402,7 @@ dependencies = [
 
 [[package]]
 name = "mavplayer"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "cpal",

@@ -8,15 +8,15 @@ use super::text_input::{InputEvent, TextInput};
 use super::theme::Theme;
 use crate::engine::disc::{self, DvdTitle};
 use crate::engine::{
-    self, Deinterlace, HwDecode, LoadOptions, MediaSource, Player, PlayerEvent, Rotation, Status, SubEvent, TrackId,
-    TrackKind, VideoAdjust,
+    self, Deinterlace, DvdCommand, DvdMenu, HwDecode, LoadOptions, MediaSource, Player, PlayerEvent, Rotation, Status,
+    SubEvent, TrackId, TrackKind, VideoAdjust,
 };
 use crate::icons;
 use crate::playlist::{self, Playlist};
 use crate::settings::{RepeatMode, ResumeStore, Settings};
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, PathPromptOptions, Pixels, RenderImage,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, ImageId, PathPromptOptions, Pixels, RenderImage,
     Subscription, Window, px, size,
 };
 use std::cell::Cell;
@@ -109,7 +109,10 @@ pub struct PlayerView {
     // Picture
     pub frame: Option<Arc<RenderImage>>,
     pub frame_size: (u32, u32),
-    retired: VecDeque<(Arc<RenderImage>, u8)>,
+    /// Textures to free a few frames from now (`retire_textures`). Only the
+    /// ID is kept: holding the image would keep its pixels (8 MB for a 1080p
+    /// frame) alive after GPUI has uploaded and let go of them.
+    retired: VecDeque<(ImageId, u8)>,
     pub sub_images: HashMap<u64, (Arc<RenderImage>, u32)>,
     pub subs: Vec<SubEvent>,
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -151,10 +154,6 @@ pub struct PlayerView {
     pub zoom: f32,
     pub video_adjust: VideoAdjust,
     pub sub_delay: f64,
-    pub subs_visible: bool,
-    /// The user turned subtitles on or off this session: later files follow
-    /// that instead of the "always show subtitles" setting.
-    pub subs_on: Option<bool>,
     /// The Keyboard Shortcuts page is waiting for the keystroke to add to this command.
     pub capturing_key: Option<&'static str>,
     /// What the last change on the Keyboard Shortcuts page did (shown there).
@@ -163,6 +162,9 @@ pub struct PlayerView {
     pub modal_scroll: gpui::ScrollHandle,
     pub options_scroll: gpui::ScrollHandle,
     pub dvd_titles: Option<(String, Vec<DvdTitle>)>,
+    /// What the Open Disc dialog found in the selected drive or image
+    /// (`None` while it is being read).
+    pub disc_scan: Option<(String, Option<disc::DiscContent>)>,
     pub reading_disc: bool,
     pub fitted_for: Option<u64>,
     /// A requested window size and how many more times to re-apply it if
@@ -183,6 +185,8 @@ pub struct PlayerView {
     /// Frames received from the engine and renders since `ui_stats.2`, for
     /// the once-a-second `-v` report.
     pub ui_stats: (u32, u32, Instant),
+    /// The window has been rendered once (for the startup timings).
+    pub rendered: bool,
     /// The window surface is currently declared non-opaque (see
     /// [`PlayerView::avoid_direct_scanout`]).
     surface_translucent: bool,
@@ -252,8 +256,10 @@ impl Boot {
         player.set_audio_fx(settings.audio_fx.clone());
         let resume = ResumeStore::load();
         // A whole DVD (title 0) needs its titles probed first; that runs in the view.
+        let dvd_menus = engine::dvd_menus_available() && settings.dvd_menus;
         let started = match sources.first() {
-            Some(MediaSource::Dvd { title: 0, .. }) | None => false,
+            Some(MediaSource::Dvd { title: 0, .. }) if !dvd_menus => false,
+            Some(MediaSource::Cd { track: 0, .. }) | None => false,
             Some(src) => {
                 let start_at = if settings.resume_playback { resume.get(&src.key()) } else { None };
                 // Paused until the window exists, so sound doesn't start
@@ -399,13 +405,12 @@ impl PlayerView {
             zoom: 1.0,
             video_adjust: VideoAdjust::default(),
             sub_delay: 0.0,
-            subs_visible: true,
-            subs_on: None,
             capturing_key: None,
             shortcut_note: None,
             modal_scroll: gpui::ScrollHandle::new(),
             options_scroll: gpui::ScrollHandle::new(),
             dvd_titles: None,
+            disc_scan: None,
             reading_disc: false,
             fitted_for: None,
             pending_fit: None,
@@ -420,6 +425,7 @@ impl PlayerView {
             editing_volume: false,
             volume_blur: None,
             ui_stats: (0, 0, Instant::now()),
+            rendered: false,
             surface_translucent: false,
             frame_pad: 0,
             frame_painted: false,
@@ -473,12 +479,8 @@ impl PlayerView {
                 let img = Arc::new(RenderImage::new(smallvec::smallvec![image::Frame::new(buf)]));
                 // A frame that was never drawn has no texture: just drop it.
                 // (Retiring those would pile up while the window isn't drawn.)
-                if let Some(old) = self.frame.replace(img)
-                    && self.frame_painted
-                {
-                    self.retired.push_back((old, 3));
-                }
-                self.frame_painted = false;
+                let old = self.frame.replace(img);
+                self.retire_frame(old);
             }
             // Pictures arrive but nothing is drawn: the compositor isn't
             // showing the window. Stop converting frames for it until it is.
@@ -511,7 +513,7 @@ impl PlayerView {
                     }
                 }
                 PlayerEvent::Warning(w) => self.osd(w, cx),
-                PlayerEvent::TracksChanged => {}
+                PlayerEvent::TracksChanged => self.ensure_subtitle(),
                 PlayerEvent::ScreenshotSaved(p) => self.osd(format!("Screenshot saved: {}", p.display()), cx),
             }
         }
@@ -538,6 +540,7 @@ impl PlayerView {
         {
             self.osd(format!("Resumed at {}", super::widgets::format_time(pos)), cx);
         }
+        self.ensure_subtitle();
         self.fit_window_if_needed(window, cx);
     }
 
@@ -620,7 +623,8 @@ impl PlayerView {
         }
         // Keep the last picture for a seamless cut, unless nothing will replace it.
         if self.player.with_state(|s| s.video.is_none()) {
-            self.frame = None;
+            let old = self.frame.take();
+            self.retire_frame(old);
         }
         self.subs.clear();
         self.update_next();
@@ -722,6 +726,18 @@ impl PlayerView {
 
     /// Drops GPU textures of frames that have been off screen for a few
     /// renders (the GPU may still be reading the most recent ones).
+    /// Frees the texture of a picture no longer shown, a few frames later.
+    /// A picture that was never drawn has none: it is just dropped.
+    /// (Retiring those would pile up while the window isn't drawn.)
+    fn retire_frame(&mut self, old: Option<Arc<RenderImage>>) {
+        if let Some(old) = old
+            && self.frame_painted
+        {
+            self.retired.push_back((old.id, 3));
+        }
+        self.frame_painted = false;
+    }
+
     pub fn retire_textures(&mut self, window: &mut Window) {
         self.last_render = Instant::now();
         if self.video_hidden {
@@ -733,8 +749,11 @@ impl PlayerView {
             e.1 = e.1.saturating_sub(1);
         }
         while self.retired.front().is_some_and(|e| e.1 == 0) {
-            let (img, _) = self.retired.pop_front().unwrap();
-            let _ = window.drop_image(img);
+            let (id, _) = self.retired.pop_front().unwrap();
+            // `drop_image` only reads the ID (and the frame count: one).
+            let mut stub = RenderImage::new(smallvec::smallvec![image::Frame::new(image::RgbaImage::new(1, 1))]);
+            stub.id = id;
+            let _ = window.drop_image(Arc::new(stub));
         }
         // Subtitle bitmaps not shown for a while.
         let stale: Vec<u64> = self
@@ -747,7 +766,7 @@ impl PlayerView {
             .collect();
         for id in stale {
             if let Some((img, _)) = self.sub_images.remove(&id) {
-                self.retired.push_back((img, 3));
+                self.retired.push_back((img.id, 3));
             }
         }
     }
@@ -766,6 +785,8 @@ impl PlayerView {
         if let (Some(src), Some(m)) = (st.source, st.media)
             && !m.is_live
             && m.seekable
+            // A DVD with menus starts at its menu again.
+            && st.dvd.is_none()
             && matches!(st.status, Status::Playing | Status::Paused)
         {
             self.resume.remember(src.key(), self.player.position(), m.duration);
@@ -827,10 +848,17 @@ impl PlayerView {
         self.playlist_selected = Some(idx);
         self.ab_loop = (None, None);
         self.sub_delay = 0.0;
-        self.frame = None;
+        let old = self.frame.take();
+        self.retire_frame(old);
         self.subs.clear();
-        if let MediaSource::Dvd { path, title: 0, .. } = &item.source {
+        if let MediaSource::Dvd { path, title: 0, .. } = &item.source
+            && !self.dvd_menus_on()
+        {
             self.open_dvd_auto(path.clone(), window, cx);
+            return;
+        }
+        if let MediaSource::Cd { device, track: 0 } = &item.source {
+            self.open_audio_cd(device.clone(), idx, paused, window, cx);
             return;
         }
         self.load_counter += 1;
@@ -840,9 +868,18 @@ impl PlayerView {
             let start_at = if self.settings.resume_playback { self.resume.get(&item.source.key()) } else { None };
             self.player.load(item.source.clone(), LoadOptions { start_at, start_paused: paused, ..Default::default() });
         }
-        self.settings.add_recent(&item.source);
+        match &item.source {
+            // One entry for the whole disc, not one per track.
+            MediaSource::Cd { device, .. } => {
+                self.settings.add_recent(&MediaSource::Cd { device: device.clone(), track: 0 })
+            }
+            src => self.settings.add_recent(src),
+        }
         window.set_window_title(&format!("{} — MavPlayer", item.display_title()));
-        if let MediaSource::Dvd { path, .. } = &item.source
+        // The title list (for the DVD Titles menu); a disc played with its
+        // menus has its own, and reading it meanwhile would make the drive seek.
+        if let MediaSource::Dvd { path, title, .. } = &item.source
+            && (*title > 0 || !self.dvd_menus_on())
             && self.dvd_titles.as_ref().map(|(p, _)| p != path).unwrap_or(true)
         {
             self.probe_dvd_titles(path.clone(), None, window, cx);
@@ -936,6 +973,7 @@ impl PlayerView {
             let ext = paths[0].extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
             if engine_sub_ext(&ext) {
                 self.player.add_subtitle_file(&paths[0]);
+                self.remember_subtitles(true);
                 self.osd(format!("Subtitles: {}", paths[0].file_name().unwrap_or_default().to_string_lossy()), cx);
                 return;
             }
@@ -1017,6 +1055,7 @@ impl PlayerView {
                 let _ = this.update_in(cx, |v, window, cx| {
                     if subtitle {
                         v.player.add_subtitle_file(&paths[0]);
+                        v.remember_subtitles(true);
                     } else {
                         v.open_paths(paths, window, cx);
                     }
@@ -1058,6 +1097,143 @@ impl PlayerView {
             });
         })
         .detach();
+    }
+
+    /// DVDs start at their own menu.
+    pub fn dvd_menus_on(&self) -> bool {
+        engine::dvd_menus_available() && self.settings.dvd_menus
+    }
+
+    /// A DVD playing with its menus shows buttons: arrow keys, Enter and
+    /// the mouse go to them.
+    pub fn dvd_buttons(&self) -> bool {
+        self.player.with_state(|s| s.dvd.as_ref().is_some_and(|d| d.takes_input()))
+    }
+
+    /// Shows one of the disc's menus. A DVD playing title by title is
+    /// reopened with its menus first.
+    pub fn dvd_menu(&mut self, menu: DvdMenu, window: &mut Window, cx: &mut Context<Self>) {
+        if self.player.with_state(|s| s.dvd.is_some()) {
+            let ok = self.player.dvd_command(DvdCommand::Menu(menu))
+                || (menu == DvdMenu::Root && self.player.dvd_command(DvdCommand::Menu(DvdMenu::Title)));
+            if !ok {
+                self.osd("The disc doesn't offer that menu here", cx);
+            }
+            return;
+        }
+        let Some(MediaSource::Dvd { path, .. }) = self.player.with_state(|s| s.source.clone()) else {
+            self.osd("Disc menus are for DVDs", cx);
+            return;
+        };
+        if !engine::dvd_menus_available() {
+            self.osd("This build of MavPlayer can't show DVD menus", cx);
+            return;
+        }
+        self.save_current_position();
+        let src = MediaSource::Dvd { path, title: 0, angle: 1 };
+        if let Some(i) = self.playlist.current {
+            self.playlist.items[i].source = src.clone();
+            self.playlist.items[i].title = None;
+        }
+        self.player.load(src, LoadOptions::default());
+        self.load_counter += 1;
+        cx.notify();
+        let _ = window;
+    }
+
+    /// Sends a remote-control command to a DVD playing with its menus.
+    pub fn dvd(&mut self, cmd: DvdCommand, cx: &mut Context<Self>) {
+        if self.player.dvd_command(cmd) {
+            cx.notify();
+        }
+    }
+
+    /// A point in the window → the DVD picture's own pixels (for buttons).
+    pub fn dvd_point(&self, p: gpui::Point<Pixels>) -> Option<(f32, f32)> {
+        let rect = super::render::video_rect(self.video_bounds.get(), self.frame_size, self.aspect, self.zoom);
+        let (cw, ch) = self.player.subtitle_canvas();
+        let (w, h) = (f32::from(rect.size.width), f32::from(rect.size.height));
+        if cw == 0 || ch == 0 || w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let (x, y) = (f32::from(p.x - rect.origin.x) / w, f32::from(p.y - rect.origin.y) / h);
+        ((0.0..1.0).contains(&x) && (0.0..1.0).contains(&y)).then_some((x * cw as f32, y * ch as f32))
+    }
+
+    /// Reads an audio CD's track list and puts one playlist item per track
+    /// in place of item `idx` (the whole disc), then plays the first.
+    pub fn open_audio_cd(
+        &mut self,
+        device: String,
+        idx: usize,
+        paused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reading_disc = true;
+        self.player.stop();
+        self.osd("Reading CD…", cx);
+        let d = device.clone();
+        let task = cx.background_executor().spawn(async move { engine::cdda::read_toc(&d) });
+        cx.spawn_in(window, async move |this, cx| {
+            let toc = task.await;
+            let _ = this.update_in(cx, |v, window, cx| {
+                v.reading_disc = false;
+                let toc = match toc {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if let Some(it) = v.playlist.items.get_mut(idx) {
+                            it.failed = true;
+                        }
+                        v.osd(format!("Could not read the CD: {e}"), cx);
+                        cx.notify();
+                        return;
+                    }
+                };
+                v.play_cd_tracks(device, &toc, Some(idx), 0, paused, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Puts an audio CD's tracks in the playlist (in place of item `replace`,
+    /// or replacing everything) and plays track number `first` (0-based).
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_cd_tracks(
+        &mut self,
+        device: String,
+        toc: &engine::cdda::CdToc,
+        replace: Option<usize>,
+        first: usize,
+        paused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sources: Vec<MediaSource> =
+            toc.tracks.iter().map(|t| MediaSource::Cd { device: device.clone(), track: t.number }).collect();
+        if sources.is_empty() {
+            self.osd("The CD has no audio tracks", cx);
+            return;
+        }
+        let at = match replace.filter(|&i| i < self.playlist.items.len()) {
+            Some(i) => {
+                self.playlist.remove(i);
+                i
+            }
+            None => {
+                self.save_current_position();
+                self.playlist.clear();
+                0
+            }
+        };
+        let range = self.playlist.insert(at, sources);
+        for (it, t) in self.playlist.items[range.clone()].iter_mut().zip(&toc.tracks) {
+            it.title = Some(t.title.clone().unwrap_or_else(|| format!("Track {}", t.number)));
+            it.artist = t.artist.clone();
+            it.duration = Some(t.duration());
+            it.probed = true;
+        }
+        self.start_item(range.start + first.min(range.len() - 1), true, paused, window, cx);
     }
 
     pub fn play_dvd_title(&mut self, path: String, title: u32, window: &mut Window, cx: &mut Context<Self>) {
@@ -1248,13 +1424,8 @@ impl PlayerView {
         cx.notify();
     }
 
-    /// The engine settings, with this session's subtitle on/off choice.
     pub fn engine_config(&self) -> crate::engine::EngineConfig {
-        let mut c = self.settings.engine_config();
-        if let Some(on) = self.subs_on {
-            c.subs_enabled_by_default = on;
-        }
-        c
+        self.settings.engine_config()
     }
 
     pub fn apply_settings(&mut self, cx: &mut Context<Self>) {
@@ -1275,7 +1446,8 @@ impl PlayerView {
             TrackKind::Video => "Video",
         };
         if kind == TrackKind::Subtitle {
-            self.subs_visible = true;
+            // Picking a track turns subtitles on, "Off" turns them off.
+            self.remember_subtitles(id.is_some());
         }
         self.osd(format!("{what}: {label}"), cx);
     }
@@ -1290,39 +1462,76 @@ impl PlayerView {
         })
     }
 
+    /// Subtitles are on (the user's choice, kept across files and launches).
+    /// A chosen track is hidden while they are off.
+    pub fn subs_visible(&self) -> bool {
+        self.settings.show_subtitles
+    }
+
     /// Subtitles are on screen (a track is chosen and not hidden).
     pub fn subs_shown(&self) -> bool {
-        self.subs_visible && self.player.with_state(|s| s.selected.subtitle.is_some())
+        self.subs_visible() && self.player.with_state(|s| s.selected.subtitle.is_some())
     }
 
     /// The subtitle track to show when the user asks for subtitles.
     fn best_subtitle(&self) -> Option<TrackId> {
         let langs = self.settings.engine_config().sub_langs;
-        self.player
-            .with_state(|s| s.media.as_ref().and_then(|m| engine::pick_subtitle(m, s.selected.audio, &langs, true)))
+        self.player.with_state(|s| s.media.as_ref().and_then(|m| engine::pick_subtitle(m, &langs)))
+    }
+
+    /// Records the user's subtitle on/off choice: saved right away, and the
+    /// engine starts later files (and the one queued next) with it.
+    fn remember_subtitles(&mut self, on: bool) {
+        if self.settings.show_subtitles == on {
+            return;
+        }
+        self.settings.show_subtitles = on;
+        self.player.set_config(self.engine_config());
+        self.settings.save();
+    }
+
+    /// With subtitles on, a file that started without a track (it was queued
+    /// before they were turned on, or its subtitle file loaded later) gets
+    /// the best one.
+    pub fn ensure_subtitle(&mut self) {
+        if !self.subs_visible() || self.player.with_state(|s| s.selected.subtitle.is_some()) {
+            return;
+        }
+        if let Some(id) = self.best_subtitle() {
+            self.player.select_track(TrackKind::Subtitle, Some(id));
+        }
+    }
+
+    /// Turns subtitles on or off (Preferences): the same as the subtitle button.
+    pub fn set_show_subtitles(&mut self, on: bool) {
+        self.remember_subtitles(on);
+        self.ensure_subtitle();
     }
 
     /// Show / hide subtitles. Showing picks the best track by itself when
-    /// none is chosen yet, and later files follow the choice.
+    /// none is chosen yet, and later files and launches follow the choice.
     fn toggle_subtitles(&mut self, cx: &mut Context<Self>) {
         let cur = self.player.with_state(|s| s.selected.subtitle);
-        if self.subs_visible && cur.is_some() {
-            self.subs_visible = false;
-            self.subs_on = Some(false);
-            self.player.set_config(self.engine_config());
+        if self.subs_visible() && cur.is_some() {
+            self.remember_subtitles(false);
+            // A DVD with menus always draws its pictures (buttons, forced
+            // subtitles): deselect rather than hide.
+            if self.player.with_state(|s| s.dvd.is_some()) {
+                self.player.select_track(TrackKind::Subtitle, None);
+            }
             self.osd("Subtitles off", cx);
             return;
         }
         let Some(id) = cur.or_else(|| self.best_subtitle()) else {
+            // Nothing to show here, but later files come with subtitles.
+            self.remember_subtitles(true);
             self.osd("No subtitles", cx);
             return;
         };
-        self.subs_on = Some(true);
-        self.player.set_config(self.engine_config());
         if cur.is_none() {
             self.select_track(TrackKind::Subtitle, Some(id), cx);
         } else {
-            self.subs_visible = true;
+            self.remember_subtitles(true);
             let label = self.track_label(TrackKind::Subtitle, Some(id));
             self.osd(format!("Subtitles: {label}"), cx);
         }
@@ -1350,15 +1559,11 @@ impl PlayerView {
         }
         let pos = ids.iter().position(|i| Some(*i) == cur);
         let next = match pos {
-            Some(_) if kind == TrackKind::Subtitle && !self.subs_visible => cur,
+            Some(_) if kind == TrackKind::Subtitle && !self.subs_visible() => cur,
             Some(p) => Some(ids[(p as isize + step).rem_euclid(ids.len() as isize) as usize]),
             None if kind == TrackKind::Subtitle => self.best_subtitle().or(Some(ids[0])),
             None => Some(ids[0]),
         };
-        if kind == TrackKind::Subtitle {
-            self.subs_on = Some(true);
-            self.player.set_config(self.engine_config());
-        }
         self.select_track(kind, next, cx);
     }
 
@@ -1550,7 +1755,8 @@ impl PlayerView {
     pub fn stop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_current_position();
         self.player.stop();
-        self.frame = None;
+        let old = self.frame.take();
+        self.retire_frame(old);
         self.subs.clear();
         window.set_window_title("MavPlayer");
         cx.notify();
@@ -1627,6 +1833,13 @@ impl PlayerView {
         let vstep = self.settings.volume_step / 100.0;
         on!(el,
             TogglePause => |this, _w, _cx| this.player.toggle_pause(),
+            DiscUp => |this, _w, cx| this.dvd(DvdCommand::Up, cx),
+            DiscDown => |this, _w, cx| this.dvd(DvdCommand::Down, cx),
+            DiscLeft => |this, _w, cx| this.dvd(DvdCommand::Left, cx),
+            DiscRight => |this, _w, cx| this.dvd(DvdCommand::Right, cx),
+            DiscActivate => |this, _w, cx| this.dvd(DvdCommand::Activate, cx),
+            DiscMenu => |this, w, cx| this.dvd_menu(DvdMenu::Root, w, cx),
+            DiscTitleMenu => |this, w, cx| this.dvd_menu(DvdMenu::Title, w, cx),
             Stop => |this, w, cx| this.stop(w, cx),
             PlayNext => |this, w, cx| this.next_item(w, cx),
             PlayPrevious => |this, w, cx| this.prev_item(w, cx),

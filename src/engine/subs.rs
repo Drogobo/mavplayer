@@ -45,7 +45,7 @@ impl SubStore {
         *self.active_external.lock() = i;
     }
 
-    fn add_event(&self, ev: SubEvent) {
+    pub(super) fn add_event(&self, ev: SubEvent) {
         let mut g = self.embedded.lock();
         // Bitmap formats (PGS, DVD, DVB) replace the previous picture.
         if matches!(ev.content, SubContent::Bitmap(_)) {
@@ -61,8 +61,19 @@ impl SubStore {
         }
     }
 
+    /// Replaces the bitmap event that starts when `ev` does (a DVD menu
+    /// redrawn with another button highlighted), or adds it.
+    #[cfg_attr(not(has_dvdnav), allow(dead_code))]
+    pub(super) fn replace_bitmap(&self, ev: SubEvent) {
+        let mut g = self.embedded.lock();
+        match g.iter_mut().rev().find(|e| matches!(e.content, SubContent::Bitmap(_)) && e.start == ev.start) {
+            Some(old) => old.content = ev.content,
+            None => g.push(ev),
+        }
+    }
+
     /// A "clear screen" packet (bitmap subtitle with no rectangles).
-    fn end_bitmaps_at(&self, t: f64) {
+    pub(super) fn end_bitmaps_at(&self, t: f64) {
         let mut g = self.embedded.lock();
         for old in g.iter_mut().rev().take(8) {
             if old.end > t && old.start <= t {

@@ -93,10 +93,8 @@ impl PlayerView {
                 }
             }
             Dialog::OpenDisc => {
-                let drives = disc::optical_drives();
-                if let Some(d) = drives.first()
-                    && self.dvd_titles.as_ref().map(|(p, _)| p != &d.path).unwrap_or(true)
-                {
+                // Read the first drive (again: the disc may have changed).
+                if let Some(d) = disc::optical_drives().first() {
                     self.scan_disc(d.path.clone(), cx);
                 }
                 window.focus(&self.focus);
@@ -119,21 +117,45 @@ impl PlayerView {
     }
 
     fn scan_disc(&mut self, path: String, cx: &mut Context<Self>) {
-        self.reading_disc = true;
-        self.dvd_titles = Some((path.clone(), vec![]));
+        if self.disc_scan.as_ref().is_some_and(|(p, c)| *p == path && c.is_none()) {
+            return; // already reading it
+        }
+        self.disc_scan = Some((path.clone(), None));
         let cfg = self.settings.engine_config();
         let p = path.clone();
-        let task = cx.background_executor().spawn(async move { disc::probe_titles(&p, &cfg, 99) });
+        let task = cx.background_executor().spawn(async move { disc::read_disc(&p, &cfg) });
         cx.spawn(async move |this, cx| {
-            let titles = task.await;
+            let content = task.await;
             let _ = this.update(cx, |v, cx| {
-                v.reading_disc = false;
-                v.dvd_titles = Some((path, titles));
+                if v.disc_scan.as_ref().is_none_or(|(p, _)| *p != path) {
+                    return; // another drive was chosen meanwhile
+                }
+                if let disc::DiscContent::Dvd(titles) = &content {
+                    v.dvd_titles = Some((path.clone(), titles.clone()));
+                }
+                v.disc_scan = Some((path, Some(content)));
                 cx.notify();
             });
         })
         .detach();
         cx.notify();
+    }
+
+    /// Plays a whole DVD from the dialog: from its menu, or its main feature.
+    fn play_disc_dvd(&mut self, path: String, menus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_dialog(window, cx);
+        if menus {
+            self.save_current_position();
+            self.playlist.clear();
+            self.playlist.add(vec![engine::MediaSource::Dvd { path, title: 0, angle: 1 }]);
+            self.play_index(0, window, cx);
+            return;
+        }
+        self.playlist.clear();
+        match self.dvd_titles.as_ref().filter(|(p, _)| *p == path).and_then(|(_, t)| disc::main_title(t)) {
+            Some(n) => self.play_dvd_title(path, n, window, cx),
+            None => self.open_dvd_auto(path, window, cx),
+        }
     }
 
     pub fn on_input_submit(&mut self, key: &'static str, window: &mut Window, cx: &mut Context<Self>) {
@@ -1514,10 +1536,10 @@ impl PlayerView {
                     .child(self.row("Preferred subtitle languages", Some(&sub_langs_hint), self.input_box("sub_langs")))
                     .child(self.toggle_row(
                         "subdef",
-                        "Always show subtitles",
-                        Some("Otherwise only forced subtitles or foreign-language ones appear"),
-                        s.subs_enabled_by_default,
-                        |t, _| t.settings.subs_enabled_by_default = !t.settings.subs_enabled_by_default,
+                        "Show subtitles",
+                        Some("Remembered for later videos and launches. The subtitle button and menus change it too"),
+                        s.show_subtitles,
+                        |t, _| t.set_show_subtitles(!t.settings.show_subtitles),
                         cx,
                     ))
                     .child(self.toggle_row(
@@ -1586,6 +1608,16 @@ impl PlayerView {
                         ),
                     ))
                     .child(self.section("DVD"))
+                    .when(engine::dvd_menus_available(), |c| {
+                        c.child(self.toggle_row(
+                            "dvd-menus",
+                            "Start DVDs at the disc menu",
+                            Some("Off: play the main feature straight away"),
+                            s.dvd_menus,
+                            |t, _| t.settings.dvd_menus = !t.settings.dvd_menus,
+                            cx,
+                        ))
+                    })
                     .child(
                         self.row(
                             "Player region",
@@ -2122,7 +2154,9 @@ impl PlayerView {
                 match src {
                     engine::MediaSource::File(p) => p.display().to_string(),
                     engine::MediaSource::Url(u) => u.clone(),
+                    engine::MediaSource::Dvd { path, title: 0, .. } => format!("DVD {path} (with menus)"),
                     engine::MediaSource::Dvd { path, title, .. } => format!("DVD {path}, title {title}"),
+                    engine::MediaSource::Cd { device, track } => format!("Audio CD {device}, track {track}"),
                 },
             ));
         }
@@ -2223,12 +2257,12 @@ impl PlayerView {
     fn disc_dialog(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let drives = disc::optical_drives();
-        let selected = self.dvd_titles.as_ref().map(|(p, _)| p.clone());
+        let selected = self.disc_scan.as_ref().map(|(p, _)| p.clone());
         let mut c = div().p_4().flex().flex_col().gap_2();
         c = c.child(self.section("Source"));
         if drives.is_empty() {
             c = c.child(div().text_size(px(13.)).text_color(t.text_dim).child(
-                "No disc drives with a DVD were found. You can open a DVD folder (VIDEO_TS) or an ISO image instead.",
+                "No disc drives were found. You can open a DVD folder (VIDEO_TS), a DVD ISO image or an audio CD image (.cue) instead.",
             ));
         }
         for d in drives {
@@ -2266,92 +2300,168 @@ impl PlayerView {
                 ))
                 .child(self.text_button(
                     "disc-iso",
-                    "Open ISO Image…",
+                    "Open Disc Image…",
                     false,
                     |this, _, w, cx| this.pick_disc(false, w, cx),
                     cx,
                 )),
         );
-        if let Some((path, titles)) = self.dvd_titles.clone() {
-            c = c.child(self.section(&format!("Titles on {path}")));
-            if self.reading_disc && titles.is_empty() {
-                c = c.child(div().text_size(px(13.)).text_color(t.text_dim).child("Reading disc…"));
-            } else if titles.is_empty() {
-                c = c.child(
-                    div()
-                        .text_size(px(13.))
-                        .text_color(t.danger)
-                        .child("No titles could be read. Is this a DVD-Video disc? Encrypted discs need libdvdcss."),
-                );
+        let note = |text: String, color| div().text_size(px(13.)).text_color(color).child(text);
+        let row = |id: String| {
+            div()
+                .id(SharedString::from(id))
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .h(px(34.))
+                .flex_none()
+                .rounded(px(7.))
+                .cursor_pointer()
+                .hover(|s| s.bg(t.hover))
+        };
+        let mut footer = div().flex().gap_2();
+        match self.disc_scan.clone() {
+            None => {}
+            Some((path, None)) => {
+                c = c.child(self.section(&format!("On {path}"))).child(note("Reading disc…".into(), t.text_dim));
             }
-            let main = disc::main_title(&titles);
-            for tt in titles {
-                let (p, n) = (path.clone(), tt.number);
-                c = c.child(
-                    div()
-                        .id(SharedString::from(format!("title-{n}")))
-                        .flex()
-                        .items_center()
-                        .gap_3()
-                        .px_3()
-                        .h(px(34.))
-                        .rounded(px(7.))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(t.hover))
-                        .child(div().w(px(70.)).text_size(px(13.)).child(format!("Title {n}")))
-                        .child(div().w(px(70.)).text_size(px(13.)).child(format_time(tt.duration)))
-                        .child(
-                            div()
-                                .w(px(90.))
-                                .text_size(px(12.))
-                                .text_color(t.text_dim)
-                                .child(format!("{} chapters", tt.chapters)),
-                        )
-                        .child(div().flex_1().truncate().text_size(px(12.)).text_color(t.text_dim).child({
-                            let mut d = tt.audio.join(", ");
-                            if !tt.subtitles.is_empty() {
-                                d.push_str(&format!(" · subtitles: {}", tt.subtitles.join(", ")));
-                            }
-                            d
-                        }))
-                        .when(main == Some(n), |d| {
-                            d.child(
+            Some((path, Some(disc::DiscContent::Unreadable))) => {
+                c = c.child(self.section(&format!("On {path}"))).child(note(
+                    "No DVD or audio CD could be read. Is there a disc in the drive? Encrypted DVDs need libdvdcss."
+                        .into(),
+                    t.danger,
+                ));
+            }
+            Some((path, Some(disc::DiscContent::Dvd(titles)))) => {
+                c = c.child(self.section(&format!("DVD titles on {path}")));
+                let main = disc::main_title(&titles);
+                for tt in titles {
+                    let (p, n) = (path.clone(), tt.number);
+                    c = c.child(
+                        row(format!("title-{n}"))
+                            .child(div().w(px(70.)).text_size(px(13.)).child(format!("Title {n}")))
+                            .child(div().w(px(70.)).text_size(px(13.)).child(format_time(tt.duration)))
+                            .child(
                                 div()
-                                    .px_2()
-                                    .rounded(px(4.))
-                                    .bg(t.accent_soft)
-                                    .text_color(t.accent)
-                                    .text_size(px(11.))
-                                    .child("Main feature"),
+                                    .w(px(90.))
+                                    .text_size(px(12.))
+                                    .text_color(t.text_dim)
+                                    .child(format!("{} chapters", tt.chapters)),
                             )
-                        })
-                        .on_click(cx.listener(move |this, _, w, cx| {
-                            this.close_dialog(w, cx);
-                            this.playlist.clear();
-                            this.play_dvd_title(p.clone(), n, w, cx);
-                        })),
-                );
+                            .child(div().flex_1().truncate().text_size(px(12.)).text_color(t.text_dim).child({
+                                let mut d = tt.audio.join(", ");
+                                if !tt.subtitles.is_empty() {
+                                    d.push_str(&format!(" · subtitles: {}", tt.subtitles.join(", ")));
+                                }
+                                d
+                            }))
+                            .when(main == Some(n), |d| {
+                                d.child(
+                                    div()
+                                        .px_2()
+                                        .rounded(px(4.))
+                                        .bg(t.accent_soft)
+                                        .text_color(t.accent)
+                                        .text_size(px(11.))
+                                        .child("Main feature"),
+                                )
+                            })
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.close_dialog(w, cx);
+                                this.playlist.clear();
+                                this.play_dvd_title(p.clone(), n, w, cx);
+                            })),
+                    );
+                }
+                let menus = engine::dvd_menus_available();
+                if menus {
+                    let p = path.clone();
+                    footer = footer.child(self.text_button(
+                        "disc-menus",
+                        "Play from Disc Menu",
+                        self.settings.dvd_menus,
+                        move |this, _, w, cx| this.play_disc_dvd(p.clone(), true, w, cx),
+                        cx,
+                    ));
+                }
+                footer = footer.child(self.text_button(
+                    "disc-play",
+                    "Play Main Feature",
+                    !menus || !self.settings.dvd_menus,
+                    move |this, _, w, cx| this.play_disc_dvd(path.clone(), false, w, cx),
+                    cx,
+                ));
+            }
+            Some((path, Some(disc::DiscContent::AudioCd(toc)))) => {
+                let mut head = "Audio CD".to_string();
+                match (&toc.artist, &toc.album) {
+                    (Some(a), Some(t)) => head = format!("{a} – {t}"),
+                    (None, Some(t)) => head = t.clone(),
+                    _ => {}
+                }
+                c = c.child(self.section(&head));
+                let total: f64 = toc.tracks.iter().map(|t| t.duration()).sum();
+                c = c.child(note(format!("{} tracks, {}", toc.tracks.len(), format_time(total)), t.text_dim));
+                for (k, tr) in toc.tracks.iter().enumerate() {
+                    let (p, toc2) = (path.clone(), toc.clone());
+                    let name = tr.title.clone().unwrap_or_else(|| format!("Track {}", tr.number));
+                    let artist = tr.artist.clone().filter(|a| Some(a) != toc.artist.as_ref());
+                    c = c.child(
+                        row(format!("track-{}", tr.number))
+                            .child(
+                                div()
+                                    .w(px(28.))
+                                    .text_size(px(12.))
+                                    .text_color(t.text_dim)
+                                    .child(format!("{}", tr.number)),
+                            )
+                            .child(div().flex_1().truncate().text_size(px(13.)).child(match artist {
+                                Some(a) => format!("{name} – {a}"),
+                                None => name,
+                            }))
+                            .child(div().text_size(px(12.)).text_color(t.text_dim).child(format_time(tr.duration())))
+                            .on_click(cx.listener(move |this, _, w, cx| {
+                                this.close_dialog(w, cx);
+                                this.play_cd_tracks(p.clone(), &toc2, None, k, false, w, cx);
+                            })),
+                    );
+                }
+                footer = footer.child(self.text_button(
+                    "disc-cd",
+                    "Play CD",
+                    true,
+                    move |this, _, w, cx| {
+                        this.close_dialog(w, cx);
+                        this.play_cd_tracks(path.clone(), &toc, None, 0, false, w, cx);
+                    },
+                    cx,
+                ));
+            }
+            Some((path, Some(disc::DiscContent::MountedCd(files)))) => {
+                c = c.child(self.section(&format!("Audio CD ({path})")));
+                for f in &files {
+                    c = c.child(note(
+                        f.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                        t.text,
+                    ));
+                }
+                footer = footer.child(self.text_button(
+                    "disc-cd",
+                    "Play CD",
+                    true,
+                    move |this, _, w, cx| {
+                        this.close_dialog(w, cx);
+                        this.save_current_position();
+                        this.playlist.clear();
+                        let sources = files.iter().map(|f| engine::MediaSource::File(f.clone())).collect();
+                        this.open_sources(sources, w, cx);
+                    },
+                    cx,
+                ));
             }
         }
-        let footer = self
-            .text_button(
-                "disc-play",
-                "Play Main Feature",
-                true,
-                |this, _, w, cx| {
-                    if let Some((path, titles)) = this.dvd_titles.clone() {
-                        this.close_dialog(w, cx);
-                        this.playlist.clear();
-                        match disc::main_title(&titles) {
-                            Some(n) => this.play_dvd_title(path, n, w, cx),
-                            None => this.open_dvd_auto(path, w, cx),
-                        }
-                    }
-                },
-                cx,
-            )
-            .into_any_element();
-        self.modal("Play Disc", 640., c.into_any_element(), Some(footer), cx)
+        self.modal("Play Disc", 640., c.into_any_element(), Some(footer.into_any_element()), cx)
     }
 
     fn pick_disc(&mut self, folder: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -2365,9 +2475,15 @@ impl PlayerView {
             if let Ok(Ok(Some(p))) = rx.await
                 && let Some(p) = p.into_iter().next()
             {
-                let _ = this.update(cx, |v, cx| match disc::dvd_root(&p) {
-                    Some(root) => v.scan_disc(root, cx),
-                    None => v.osd("That doesn't look like a DVD (no VIDEO_TS found)", cx),
+                let _ = this.update(cx, |v, cx| {
+                    if engine::cdda::is_cue(&p) {
+                        v.scan_disc(p.display().to_string(), cx);
+                        return;
+                    }
+                    match disc::dvd_root(&p) {
+                        Some(root) => v.scan_disc(root, cx),
+                        None => v.osd("That doesn't look like a DVD (no VIDEO_TS found) or an audio CD image", cx),
+                    }
                 });
             }
         })

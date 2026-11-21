@@ -26,7 +26,7 @@ video/mp4;video/mp4v-es;video/mpeg;video/msvideo;video/ogg;video/quicktime;video
 video/vnd.mpegurl;video/vnd.rn-realvideo;video/webm;video/x-avi;video/x-flc;video/x-fli;video/x-flv;\
 video/x-m4v;video/x-matroska;video/x-mpeg2;video/x-mpeg3;video/x-ms-afs;video/x-ms-asf;video/x-ms-wmv;\
 video/x-ms-wmx;video/x-ms-wvxvideo;video/x-msvideo;video/x-ogm+ogg;video/x-theora;video/x-theora+ogg;\
-x-content/video-dvd;x-scheme-handler/dvd;";
+x-content/audio-cdda;x-content/video-dvd;x-scheme-handler/cdda;x-scheme-handler/dvd;";
 
 /// The .desktop entry. `exec` is the program to run, already quoted for
 /// an `Exec` key ([`quote_exec`]); `tryexec` is its plain path.

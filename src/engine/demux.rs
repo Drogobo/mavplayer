@@ -14,21 +14,23 @@ use std::time::Duration;
 
 const MAX_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 const MIN_FRAMES: usize = 25;
+/// Read-ahead for files and discs, in seconds (streams use the network cache setting).
+const LOCAL_READ_AHEAD_SECS: f64 = 3.0;
 
-unsafe extern "C" fn interrupt_cb(opaque: *mut c_void) -> c_int {
+pub(super) unsafe extern "C" fn interrupt_cb(opaque: *mut c_void) -> c_int {
     let ctx = unsafe { &*(opaque as *const SessionCtx) };
     (!ctx.alive()) as c_int
 }
 
 /// A running decoder thread for one stream.
-struct Component {
-    stream: usize,
+pub(super) struct Component {
+    pub stream: usize,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl Component {
-    fn stop(self) {
+    pub fn stop(self) {
         self.stop.store(true, Ordering::Release);
         for t in self.threads {
             let _ = t.join();
@@ -38,7 +40,15 @@ impl Component {
 
 pub fn open_input(source: &MediaSource, cfg: &EngineConfig, ctx: Option<&SessionCtx>) -> anyhow::Result<FormatCtx> {
     unsafe {
-        let mut ic = ff::avformat_alloc_context();
+        let mut cd_toc = None;
+        let mut ic = match source {
+            MediaSource::Cd { device, track } => {
+                let (io, toc) = super::cdda::open_track(device, *track)?;
+                cd_toc = Some(toc);
+                av::custom_io_context(io, 64 * 1024)?
+            }
+            _ => ff::avformat_alloc_context(),
+        };
         if ic.is_null() {
             anyhow::bail!("out of memory");
         }
@@ -78,15 +88,36 @@ pub fn open_input(source: &MediaSource, cfg: &EngineConfig, ctx: Option<&Session
                 }
                 path.clone()
             }
+            MediaSource::Cd { .. } => {
+                // Raw CD audio: 44.1 kHz 16-bit stereo, little-endian.
+                fmt = ff::av_find_input_format(av::cstr("s16le").as_ptr());
+                opts.set("sample_rate", "44100");
+                opts.set("ch_layout", "stereo");
+                String::new()
+            }
         };
         opts.set("scan_all_pmts", "1");
         let curl = av::cstr(&url);
+        // Custom I/O belongs to us until the context is opened.
+        let io = (*ic).opaque;
         let r = ff::avformat_open_input(&mut ic, curl.as_ptr(), fmt, &mut opts.0);
         if r < 0 {
-            // avformat_open_input frees `ic` on failure.
+            // avformat_open_input frees `ic` on failure, but not custom I/O.
+            av::free_custom_io(io);
             anyhow::bail!("{}", friendly_open_error(r, source));
         }
         let fctx = FormatCtx(ic);
+        if let (Some(toc), MediaSource::Cd { track, .. }) = (&cd_toc, source) {
+            set_cd_metadata(ic, toc, *track);
+        }
+        // The container's header usually lists the streams already: if one
+        // is a video, start opening the hardware decoding device while the
+        // streams are probed. (Not earlier: it costs about 100 MB, which a
+        // music file shouldn't pay.)
+        if ctx.is_some() && has_video(ic) {
+            super::decoder::prewarm_hw(cfg.hwdec);
+            super::upscale::prewarm(cfg);
+        }
         let r = ff::avformat_find_stream_info(ic, ptr::null_mut());
         if ctx.is_some() {
             log::debug!("startup: media opened at {:.0} ms", crate::ms_since_start());
@@ -96,6 +127,25 @@ pub fn open_input(source: &MediaSource, cfg: &EngineConfig, ctx: Option<&Session
         }
         Ok(fctx)
     }
+}
+
+/// Track names from CD-Text or the cue sheet, as the container's tags.
+unsafe fn set_cd_metadata(ic: *mut ff::AVFormatContext, toc: &super::cdda::CdToc, n: u32) {
+    let set = |k: &str, v: &str| unsafe {
+        ff::av_dict_set(&mut (*ic).metadata, av::cstr(k).as_ptr(), av::cstr(v).as_ptr(), 0);
+    };
+    let t = toc.track(n);
+    set("title", t.and_then(|t| t.title.as_deref()).unwrap_or(&format!("Track {n}")));
+    if let Some(a) = t.and_then(|t| t.artist.as_deref()) {
+        set("artist", a);
+    }
+    if let Some(a) = toc.album.as_deref() {
+        set("album", a);
+    }
+    if let Some(a) = toc.artist.as_deref() {
+        set("album_artist", a);
+    }
+    set("track", &format!("{n}/{}", toc.tracks.len()));
 }
 
 /// A local path as an FFmpeg URL. The explicit `file:` protocol keeps names
@@ -110,6 +160,7 @@ fn friendly_open_error(code: c_int, source: &MediaSource) -> String {
     match source {
         MediaSource::File(p) if !p.exists() => format!("File not found: {}", p.display()),
         MediaSource::Dvd { .. } => format!("Could not read the DVD ({base}). Encrypted discs need libdvdcss."),
+        MediaSource::Cd { .. } => format!("Could not read the audio CD ({base})"),
         _ => format!("Could not open media: {base}"),
     }
 }
@@ -221,18 +272,18 @@ fn choose_tracks(ic: &FormatCtx, info: &MediaInfo, cfg: &EngineConfig) -> Select
     let audio = pick_by_lang(info.tracks_of(TrackKind::Audio), &cfg.audio_langs)
         .map(|t| t.id)
         .or_else(|| best(ff::AVMediaType::AVMEDIA_TYPE_AUDIO, vidx).map(TrackId::Stream));
-    let subtitle = super::types::pick_subtitle(info, audio, &cfg.sub_langs, cfg.subs_enabled_by_default);
+    let subtitle = if cfg.show_subs { super::types::pick_subtitle(info, &cfg.sub_langs) } else { None };
     Selected { video, audio, subtitle }
 }
 
-fn stream_index(id: Option<TrackId>) -> Option<usize> {
+pub(super) fn stream_index(id: Option<TrackId>) -> Option<usize> {
     match id {
         Some(TrackId::Stream(i)) => Some(i),
         _ => None,
     }
 }
 
-fn start_component(
+pub(super) fn start_component(
     ctx: &Arc<SessionCtx>,
     ic: &FormatCtx,
     kind: TrackKind,
@@ -245,7 +296,9 @@ fn start_component(
     let mut threads = Vec::new();
     match kind {
         TrackKind::Video => {
-            let opened = open_codec(stream, cfg.decoder_threads, Some(cfg.hwdec), None)?;
+            // Cover art is one picture: no hardware device for it.
+            let cover = unsafe { (*stream).disposition & ff::AV_DISPOSITION_ATTACHED_PIC as c_int != 0 };
+            let opened = open_codec(stream, cfg.decoder_threads, (!cover).then_some(cfg.hwdec), None)?;
             let hw = opened.hw.as_ref().map(|h| h.name.clone());
             let decoder_name = opened.decoder_name.clone();
             let dec = Decoder::new(opened, ctx.vq.clone(), stop.clone());
@@ -334,6 +387,13 @@ fn start_component(
             let (c, s) = (ctx.clone(), stop.clone());
             let q = ctx.sq.clone();
             ctx.subs.clear_embedded();
+            // DVDs played with their menus draw subpictures (and buttons) themselves.
+            #[cfg(has_dvdnav)]
+            if let Some(ov) = ctx.spu_overlay.lock().clone() {
+                drop(opened);
+                threads.push(spawn("sub-dec", move || super::spu::run_decoder(c, ov, q, tb, s)));
+                return Ok(Component { stream: idx, stop, threads });
+            }
             threads.push(spawn("sub-dec", move || subs::run_decoder(c, opened, q, tb, s)));
         }
     }
@@ -356,6 +416,13 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
 
 pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     let cfg = ctx.controls.config.lock().clone();
+    #[cfg(has_dvdnav)]
+    if let MediaSource::Dvd { path, title: 0, .. } = &source
+        && cfg.dvd_menus
+    {
+        let path = path.clone();
+        return super::nav::run(ctx, source, path);
+    }
     let ic = match open_input(&source, &cfg, Some(&ctx)) {
         Ok(ic) => ic,
         Err(e) => {
@@ -437,7 +504,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     {
         ext.extend(subs::find_sidecar_subtitles(p));
     }
-    let want_external = selected.subtitle.is_none() && cfg.subs_enabled_by_default;
+    let want_external = selected.subtitle.is_none() && cfg.show_subs;
     for (n, p) in ext.into_iter().enumerate() {
         subs::load_external_async(ctx.clone(), p, n == 0 && (want_external || !opts.external_subs.is_empty()));
     }
@@ -568,12 +635,20 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
 
         // Back-pressure: stop reading when every queue has enough.
         let enough = |q: &super::sync::PacketQueue, active: bool| !active || q.len() > MIN_FRAMES;
+        // How far to read ahead. A stream needs a cushion against the
+        // network; a file or disc only against a slow disk, and every second
+        // of a high-bitrate film read ahead is several MB held in memory.
+        let ahead = if matches!(source, MediaSource::Url(_)) {
+            cfg.network_cache_secs.min(if info.is_live { 4.0 } else { 120.0 })
+        } else {
+            cfg.network_cache_secs.min(LOCAL_READ_AHEAD_SECS)
+        };
         let total = ctx.vq.bytes() + ctx.aq.bytes() + ctx.sq.bytes();
         let cached = cache_ahead(&ctx, &ic, &audio_c, &video_c);
         let full = total > MAX_QUEUE_BYTES
             || (enough(&ctx.vq, video_c.is_some() && ctx.video_active.load(Ordering::Acquire))
                 && enough(&ctx.aq, audio_c.is_some())
-                && cached > cfg.network_cache_secs.min(if info.is_live { 4.0 } else { 120.0 }).max(1.0));
+                && cached > ahead.max(1.0));
         update_cache_state(&ctx, cached, audio_c.is_some());
         if full || (ctx.eof.load(Ordering::Acquire) && ctx.seek_req.lock().is_none()) {
             if ctx.eof.load(Ordering::Acquire) {
@@ -677,6 +752,17 @@ fn queue_attached_pic(ctx: &SessionCtx, ic: &FormatCtx, video_c: &Option<Compone
             ctx.vq.put(ap);
             ctx.vq.put_drain();
         }
+    }
+}
+
+/// A stream that plays as video (not cover art).
+unsafe fn has_video(ic: *mut ff::AVFormatContext) -> bool {
+    unsafe {
+        (0..(*ic).nb_streams as usize).any(|i| {
+            let st = *(*ic).streams.add(i);
+            (*(*st).codecpar).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO
+                && (*st).disposition & ff::AV_DISPOSITION_ATTACHED_PIC as c_int == 0
+        })
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "mavplayer"
-version = "0.2.1"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.90"
 description = "A fast, native media player for video, music, streams and DVDs"
@@ -51,7 +51,8 @@ memmap2 = "0.9"
 # System tray icon (StatusNotifierItem over D-Bus; KDE, and GNOME with the
 # AppIndicator extension). Same zbus and async-io as souvlaki's MPRIS.
 ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
-# setsid() for the process that takes over in the system tray.
+# setsid(), dup2() and _exit() for the hand-over to the process that waits in
+# the system tray.
 libc = "0.2"
 
 # The window handle the Windows media controls attach to.
@@ -69,6 +70,13 @@ winresource = "0.1"
 # xattr 0.2.3 (pulled in by gpui's http client) references libc::ENOATTR,
 # which recent libc releases removed on Linux. See third_party/xattr.
 xattr = { path = "third_party/xattr" }
+# ksni 0.3.7 plus a `dbus_name` option: the tray icon keeps one D-Bus name
+# that the process taking over in the tray inherits, so the icon never blinks
+# out. See src/ui/tray.rs.
+ksni = { path = "third_party/ksni" }
+# blade-graphics 0.7.1 (GPUI's renderer) with ray tracing never enabled: on
+# NVIDIA it costs 50 MB in every process. See third_party/blade-graphics.
+blade-graphics = { path = "third_party/blade-graphics" }
 
 [profile.dev]
 opt-level = 1
@@ -77,10 +85,22 @@ opt-level = 1
 opt-level = 2
 
 [profile.release]
-lto = "thin"
+# No cross-crate LTO. `src/mem.rs` is the global allocator, and with
+# cross-crate thin LTO, LLVM copies its `__rust_alloc_zeroed` into other
+# crates' modules; when it then turns a `__rust_alloc` + memset there into a
+# call to that copy, LLVM 23's inliner crashes (SIGSEGV in
+# `LazyCallGraph::removeDeadFunctions`). Whether it does depends on chance:
+# `-C target-cpu=native` (CachyOS's makepkg default) and even the build path
+# set it off. Fat LTO avoids it too, but takes seven minutes to link.
+lto = false
 codegen-units = 4
 strip = "symbols"
 panic = "unwind"
+
+# One codegen unit, so the allocator shim never has a copy in another one
+# either (and MavPlayer's own code is still optimized as a whole).
+[profile.release.package.mavplayer]
+codegen-units = 1
 
 # ── Linux packages ──────────────────────────────────────────────────────────
 # `cargo deb` (cargo install cargo-deb) and `cargo generate-rpm`

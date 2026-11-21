@@ -18,7 +18,30 @@ pub struct OpenedCodec {
     pub ctx: CodecCtx,
     pub hw: Option<HwInfo>,
     pub decoder_name: String,
+    reopen: Option<Reopen>,
 }
+
+/// What it takes to open a decoder again after `Decoder::park`.
+struct Reopen {
+    par: *mut ff::AVCodecParameters,
+    time_base: ff::AVRational,
+    threads: u32,
+    hw_mode: Option<HwDecode>,
+}
+
+// SAFETY: a private copy of the stream's parameters, owned by this value.
+unsafe impl Send for Reopen {}
+
+impl Drop for Reopen {
+    fn drop(&mut self) {
+        unsafe { ff::avcodec_parameters_free(&mut self.par) };
+    }
+}
+
+/// How long a decoder that has reached the end of the file waits for a seek
+/// before it lets go of its codec (and with it the GPU device and picture
+/// pools: about 100 MB with CUDA).
+const PARK_AFTER: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Device types to try, best first, for the current platform.
 fn hw_device_types() -> &'static [ff::AVHWDeviceType] {
@@ -78,7 +101,8 @@ impl Drop for HwDevice {
 enum HwSlot {
     Untried,
     Unavailable,
-    Ready(HwDevice),
+    /// The device, and when a decoder last took it.
+    Ready(HwDevice, std::time::Instant),
 }
 
 /// Hardware devices, created once per process instead of once per file:
@@ -112,11 +136,12 @@ fn hw_device(ty: ff::AVHWDeviceType) -> Option<*mut ff::AVBufferRef> {
             HwSlot::Unavailable
         } else {
             log::debug!("hw device {:?} ready in {:.0} ms", ty, t0.elapsed().as_secs_f64() * 1000.0);
-            HwSlot::Ready(HwDevice(dev))
+            HwSlot::Ready(HwDevice(dev), std::time::Instant::now())
         };
     }
-    match &*slot {
-        HwSlot::Ready(d) => {
+    match &mut *slot {
+        HwSlot::Ready(d, used) => {
+            *used = std::time::Instant::now();
             let r = unsafe { ff::av_buffer_ref(d.0) };
             (!r.is_null()).then_some(r)
         }
@@ -124,8 +149,28 @@ fn hw_device(ty: ff::AVHWDeviceType) -> Option<*mut ff::AVBufferRef> {
     }
 }
 
+/// Closes hardware devices that no decoder has held for `idle` (call it
+/// every second or so: that is how often use is noticed). A CUDA
+/// device costs about 100 MB, which a window left open after the video
+/// ended shouldn't keep; the next video opens it again (100–200 ms).
+pub fn release_idle_hw(idle: std::time::Duration) {
+    let slots: Vec<_> = HW_SLOTS.lock().iter().map(|(_, s)| s.clone()).collect();
+    for slot in slots {
+        let Some(mut slot) = slot.try_lock() else { continue };
+        let HwSlot::Ready(d, used) = &mut *slot else { continue };
+        // Only the slot's own reference left: no decoder has it.
+        if unsafe { ff::av_buffer_get_ref_count(d.0) } > 1 {
+            *used = std::time::Instant::now();
+        } else if used.elapsed() >= idle {
+            log::debug!("closing the idle hardware decoding device");
+            *slot = HwSlot::Untried;
+        }
+    }
+}
+
 /// Starts opening the hardware decoding device in the background, so the
-/// first file doesn't wait for it (only when every file decodes in hardware).
+/// video about to play doesn't wait as long for it (only when every video
+/// decodes in hardware).
 pub fn prewarm_hw(mode: HwDecode) {
     if mode != HwDecode::Always {
         return;
@@ -198,6 +243,18 @@ fn hw_worth_it(par: &ff::AVCodecParameters, mode: HwDecode) -> bool {
     }
 }
 
+/// Decoder threads for "auto". FFmpeg's own choice is one per CPU plus one,
+/// and with frame threading every thread holds its own decoder state and
+/// pictures in flight: 17 threads cost about 90 MB more than 4 for 1080p
+/// H.264, for no gain at that size. With a hardware decoder the threads only
+/// do bookkeeping; a few are kept for when the GPU turns the stream down and
+/// FFmpeg decodes it in software instead.
+fn auto_video_threads(par: &ff::AVCodecParameters, hw: bool) -> usize {
+    let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let big = par.width as i64 * par.height as i64 > 1920 * 1088;
+    cpus.min(if big && !hw { 8 } else { 4 })
+}
+
 /// Opens a decoder for `stream`.
 pub fn open_codec(
     stream: *mut ff::AVStream,
@@ -206,7 +263,26 @@ pub fn open_codec(
     sub_charset: Option<&str>,
 ) -> anyhow::Result<OpenedCodec> {
     unsafe {
-        let par = (*stream).codecpar;
+        let mut opened = open_par((*stream).codecpar, (*stream).time_base, threads, hw_mode, sub_charset)?;
+        let par = ff::avcodec_parameters_alloc();
+        if !par.is_null() {
+            let reopen = Reopen { par, time_base: (*stream).time_base, threads, hw_mode };
+            if ff::avcodec_parameters_copy(par, (*stream).codecpar) >= 0 {
+                opened.reopen = Some(reopen);
+            }
+        }
+        Ok(opened)
+    }
+}
+
+unsafe fn open_par(
+    par: *const ff::AVCodecParameters,
+    time_base: ff::AVRational,
+    threads: u32,
+    hw_mode: Option<HwDecode>,
+    sub_charset: Option<&str>,
+) -> anyhow::Result<OpenedCodec> {
+    unsafe {
         let codec = ff::avcodec_find_decoder((*par).codec_id);
         if codec.is_null() {
             anyhow::bail!("no decoder for codec '{}'", av::codec_name((*par).codec_id));
@@ -216,10 +292,8 @@ pub fn open_codec(
             anyhow::bail!("out of memory");
         }
         av::check(ff::avcodec_parameters_to_context(ctx.0, par), "avcodec_parameters_to_context")?;
-        (*ctx.0).pkt_timebase = (*stream).time_base;
+        (*ctx.0).pkt_timebase = time_base;
         let mut opts = av::Dict::new();
-        let threads_s = if threads == 0 { "auto".to_string() } else { threads.to_string() };
-        opts.set("threads", &threads_s);
         if (*par).codec_type == ff::AVMediaType::AVMEDIA_TYPE_SUBTITLE
             && let Some(cs) = sub_charset
         {
@@ -229,16 +303,24 @@ pub fn open_codec(
             Some(m) if hw_worth_it(&*par, m) => try_setup_hw(ctx.0, codec),
             _ => None,
         };
+        let threads_s = match threads {
+            0 if (*par).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO => {
+                auto_video_threads(&*par, hw.is_some()).to_string()
+            }
+            0 => "auto".to_string(),
+            n => n.to_string(),
+        };
+        opts.set("threads", &threads_s);
         let r = ff::avcodec_open2(ctx.0, codec, &mut opts.0);
         if r < 0 {
             if hw.is_some() {
                 log::warn!("hardware decoder failed to open ({}), retrying in software", av::err_str(r));
-                return open_codec(stream, threads, None, sub_charset);
+                return open_par(par, time_base, threads, None, sub_charset);
             }
             anyhow::bail!("could not open decoder: {}", av::err_str(r));
         }
         let decoder_name = av::from_cstr((*codec).name).unwrap_or_default();
-        Ok(OpenedCodec { ctx, hw, decoder_name })
+        Ok(OpenedCodec { ctx, hw, decoder_name, reopen: None })
     }
 }
 
@@ -258,7 +340,67 @@ pub struct Decoder {
     pending: Option<Packet>,
     pub hw_pix_fmt: Option<c_int>,
     sw: Frame,
+    /// Buffers for frames downloaded from the GPU, reused frame after frame.
+    pool: DownloadPool,
     stop: Arc<AtomicBool>,
+    /// Decoded to the end of the stream, nothing sent since.
+    drained: bool,
+    reopen: Option<Reopen>,
+}
+
+/// Picture buffers for downloads from a hardware decoder. Without it every
+/// frame got a new buffer (3 MB at 1080p, 12 MB at 4K) that glibc maps and
+/// the kernel zeroes, since big blocks are mapped on their own (`mem.rs`).
+struct DownloadPool {
+    pool: *mut ff::AVBufferPool,
+    /// Pixel format, width and height the buffers are sized for.
+    key: (c_int, c_int, c_int),
+}
+
+// SAFETY: an AVBufferPool is thread-safe; buffers return to it from any thread.
+unsafe impl Send for DownloadPool {}
+
+const DOWNLOAD_ALIGN: c_int = 64;
+
+impl DownloadPool {
+    /// Gives `dst` pooled buffers for a `w`×`h` picture in `fmt`.
+    unsafe fn fill(&mut self, dst: *mut ff::AVFrame, fmt: ff::AVPixelFormat, w: c_int, h: c_int) -> bool {
+        unsafe {
+            let key = (fmt as c_int, w, h);
+            if self.pool.is_null() || self.key != key {
+                ff::av_buffer_pool_uninit(&mut self.pool); // frees once its buffers are back
+                let size = ff::av_image_get_buffer_size(fmt, w, h, DOWNLOAD_ALIGN);
+                if size <= 0 {
+                    return false;
+                }
+                self.pool = ff::av_buffer_pool_init(size as usize, None);
+                self.key = key;
+            }
+            let buf = ff::av_buffer_pool_get(self.pool);
+            if buf.is_null() {
+                return false;
+            }
+            (*dst).buf[0] = buf;
+            (*dst).format = fmt as c_int;
+            (*dst).width = w;
+            (*dst).height = h;
+            ff::av_image_fill_arrays(
+                (*dst).data.as_mut_ptr(),
+                (*dst).linesize.as_mut_ptr(),
+                (*buf).data,
+                fmt,
+                w,
+                h,
+                DOWNLOAD_ALIGN,
+            ) >= 0
+        }
+    }
+}
+
+impl Drop for DownloadPool {
+    fn drop(&mut self) {
+        unsafe { ff::av_buffer_pool_uninit(&mut self.pool) };
+    }
 }
 
 impl Decoder {
@@ -272,6 +414,9 @@ impl Decoder {
             finished: 0,
             pending: None,
             sw: Frame::new(),
+            pool: DownloadPool { pool: ptr::null_mut(), key: (0, 0, 0) },
+            drained: false,
+            reopen: opened.reopen,
         }
     }
 
@@ -279,7 +424,7 @@ impl Decoder {
     /// to system memory transparently.
     pub fn decode(&mut self, frame: &mut Frame) -> DecodeResult {
         loop {
-            if self.queue.serial() == self.pkt_serial {
+            if self.queue.serial() == self.pkt_serial && !self.ctx.0.is_null() {
                 loop {
                     if self.queue.is_aborted() || self.stop.load(Ordering::Acquire) {
                         return DecodeResult::Aborted;
@@ -297,6 +442,7 @@ impl Decoder {
                     }
                     if r == ff::AVERROR_EOF {
                         self.finished = self.pkt_serial;
+                        self.drained = true;
                         unsafe { ff::avcodec_flush_buffers(self.ctx.0) };
                         return DecodeResult::Eof;
                     }
@@ -313,11 +459,23 @@ impl Decoder {
                 let qp = if let Some(p) = self.pending.take() {
                     super::sync::QueuedPacket { pkt: p, serial: self.pkt_serial }
                 } else {
-                    match self.queue.get(&self.stop) {
+                    // At the end only a seek brings more packets: let go of
+                    // the codec if none comes for a while.
+                    let park_at = (self.drained && self.reopen.is_some() && !self.ctx.0.is_null())
+                        .then(|| std::time::Instant::now() + PARK_AFTER);
+                    match self.queue.get_until(&self.stop, park_at) {
                         Some(p) => p,
+                        None if park_at.is_some() && !self.queue.is_aborted() && !self.stop.load(Ordering::Acquire) => {
+                            self.park();
+                            continue;
+                        }
                         None => return DecodeResult::Aborted,
                     }
                 };
+                self.drained = false;
+                if self.ctx.0.is_null() && !self.unpark() {
+                    return DecodeResult::Aborted;
+                }
                 if qp.serial != self.pkt_serial {
                     unsafe { ff::avcodec_flush_buffers(self.ctx.0) };
                     self.finished = 0;
@@ -344,9 +502,42 @@ impl Decoder {
         }
     }
 
+    /// Frees the codec, its GPU device reference and the picture pools.
+    fn park(&mut self) {
+        log::debug!("decoder idle at the end of the file: closing it until a seek");
+        self.ctx = CodecCtx(ptr::null_mut());
+        self.sw.unref();
+        self.pool = DownloadPool { pool: ptr::null_mut(), key: (0, 0, 0) };
+    }
+
+    /// Opens the codec again after `park` (a seek arrived). The packet that
+    /// woke it starts at a keyframe, as every packet after a seek does.
+    fn unpark(&mut self) -> bool {
+        let Some(r) = &self.reopen else { return false };
+        match unsafe { open_par(r.par, r.time_base, r.threads, r.hw_mode, None) } {
+            Ok(opened) => {
+                log::debug!("decoder reopened");
+                self.ctx = opened.ctx;
+                self.hw_pix_fmt = opened.hw.as_ref().map(|h| h.pix_fmt);
+                true
+            }
+            Err(e) => {
+                log::warn!("could not reopen the decoder: {e:#}");
+                false
+            }
+        }
+    }
+
     fn download(&mut self, frame: &mut Frame) -> bool {
         unsafe {
             self.sw.unref();
+            let src = frame.0;
+            if !(*src).hw_frames_ctx.is_null() {
+                let fc = (*(*src).hw_frames_ctx).data as *const ff::AVHWFramesContext;
+                if !self.pool.fill(self.sw.0, (*fc).sw_format, (*src).width, (*src).height) {
+                    self.sw.unref(); // let FFmpeg allocate instead
+                }
+            }
             let r = ff::av_hwframe_transfer_data(self.sw.0, frame.0, 0);
             if r < 0 {
                 log::warn!("hwframe download failed: {}", av::err_str(r));
