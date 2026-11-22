@@ -423,7 +423,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     #[cfg(has_dvdnav)]
     if let MediaSource::Dvd { path, title: 0, .. } = &source {
         let path = path.clone();
-        return super::nav::run(ctx, source, path);
+        return super::nav::run(ctx, source, path, &opts);
     }
     let ic = match open_input(&source, &cfg, Some(&ctx)) {
         Ok(ic) => ic,

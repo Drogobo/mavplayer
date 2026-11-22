@@ -8,8 +8,8 @@ use super::text_input::{InputEvent, TextInput};
 use super::theme::Theme;
 use crate::engine::disc::{self, DvdTitle};
 use crate::engine::{
-    self, Deinterlace, DvdCommand, DvdMenu, HwDecode, LoadOptions, MediaSource, Player, PlayerEvent, Rotation, Status,
-    SubEvent, TrackId, TrackKind, VideoAdjust,
+    self, Deinterlace, DvdCommand, DvdDomain, DvdMenu, HwDecode, LoadOptions, MediaSource, Player, PlayerEvent,
+    Rotation, Status, SubEvent, TrackId, TrackKind, VideoAdjust,
 };
 use crate::icons;
 use crate::playlist::{self, Playlist};
@@ -938,8 +938,11 @@ impl PlayerView {
         let Some(src) = st.source else { return };
         let pos = self.player.position();
         let paused = self.player.paused();
+        // A DVD played with its menus resumes its title, not the first-play program.
+        let dvd_title = st.dvd.as_ref().filter(|d| d.domain == DvdDomain::Title && d.title > 0).map(|d| d.title);
         self.player.set_config(self.engine_config());
-        self.player.load(src, LoadOptions { start_at: Some(pos), start_paused: paused, ..Default::default() });
+        self.player
+            .load(src, LoadOptions { start_at: Some(pos), dvd_title, start_paused: paused, ..Default::default() });
         cx.notify();
     }
 

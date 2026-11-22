@@ -204,6 +204,25 @@ pub struct SessionCtx {
 }
 
 impl SessionCtx {
+    /// Lets go of what an ended session holds (its demuxer has exited and
+    /// stopped the decoders). Something may keep the context itself alive
+    /// past that, such as an audio device open that never returns: it
+    /// shouldn't keep queued packets, pictures (a CUDA frame keeps the GPU
+    /// device open) or the disc's navigator with it.
+    fn release(&self) {
+        self.vq.flush();
+        self.aq.flush();
+        self.sq.flush();
+        self.frames.clear();
+        *self.last_frame.lock() = None;
+        self.subs.clear_embedded();
+        #[cfg(has_dvdnav)]
+        {
+            *self.nav.lock() = None;
+            *self.spu_overlay.lock() = None;
+        }
+    }
+
     pub fn alive(&self) -> bool {
         !self.abort.load(Ordering::Acquire)
     }
@@ -347,6 +366,10 @@ impl SessionCtx {
 #[derive(Default, Clone)]
 pub struct LoadOptions {
     pub start_at: Option<f64>,
+    /// A DVD played with its menus starts in this title (at `start_at`)
+    /// instead of at its first-play program: a reload keeps its place.
+    #[cfg_attr(not(has_dvdnav), allow(dead_code))]
+    pub dvd_title: Option<u32>,
     pub external_subs: Vec<PathBuf>,
     pub start_paused: bool,
 }
@@ -372,6 +395,7 @@ impl Session {
                 .name("session-reaper".into())
                 .spawn(move || {
                     let _ = h.join();
+                    ctx.release();
                 })
                 .ok();
         }
