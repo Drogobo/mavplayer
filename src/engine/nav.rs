@@ -1393,7 +1393,7 @@ fn play_segment(
     }
     ctx.emit(PlayerEvent::Loaded);
     if let Some(t) = start_at.filter(|t| *t > 0.5 && info.seekable) {
-        ctx.request_seek(SeekRequest { target: t, relative: false, precise: true });
+        ctx.request_seek(SeekRequest { target: t, relative: false, precise: true, direction: 0, origin: 0.0 });
     }
 
     let mut phase = Phase::Reading;

@@ -315,6 +315,7 @@ pub(super) fn start_component(
                 })
             });
             ctx.video_active.store(!info.attached_pic, Ordering::Release);
+            ctx.cover_art.store(info.attached_pic, Ordering::Release);
             let (c, s) = (ctx.clone(), stop.clone());
             threads.push(spawn("video-dec", move || video::run_decoder(c, dec, info, s)));
             let (c, s) = (ctx.clone(), stop.clone());
@@ -557,6 +558,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
                         }
                         TrackKind::Video => {
                             ctx.video_active.store(false, Ordering::Release);
+                            ctx.cover_art.store(false, Ordering::Release);
                             ctx.vq.flush();
                             ctx.frames.clear();
                         }
@@ -650,6 +652,11 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
             ctx.wake();
         }
 
+        // Cover art to decode again (`SessionCtx::redo_cover`).
+        if ctx.cover_redo.swap(false, Ordering::AcqRel) {
+            queue_attached_pic(&ctx, &ic, &video_c, true);
+        }
+
         // Back-pressure: stop reading when every queue has enough.
         let enough = |q: &super::sync::PacketQueue, active: bool| !active || q.len() > MIN_FRAMES;
         // How far to read ahead. A stream needs a cushion against the
@@ -735,7 +742,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
             pkt.unref();
         }
         // Cover art is delivered once via `attached_pic`, not by the demuxer.
-        queue_attached_pic(&ctx, &ic, &video_c);
+        queue_attached_pic(&ctx, &ic, &video_c, false);
     }
 
     ctx.vq.abort();
@@ -752,7 +759,9 @@ thread_local! {
     static ATTACHED_SERIAL: std::cell::Cell<i32> = const { std::cell::Cell::new(-1) };
 }
 
-fn queue_attached_pic(ctx: &SessionCtx, ic: &FormatCtx, video_c: &Option<Component>) {
+/// Queues the cover art picture for decoding: once per serial (after each
+/// seek), or again with `again` (the picture shows at once even if paused).
+fn queue_attached_pic(ctx: &SessionCtx, ic: &FormatCtx, video_c: &Option<Component>, again: bool) {
     let Some(c) = video_c else { return };
     let st = ic.stream(c.stream);
     unsafe {
@@ -760,12 +769,15 @@ fn queue_attached_pic(ctx: &SessionCtx, ic: &FormatCtx, video_c: &Option<Compone
             return;
         }
         let serial = ctx.vq.serial();
-        if ATTACHED_SERIAL.with(|s| s.get()) == serial {
+        if ATTACHED_SERIAL.with(|s| s.get()) == serial && !again {
             return;
         }
         ATTACHED_SERIAL.with(|s| s.set(serial));
         let ap = Packet(ff::av_packet_clone(&(*st).attached_pic));
         if !ap.0.is_null() {
+            if again && ctx.paused() {
+                ctx.show_one.store(true, Ordering::Release);
+            }
             ctx.vq.put(ap);
             ctx.vq.put_drain();
         }

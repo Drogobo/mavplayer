@@ -172,6 +172,11 @@ pub struct SessionCtx {
     pub audio_pending: AtomicU64,
     pub audio_tokens: AtomicU64,
     pub video_active: AtomicBool,
+    /// The video track is cover art: one picture, decoded once.
+    pub cover_art: AtomicBool,
+    /// Asks the demuxer to decode the cover art again (for a new window size
+    /// or new settings; see [`SessionCtx::redo_cover`]).
+    pub cover_redo: AtomicBool,
     pub audio_finished: AtomicI32,
     pub video_finished: AtomicI32,
     pub eof: AtomicBool,
@@ -304,6 +309,20 @@ impl SessionCtx {
     pub fn wake_demuxer(&self) {
         let _g = self.demux_lock.lock();
         self.demux_cv.notify_all();
+    }
+
+    /// Cover art is decoded and filtered once, for the window size and
+    /// settings of the moment. Decodes it again for the current ones, so a
+    /// larger window gets it enlarged (by the upscaler chosen) from the
+    /// original rather than the old picture stretched. False when the video
+    /// isn't cover art.
+    pub fn redo_cover(&self) -> bool {
+        if !self.cover_art.load(Ordering::Acquire) {
+            return false;
+        }
+        self.cover_redo.store(true, Ordering::Release);
+        self.wake_demuxer();
+        true
     }
 
     pub fn paused(&self) -> bool {
@@ -446,6 +465,8 @@ fn new_session(controls: &Arc<Controls>, shared: &Arc<Shared>, source: &MediaSou
         audio_pending: AtomicU64::new(0),
         audio_tokens: AtomicU64::new(0),
         video_active: AtomicBool::new(false),
+        cover_art: AtomicBool::new(false),
+        cover_redo: AtomicBool::new(false),
         audio_finished: AtomicI32::new(-1),
         video_finished: AtomicI32::new(-1),
         eof: AtomicBool::new(false),
@@ -831,8 +852,10 @@ impl Player {
             g.1 = adj;
         }
         drop(g);
-        // Re-show the current picture with the new filters when paused.
+        // Re-show the current picture with the new filters when paused (and
+        // cover art always: it isn't decoded again otherwise).
         if let Some(s) = &self.session
+            && !s.ctx.redo_cover()
             && self.paused()
         {
             let pos = s.ctx.position();
@@ -845,7 +868,17 @@ impl Player {
         if self.session.as_ref().is_some_and(|s| s.ctx.video_active.load(Ordering::Acquire)) {
             upscale::prewarm(&cfg);
         }
-        *self.controls.config.lock() = cfg;
+        // (The presenter notices changes to its own scaling by itself.)
+        let shaders = upscale::ShaderSetKey::of(&cfg);
+        let changed = {
+            let mut c = self.controls.config.lock();
+            let changed = upscale::ShaderSetKey::of(&c) != shaders;
+            *c = cfg;
+            changed
+        };
+        if changed && let Some(s) = &self.session {
+            s.ctx.redo_cover();
+        }
     }
 
     /// Tells the engine how large the video is drawn, in physical pixels, so

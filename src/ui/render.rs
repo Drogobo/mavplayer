@@ -615,8 +615,8 @@ impl PlayerView {
             }))
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                    let items = this.context_menu(cx);
+                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                    let items = this.context_menu(this.menubar_visible(window), cx);
                     this.open_menu(items, ev.position, None, cx);
                 }),
             )
@@ -1587,7 +1587,10 @@ impl PlayerView {
                             })
                             .on_click(cx.listener(move |this, ev: &ClickEvent, w, cx| {
                                 this.playlist_selected = Some(i);
-                                if ev.click_count() >= 2 {
+                                // One click plays (the second of a double
+                                // click mustn't start it again), or two.
+                                let clicks = if this.settings.playlist_double_click { 2 } else { 1 };
+                                if ev.click_count() == clicks {
                                     this.play_index(i, w, cx);
                                 }
                                 cx.notify();
@@ -1775,7 +1778,7 @@ impl PlayerView {
         let t = self.theme;
         let fullscreen = window.is_fullscreen();
         let client_decor = matches!(window.window_decorations(), Decorations::Client { .. }) && !fullscreen;
-        let show_menubar = self.settings.show_menubar && !fullscreen && !cfg!(target_os = "macos");
+        let show_menubar = self.menubar_visible(window);
         let overlay_open = self.dialog.is_some() || self.menu.is_some() || self.editing_volume;
 
         let main = div()
