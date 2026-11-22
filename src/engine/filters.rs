@@ -36,6 +36,24 @@ impl Graph {
         threads: i32,
         setup: &mut dyn FnMut(*mut ff::AVFilterContext) -> anyhow::Result<()>,
     ) -> anyhow::Result<Graph> {
+        Self::build(src_filter, src_args, ptr::null_mut(), sink_filter, chain, threads, setup)
+    }
+
+    /// A video graph fed hardware frames from `hw_frames` (the frames
+    /// context of the pictures that will be pushed), for GPU filters.
+    pub fn hw(src_args: &str, hw_frames: *mut ff::AVBufferRef, chain: &str) -> anyhow::Result<Graph> {
+        Self::build("buffer", src_args, hw_frames, "buffersink", chain, 1, &mut |_| Ok(()))
+    }
+
+    fn build(
+        src_filter: &str,
+        src_args: &str,
+        hw_frames: *mut ff::AVBufferRef,
+        sink_filter: &str,
+        chain: &str,
+        threads: i32,
+        setup: &mut dyn FnMut(*mut ff::AVFilterContext) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Graph> {
         unsafe {
             let graph = FilterGraph(ff::avfilter_graph_alloc());
             if graph.0.is_null() {
@@ -45,18 +63,23 @@ impl Graph {
             let (sf, kf) = (av::cstr(src_filter), av::cstr(sink_filter));
             let (in_name, out_name) = (av::cstr("in"), av::cstr("out"));
             let args = av::cstr(src_args);
-            let mut src = ptr::null_mut();
-            av::check(
-                ff::avfilter_graph_create_filter(
-                    &mut src,
-                    ff::avfilter_get_by_name(sf.as_ptr()),
-                    in_name.as_ptr(),
-                    args.as_ptr(),
-                    ptr::null_mut(),
-                    graph.0,
-                ),
-                "buffer source",
-            )?;
+            // Allocated, given its frames context, then initialised: the
+            // context has to be there before the source configures itself.
+            let src = ff::avfilter_graph_alloc_filter(graph.0, ff::avfilter_get_by_name(sf.as_ptr()), in_name.as_ptr());
+            if src.is_null() {
+                anyhow::bail!("buffer source: out of memory");
+            }
+            if !hw_frames.is_null() {
+                let par = ff::av_buffersrc_parameters_alloc();
+                if par.is_null() {
+                    anyhow::bail!("buffer source: out of memory");
+                }
+                (*par).hw_frames_ctx = hw_frames; // borrowed: parameters_set takes its own reference
+                let r = ff::av_buffersrc_parameters_set(src, par);
+                ff::av_free(par as *mut _);
+                av::check(r, "buffer source frames")?;
+            }
+            av::check(ff::avfilter_init_str(src, args.as_ptr()), "buffer source")?;
             let mut sink = ptr::null_mut();
             av::check(
                 ff::avfilter_graph_create_filter(

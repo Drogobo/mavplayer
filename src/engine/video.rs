@@ -2,7 +2,7 @@
 
 use super::SessionCtx;
 use super::av::{self, FormatCtx, Frame, ff};
-use super::decoder::{DecodeResult, Decoder};
+use super::decoder::{DecodeResult, Decoder, GpuResize, GpuUpload};
 use super::filters::Graph;
 use super::sync::VideoFrame;
 use super::types::*;
@@ -143,19 +143,14 @@ fn build_chain(
         w = (w as f32 * fw / 2.0).trunc() as i32 * 2;
         h = (h as f32 * fh / 2.0).trunc() as i32 * 2;
     }
-    let user_rot = match adj.rotation {
-        Rotation::None => 0,
-        Rotation::R90 => 90,
-        Rotation::R180 => 180,
-        Rotation::R270 => 270,
-    };
-    match (info.rotation + user_rot) % 360 {
+    let rotation = rotation(adj, info);
+    match rotation {
         90 => f.push("transpose=clock".into()),
         180 => f.push("hflip,vflip".into()),
         270 => f.push("transpose=cclock".into()),
         _ => {}
     }
-    if (info.rotation + user_rot) % 180 == 90 {
+    if rotation % 180 == 90 {
         (w, h, sar) = (h, w, 1.0 / sar);
     }
     if adj.hflip {
@@ -196,6 +191,67 @@ fn build_chain(
     Chain { desc: f.join(","), upscale }
 }
 
+/// Clockwise rotation of the picture, in degrees: the container's and the
+/// user's.
+fn rotation(adj: &VideoAdjust, info: &StreamInfo) -> i32 {
+    let user = match adj.rotation {
+        Rotation::None => 0,
+        Rotation::R90 => 90,
+        Rotation::R180 => 180,
+        Rotation::R270 => 270,
+    };
+    (info.rotation + user) % 360
+}
+
+/// Whether the chain deinterlaces (see `build_chain`).
+fn deinterlacing(cfg: &EngineConfig, interlaced: bool) -> bool {
+    match cfg.deinterlace {
+        Deinterlace::Off => false,
+        Deinterlace::Auto => interlaced,
+        _ => true,
+    }
+}
+
+/// The size to resize a hardware-decoded picture to on the GPU (see
+/// `decoder::GpuScaler`), or `None` to download it whole.
+///
+/// Only when nothing in the chain needs the full picture: deinterlacing
+/// needs whole fields, tone mapping its own scaling, crop and rotation
+/// change what "display size" means, and GPU upscaling enlarges the
+/// original. The rest of the chain (flips, colour adjustments, denoise,
+/// sharpen) then works on the smaller picture. Never enlarges.
+fn gpu_resize(
+    adj: &VideoAdjust,
+    cfg: &EngineConfig,
+    info: &StreamInfo,
+    frame: &Frame,
+    interlaced: bool,
+    target: (u32, u32),
+    upscale: bool,
+) -> Option<GpuResize> {
+    if deinterlacing(cfg, interlaced)
+        || (cfg.tone_map_hdr && is_hdr(frame))
+        || adj.crop.is_some()
+        || rotation(adj, info) != 0
+    {
+        return None;
+    }
+    let (w, h, sar) = (frame.width(), frame.height(), frame_sar(frame, info));
+    if upscale && upscale::plan(cfg, w, h, sar, target).is_some() {
+        return None;
+    }
+    let (dw, dh) = super::present::gpu_size(w, h, sar, target);
+    // As decoded, in a format swscale converts fast, for a presenter that
+    // can't convert on the GPU: just download it.
+    if (dw, dh) == (w, h)
+        && frame.sw_format() == ff::AVPixelFormat::AV_PIX_FMT_NV12 as c_int
+        && !super::present::gpu_convert_ok()
+    {
+        return None;
+    }
+    Some(GpuResize { w: dw, h: dh, quality: cfg.scale_quality })
+}
+
 #[derive(PartialEq, Clone)]
 struct GraphKey {
     w: i32,
@@ -226,6 +282,15 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
     let mut pending_target = (target, Instant::now());
     // GPU upscaling that failed to start; not retried until settings change.
     let mut broken_upscale: Option<upscale::ShaderSetKey> = None;
+    // Hardware frames come out of the decoder still on the GPU, to be
+    // resized there (`gpu_resize`) or downloaded whole.
+    dec.keep_hw = true;
+    // The decoded size and pixel aspect of pictures resized on the GPU.
+    let mut source: Option<(i32, i32, f64)> = None;
+    // The serial `target` was last chosen for: after a seek, the size the
+    // window has now is taken at once (a paused picture is redone that way).
+    let mut target_serial = -1;
+    let mut to_gpu = ToGpu { up: GpuUpload::new(), allowed: false, target, quality: cfg.scale_quality, active: false };
 
     while ctx.alive() && !stop.load(Ordering::Acquire) {
         match dec.decode(&mut frame) {
@@ -245,18 +310,36 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
                         }
                         let sar = frame_sar(&filtered, &info);
                         let dur = frame_duration(&filtered, otb, frame_dur);
-                        let vf = VideoFrame { frame: filtered.take(), pts: p, duration: dur, serial: k.serial, sar };
-                        if !push(&ctx, &dec, vf) {
+                        let vf =
+                            VideoFrame { frame: filtered.take(), pts: p, duration: dur, serial: k.serial, sar, source };
+                        if !push(&ctx, &dec, &mut to_gpu, vf) {
                             break;
                         }
                     }
                 }
                 graph = None;
+                // Its graph holds the CUDA device, which the decoder lets go
+                // of a while after the end (`Decoder::park`).
+                to_gpu.up = GpuUpload::new();
                 ctx.video_finished.store(dec.finished, Ordering::Release);
                 ctx.wake_demuxer();
                 continue;
             }
             DecodeResult::Frame => {}
+            DecodeResult::Restart => {
+                // Decoding restarts at a keyframe: from where playback is.
+                // (A DVD's navigator decides where reading goes; its short
+                // GOPs bring the next keyframe soon enough.)
+                #[cfg(has_dvdnav)]
+                let nav = ctx.nav.lock().is_some();
+                #[cfg(not(has_dvdnav))]
+                let nav = false;
+                if !nav {
+                    ctx.request_seek(super::SeekRequest { target: ctx.position(), relative: false, precise: true });
+                }
+                graph = None;
+                continue;
+            }
         }
         let serial = dec.pkt_serial;
         let tb = info.time_base;
@@ -277,7 +360,7 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
         if !reported_fmt {
             reported_fmt = true;
             log::debug!("startup: first video frame decoded at {:.0} ms", crate::ms_since_start());
-            let (pf, cs, hdr) = (av::pix_fmt_name(frame.format()), color_desc(&frame), is_hdr(&frame));
+            let (pf, cs, hdr) = (av::pix_fmt_name(frame.sw_format()), color_desc(&frame), is_hdr(&frame));
             ctx.update_state(|st| {
                 if let Some(v) = st.video.as_mut() {
                     v.pix_fmt = pf;
@@ -303,19 +386,67 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
         if t != pending_target.0 {
             pending_target = (t, Instant::now());
         }
-        if t != target && (graph.is_none() || pending_target.1.elapsed() >= RESIZE_SETTLE) {
+        // A graph (or the GPU resize) is rebuilt for a new size only once the
+        // window has stopped changing size; meanwhile the presenter scales.
+        let rebuilds = graph.is_some() || source.is_some() || to_gpu.active;
+        if t != target && (!rebuilds || pending_target.1.elapsed() >= RESIZE_SETTLE || serial != target_serial) {
             target = t;
         }
+        target_serial = serial;
         let try_upscale = ctx.controls.target_known.load(Ordering::Relaxed)
             && broken_upscale.as_ref().is_none_or(|k| *k != upscale::ShaderSetKey::of(&cfg));
+
+        // A screenshot of a picture that was resized on the GPU: save this
+        // one, as decoded (downloaded whole), instead.
+        let shot = ctx.screenshot_req.lock().take();
+        if let Some(path) = shot {
+            let whole = frame.clone_ref().map(|mut f| (!dec.is_hw(&f) || dec.download(&mut f), f));
+            match whole {
+                Some((true, whole)) => {
+                    super::present::save_screenshot(ctx.clone(), whole, frame_sar(&frame, &info), path);
+                }
+                _ => ctx.emit(PlayerEvent::Warning("Screenshot failed".into())),
+            }
+        }
+        let mut on_gpu = false;
+        if dec.is_hw(&frame) {
+            let decoded = (frame.width(), frame.height(), frame_sar(&frame, &info));
+            let resize = if ctx.controls.target_known.load(Ordering::Relaxed) && dec.can_resize(&frame) {
+                gpu_resize(&adj, &cfg, &info, &frame, saw_interlaced, target, try_upscale)
+            } else {
+                None
+            };
+            let resized = resize.is_some_and(|rs| dec.resize_on_gpu(&mut frame, rs));
+            source = resized.then_some(decoded);
+            on_gpu = true;
+        } else {
+            source = None;
+        }
         let chain = build_chain(&adj, &cfg, &info, &frame, saw_interlaced, target, try_upscale);
+        to_gpu.allowed = cfg.hwdec != HwDecode::Off
+            && chain.upscale.is_none()
+            && ctx.controls.target_known.load(Ordering::Relaxed)
+            && super::present::gpu_convert_ok();
+        to_gpu.target = target;
+        to_gpu.quality = cfg.scale_quality;
+        // A window-sized picture with no filters left to run waits in the
+        // queue on the GPU, and the presenter converts it there as it
+        // downloads it. Anything else is downloaded now.
+        if on_gpu {
+            if source.is_some() && chain.desc.is_empty() && super::present::gpu_convert_ok() {
+                dec.release_downloads();
+            } else if !dec.download(&mut frame) {
+                frame.unref();
+                continue;
+            }
+        }
 
         if chain.desc.is_empty() {
             graph = None;
             let sar = frame_sar(&frame, &info);
             let dur = frame_duration(&frame, tb, frame_dur);
-            let vf = VideoFrame { frame: frame.take(), pts, duration: dur, serial, sar };
-            if !push(&ctx, &dec, vf) {
+            let vf = VideoFrame { frame: frame.take(), pts, duration: dur, serial, sar, source };
+            if !push(&ctx, &dec, &mut to_gpu, vf) {
                 continue;
             }
             continue;
@@ -356,8 +487,8 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
         let Some((k, g)) = graph.as_mut() else {
             let sar = frame_sar(&frame, &info);
             let dur = frame_duration(&frame, tb, frame_dur);
-            let vf = VideoFrame { frame: frame.take(), pts, duration: dur, serial, sar };
-            push(&ctx, &dec, vf);
+            let vf = VideoFrame { frame: frame.take(), pts, duration: dur, serial, sar, source };
+            push(&ctx, &dec, &mut to_gpu, vf);
             continue;
         };
         // libplacebo times its output by frame durations: give untimed
@@ -384,15 +515,48 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
                 duration: dur,
                 serial,
                 sar,
+                source,
             };
-            if !push(&ctx, &dec, vf) {
+            if !push(&ctx, &dec, &mut to_gpu, vf) {
                 break;
             }
         }
     }
 }
 
-fn push(ctx: &SessionCtx, dec: &Decoder, vf: VideoFrame) -> bool {
+/// Pictures in system memory sent to the GPU to be resized there
+/// ([`GpuUpload`]), as hardware-decoded ones are, rather than by the
+/// presenter's swscale.
+struct ToGpu {
+    up: GpuUpload,
+    /// Set for each decoded picture: whether this may be done (no shader
+    /// upscaling, the window size known), the size and the scaling filter.
+    allowed: bool,
+    target: (u32, u32),
+    quality: ScaleQuality,
+    /// The last picture went to the GPU.
+    active: bool,
+}
+
+impl ToGpu {
+    fn apply(&mut self, vf: &mut VideoFrame) {
+        self.active = false;
+        if !self.allowed || vf.source.is_some() {
+            return;
+        }
+        let (w, h, sar) = (vf.frame.width(), vf.frame.height(), vf.sar);
+        let (dw, dh) = super::present::gpu_size(w, h, sar, self.target);
+        let resize = GpuResize { w: dw, h: dh, quality: self.quality };
+        if GpuUpload::worth_it(&vf.frame, resize) && self.up.run(&mut vf.frame, resize) {
+            vf.source = Some((w, h, sar));
+            vf.sar = 1.0;
+            self.active = true;
+        }
+    }
+}
+
+fn push(ctx: &SessionCtx, dec: &Decoder, to_gpu: &mut ToGpu, mut vf: VideoFrame) -> bool {
+    to_gpu.apply(&mut vf);
     let q = dec.queue.clone();
     let ok = ctx.frames.push(vf, |s| q.serial() != s);
     if let Some(mut st) = ctx.shared.state.try_lock()

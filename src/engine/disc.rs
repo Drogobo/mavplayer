@@ -1,6 +1,8 @@
 //! Disc helpers: recognising DVDs (discs, images, folders) and audio CD
-//! images, finding optical drives and listing DVD titles. Playback itself goes through FFmpeg's
-//! `dvdvideo` demuxer (libdvdnav/libdvdread, plus libdvdcss when present).
+//! images, finding optical drives, listing DVD titles and keeping a drive
+//! open while its disc is in use. Titles play through FFmpeg's `dvdvideo`
+//! demuxer (libdvdnav/libdvdread, plus libdvdcss when present), menus
+//! through `nav.rs`.
 
 use super::demux;
 use super::types::*;
@@ -134,9 +136,19 @@ pub fn optical_drives() -> Vec<OpticalDrive> {
     v
 }
 
-/// Lists the titles on a disc by opening each one. Slow on physical
-/// discs, so call it from a background thread.
+/// Lists the titles on a disc. Reads the disc, so call it from a
+/// background thread.
 pub fn probe_titles(path: &str, cfg: &EngineConfig, max: u32) -> Vec<DvdTitle> {
+    let _hold = hold(path);
+    // From the disc's tables alone (one open, a few small IFO files), when
+    // libdvdnav is there; opening each title reads into its video.
+    #[cfg(has_dvdnav)]
+    if let Some(mut titles) = super::nav::list_titles(path)
+        && !titles.is_empty()
+    {
+        titles.retain(|t| t.number <= max);
+        return titles;
+    }
     let mut titles = Vec::new();
     for n in 1..=max {
         let src = MediaSource::Dvd { path: path.to_string(), title: n, angle: 1 };
@@ -167,6 +179,93 @@ pub fn main_title(titles: &[DvdTitle]) -> Option<u32> {
     titles.iter().max_by(|a, b| a.duration.total_cmp(&b.duration)).map(|t| t.number)
 }
 
+/// Keeps an optical drive open while its disc is in use: when the last
+/// handle on a block device closes, Linux drops its page cache, and every
+/// open after that (each title probed, the menus played after a scan,
+/// playing the disc again) read the disc from scratch at drive speed.
+/// Dropping the hold leaves the drive open for `KEEP_AFTER` more.
+pub struct DiscHold(#[cfg_attr(not(target_os = "linux"), allow(dead_code))] String);
+
+/// How long a drive stays open after its disc was last used.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const KEEP_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Holds `path` open if it is an optical drive (a block device).
+pub fn hold(path: &str) -> Option<DiscHold> {
+    #[cfg(target_os = "linux")]
+    {
+        keep::acquire(path).map(DiscHold)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+impl Drop for DiscHold {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        keep::release(&self.0);
+    }
+}
+
+/// Closes drives unused for `KEEP_AFTER` (called once a second).
+pub fn release_idle() {
+    #[cfg(target_os = "linux")]
+    keep::release_idle(KEEP_AFTER);
+}
+
+#[cfg(target_os = "linux")]
+mod keep {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    struct Held {
+        path: String,
+        _fd: OwnedFd,
+        users: usize,
+        idle_since: Instant,
+    }
+
+    static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+
+    /// Returns the key the hold is filed under.
+    pub fn acquire(path: &str) -> Option<String> {
+        let real = std::fs::canonicalize(path).ok()?;
+        let key = real.to_string_lossy().into_owned();
+        let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = g.iter_mut().find(|h| h.path == key) {
+            h.users += 1;
+            return Some(key);
+        }
+        if !std::fs::metadata(&real).ok()?.file_type().is_block_device() {
+            return None;
+        }
+        // O_NONBLOCK: an open "for ioctls" that doesn't lock the tray.
+        let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&real).ok()?;
+        g.push(Held { path: key.clone(), _fd: f.into(), users: 1, idle_since: Instant::now() });
+        Some(key)
+    }
+
+    pub fn release(key: &str) {
+        let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = g.iter_mut().find(|h| h.path == key) {
+            h.users = h.users.saturating_sub(1);
+            if h.users == 0 {
+                h.idle_since = Instant::now();
+            }
+        }
+    }
+
+    pub fn release_idle(after: Duration) {
+        let mut g = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        g.retain(|h| h.users > 0 || h.idle_since.elapsed() < after);
+    }
+}
+
 pub fn is_disc_source(p: &Path) -> Option<MediaSource> {
     if super::cdda::is_cue(p) {
         // A cue sheet of an audio CD image (not one for a FLAC or WAV album,
@@ -191,6 +290,7 @@ pub enum DiscContent {
 /// Looks at the disc in `path` (a drive, image or folder). Slow on
 /// physical discs (it may spin one up): call it from a background thread.
 pub fn read_disc(path: &str, cfg: &EngineConfig) -> DiscContent {
+    let _hold = hold(path);
     let p = Path::new(path);
     if let Some(files) = super::cdda::mounted_cd_tracks(p) {
         return DiscContent::MountedCd(files);

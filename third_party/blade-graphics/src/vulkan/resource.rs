@@ -2,6 +2,22 @@ use ash::vk;
 use gpu_alloc_ash::AshMemoryDevice;
 use std::{mem, ptr};
 
+/// MavPlayer patch. Device-local requests this big get a memory object of
+/// their own, of exactly their size, instead of a buddy-allocator block
+/// rounded up to a power of two (a 1080p BGRA video frame is 8 MB, which took
+/// 16 MB). Freed ones are kept for a moment ([`SPARE_FOR`]) and reused by the
+/// next request of the same size: a video player creates a texture for every
+/// frame and frees an older one, and each `vkAllocateMemory`/`vkFreeMemory`
+/// pair is a kernel round trip.
+const BIG_BLOCK: u64 = 4 << 20;
+/// How long a freed big block waits for reuse, and how many wait.
+const SPARE_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+const SPARE_MAX: usize = 3;
+/// Upload buffers this big get an exact-size memory object as well: GPUI's
+/// staging chunks for video frames (2–33 MB), which `blade-util`'s belt keeps
+/// and reuses. They aren't kept as spares when freed.
+const BIG_UPLOAD: u64 = 1 << 20;
+
 struct Allocation {
     memory: vk::DeviceMemory,
     offset: u64,
@@ -38,6 +54,28 @@ impl super::Context {
             }
         };
         let memory_types = requirements.memory_type_bits & manager.valid_ash_memory_types;
+        let big = matches!(memory, crate::Memory::Device) && requirements.size >= BIG_BLOCK;
+        let dedicated = big || matches!(memory, crate::Memory::Upload) && requirements.size >= BIG_UPLOAD;
+        if big {
+            let now = std::time::Instant::now();
+            let reuse = manager.spare.iter().position(|(b, _)| {
+                b.size() == requirements.size
+                    && b.offset() & (requirements.alignment - 1) == 0
+                    && memory_types & (1 << b.memory_type()) != 0
+            });
+            if let Some(i) = reuse {
+                let (block, _) = manager.spare.swap_remove(i);
+                Self::expire_spare(&self.device.core, &mut manager, now);
+                return Allocation {
+                    memory: *block.memory(),
+                    offset: block.offset(),
+                    data: ptr::null_mut(),
+                    handle: manager.slab.insert((block, true)),
+                    memory_type: memory,
+                };
+            }
+            Self::expire_spare(&self.device.core, &mut manager, now);
+        }
         let mut block = match memory {
             crate::Memory::External(e) => {
                 let memory_properties = unsafe {
@@ -111,18 +149,21 @@ impl super::Context {
                 }
             }
             _ => unsafe {
-                manager
-                    .allocator
-                    .alloc(
-                        AshMemoryDevice::wrap(&self.device.core),
-                        gpu_alloc::Request {
-                            size: requirements.size,
-                            align_mask: requirements.alignment - 1,
-                            usage: alloc_usage,
-                            memory_types,
-                        },
-                    )
-                    .unwrap()
+                let request = gpu_alloc::Request {
+                    size: requirements.size,
+                    align_mask: requirements.alignment - 1,
+                    usage: alloc_usage,
+                    memory_types,
+                };
+                let device = AshMemoryDevice::wrap(&self.device.core);
+                if dedicated {
+                    manager
+                        .allocator
+                        .alloc_with_dedicated(device, request, gpu_alloc::Dedicated::Required)
+                        .unwrap()
+                } else {
+                    manager.allocator.alloc(device, request).unwrap()
+                }
             },
         };
 
@@ -146,18 +187,39 @@ impl super::Context {
             memory: *block.memory(),
             offset: block.offset(),
             data,
-            handle: manager.slab.insert(block),
+            handle: manager.slab.insert((block, big)),
             memory_type: memory,
         }
     }
 
     fn free_memory(&self, handle: usize) {
         let mut manager = self.memory.lock().unwrap();
-        let block = manager.slab.remove(handle);
-        unsafe {
-            manager
-                .allocator
-                .dealloc(AshMemoryDevice::wrap(&self.device.core), block);
+        let (block, big) = manager.slab.remove(handle);
+        let now = std::time::Instant::now();
+        if big {
+            manager.spare.push((block, now));
+        } else {
+            unsafe {
+                manager
+                    .allocator
+                    .dealloc(AshMemoryDevice::wrap(&self.device.core), block);
+            }
+        }
+        Self::expire_spare(&self.device.core, &mut manager, now);
+    }
+
+    /// Frees the spare big blocks that waited too long, and the oldest
+    /// beyond [`SPARE_MAX`].
+    fn expire_spare(device: &ash::Device, manager: &mut super::MemoryManager, now: std::time::Instant) {
+        let mut i = 0;
+        while i < manager.spare.len() {
+            let old = now.duration_since(manager.spare[i].1) > SPARE_FOR;
+            if old || manager.spare.len() > SPARE_MAX {
+                let (block, _) = manager.spare.remove(i);
+                unsafe { manager.allocator.dealloc(AshMemoryDevice::wrap(device), block) };
+            } else {
+                i += 1;
+            }
         }
     }
 

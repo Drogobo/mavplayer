@@ -7,6 +7,7 @@ pub mod keymap;
 pub mod media_keys;
 pub mod menu;
 pub mod menus;
+pub mod picture;
 pub mod player;
 pub mod render;
 pub mod shell;

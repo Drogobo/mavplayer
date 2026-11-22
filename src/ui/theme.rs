@@ -28,7 +28,6 @@ pub struct Theme {
     pub pressed: Hsla,
     pub track: Hsla,
     pub backdrop: Hsla,
-    pub video_bg: Hsla,
     pub osd_bg: Hsla,
     pub danger: Hsla,
 }
@@ -53,7 +52,6 @@ impl Theme {
             pressed: rgba(0xffffff22).into(),
             track: rgba(0xffffff2e).into(),
             backdrop: rgba(0x0000008c).into(),
-            video_bg: rgb(0x000000).into(),
             osd_bg: rgba(0x141314d0).into(),
             danger: rgb(0xff5d6e).into(),
         }
@@ -78,7 +76,6 @@ impl Theme {
             pressed: rgba(0x0000001c).into(),
             track: rgba(0x00000024).into(),
             backdrop: rgba(0x00000066).into(),
-            video_bg: rgb(0x000000).into(),
             osd_bg: rgba(0x141314d0).into(),
             danger: rgb(0xd42f45).into(),
         }

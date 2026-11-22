@@ -713,6 +713,7 @@ impl super::Context {
             super::MemoryManager {
                 allocator: gpu_alloc::GpuAllocator::new(config, properties),
                 slab: slab::Slab::new(),
+                spare: Vec::new(),
                 valid_ash_memory_types,
             }
         };

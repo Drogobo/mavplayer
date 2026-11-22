@@ -4,6 +4,7 @@ use super::actions::*;
 use super::keymap;
 use super::menu::MenuItem as M;
 use super::menus::MENUBAR;
+use super::picture::{Chrome, picture_rect};
 use super::player::{Aspect, Drag, PlayerView, SliderFn};
 use super::theme::{Theme, overlay_theme};
 use super::widgets::{format_speed, format_time, frac_to_speed, icon, speed_to_frac, tooltip};
@@ -11,9 +12,9 @@ use crate::engine::{MediaSource, Status, SubContent, TrackKind};
 use crate::icons::Icon;
 use crate::settings::{BarControl, RepeatMode, ScrollAction, SubStyle};
 use gpui::{
-    AnyElement, Bounds, ClickEvent, ContentMask, Context, Corners, CursorStyle, Decorations, Div, DragMoveEvent,
-    ElementId, ExternalPaths, Hsla, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point,
-    RenderImage, ResizeEdge, Resource, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, Window,
+    AnyElement, AnyView, Bounds, ClickEvent, Context, Corners, CursorStyle, Decorations, Div, DragMoveEvent, ElementId,
+    ExternalPaths, Hsla, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Point, RenderImage,
+    ResizeEdge, Resource, ScrollDelta, ScrollWheelEvent, SharedString, Stateful, StyleRefinement, Window,
     WindowControlArea, canvas, div, img, point, prelude::*, px, relative, rgba, size,
 };
 use std::cell::Cell;
@@ -312,7 +313,7 @@ impl PlayerView {
     fn resize_handles(&self) -> AnyElement {
         let e = px(RESIZE_EDGE);
         let edge = |id: &'static str, edge: ResizeEdge, cursor: CursorStyle| {
-            div().id(id).absolute().cursor(cursor).on_mouse_down(MouseButton::Left, move |_, w, cx| {
+            div().id(id).absolute().cursor(cursor).occlude().on_mouse_down(MouseButton::Left, move |_, w, cx| {
                 w.start_window_resize(edge);
                 cx.stop_propagation();
             })
@@ -348,8 +349,27 @@ impl PlayerView {
     fn menubar(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let open_idx = self.menu.as_ref().and_then(|m| m.menubar_index);
-        let mut row =
-            div().h(px(28.)).flex_none().flex().items_center().px_1().gap(px(2.)).bg(t.chrome).text_size(px(13.));
+        let bar = self.menubar_bounds.clone();
+        let mut row = div()
+            .id("menubar")
+            .relative()
+            .h(px(28.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .px_1()
+            .gap(px(2.))
+            .bg(t.chrome)
+            .text_size(px(13.))
+            .child(canvas(move |b, _, _| bar.set(b), |_, _, _, _| {}).absolute().size_full())
+            // An open menu leaves the menu bar uncovered (see `render_menu`):
+            // a click on its empty part closes the menu.
+            .on_any_mouse_down(cx.listener(|this, _, _, cx| {
+                if this.menu.is_some() {
+                    this.close_menu(cx);
+                    cx.stop_propagation();
+                }
+            }));
         for (i, name) in MENUBAR.iter().enumerate() {
             let bounds = Rc::new(Cell::new(Bounds::default()));
             let (b1, b2, b3) = (bounds.clone(), bounds.clone(), bounds.clone());
@@ -405,7 +425,6 @@ impl PlayerView {
 
         let frame = self.frame.clone();
         let fsize = self.frame_size;
-        let pad = self.frame_pad as f32;
         let aspect = self.aspect;
         let zoom = self.zoom;
         let bcell = self.video_bounds.clone();
@@ -467,23 +486,9 @@ impl PlayerView {
                 b
             },
             move |b, _, window, _| {
-                window.paint_quad(gpui::fill(b, gpui::black()));
-                if let Some(img) = frame {
-                    let r = video_rect(b, fsize, aspect, zoom);
-                    // The image carries a border of repeated edge pixels so
-                    // the GPU's filtering never reaches past the picture:
-                    // draw it that much larger, clipped to the picture.
-                    let (px_w, px_h) = (
-                        f32::from(r.size.width) / fsize.0.max(1) as f32,
-                        f32::from(r.size.height) / fsize.1.max(1) as f32,
-                    );
-                    let padded = Bounds::new(
-                        point(r.origin.x - px(pad * px_w), r.origin.y - px(pad * px_h)),
-                        size(r.size.width + px(2. * pad * px_w), r.size.height + px(2. * pad * px_h)),
-                    );
-                    window.with_content_mask(Some(ContentMask { bounds: r }), |window| {
-                        let _ = window.paint_image(padded, Corners::default(), img, 0, false);
-                    });
+                // The picture itself is drawn beneath, by `picture::Picture`.
+                if frame.is_some() {
+                    let r = picture_rect(b, fsize, aspect, zoom, window.scale_factor());
                     // Bitmap subtitles (PGS/DVD/DVB) are positioned on the video frame.
                     for (img, x, y, w, h, cw, ch) in bitmaps {
                         let (cw, ch) = if cw > 0 {
@@ -519,7 +524,6 @@ impl PlayerView {
             .min_h_0()
             .relative()
             .overflow_hidden()
-            .bg(t.video_bg)
             .child(picture)
             .when(active && !show_controls && self.menu.is_none(), |d| d.cursor(CursorStyle::None))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
@@ -695,6 +699,9 @@ impl PlayerView {
                         this.pointer_over_controls = *h;
                         cx.notify();
                     }))
+                    // Clicks, right-clicks and the wheel over the controls
+                    // are theirs, not the video's.
+                    .occlude()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(|_, _, cx| cx.stop_propagation())
                     .child(self.control_bar(ot, true, window, cx)),
@@ -825,6 +832,7 @@ impl PlayerView {
                 .border_color(rgba(0xffffff14))
                 .cursor_pointer()
                 .hover(|s| s.bg(rgba(0xffffff1c)))
+                .occlude()
                 .child(icon(i, px(26.), ot.text))
                 .child(div().text_size(px(13.)).text_color(ot.text).child(label))
                 .on_click(cx.listener(move |this, _, w, cx| f(this, w, cx)))
@@ -858,6 +866,7 @@ impl PlayerView {
                     .rounded(px(6.))
                     .cursor_pointer()
                     .hover(|s| s.bg(rgba(0xffffff12)))
+                    .occlude()
                     .child(icon(ic, px(16.), ot.text_dim))
                     .child(div().flex_1().truncate().text_size(px(13.)).text_color(ot.text).child(r.display_name()))
                     .on_click(cx.listener(move |this, _, w, cx| this.open_sources(vec![src.clone()], w, cx))),
@@ -1682,6 +1691,9 @@ impl PlayerView {
     }
 }
 
+/// The window's root: the picture, with everything else on top of it as a
+/// cached view (see `picture`). A new video frame re-renders only this and
+/// the picture.
 impl Render for PlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.rendered {
@@ -1692,6 +1704,41 @@ impl Render for PlayerView {
         self.avoid_direct_scanout(window);
         self.retire_textures(window);
         self.track_fullscreen(window);
+        let (frame, size, pad, aspect, zoom) =
+            (self.frame.clone(), self.frame_size, self.frame_pad, self.aspect, self.zoom);
+        self.picture.update(cx, |p, _| {
+            p.frame = frame;
+            p.size = size;
+            p.pad = pad;
+            p.aspect = aspect;
+            p.zoom = zoom;
+        });
+        let chrome = match &self.chrome {
+            Some(c) => c.clone(),
+            None => {
+                let me = cx.entity();
+                let c = cx.new(|cx| {
+                    // Everything the chrome shows comes from the player view.
+                    cx.observe(&me, |_, _, cx| cx.notify()).detach();
+                    Chrome { player: me.downgrade() }
+                });
+                self.chrome = Some(c.clone());
+                c
+            }
+        };
+        div()
+            .size_full()
+            .relative()
+            .bg(self.theme.chrome)
+            .child(self.picture.clone())
+            .child(AnyView::from(chrome).cached(StyleRefinement::default().size_full()))
+    }
+}
+
+impl PlayerView {
+    /// Everything in the window but the picture (see [`Chrome`]).
+    pub fn render_chrome(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        self.age_sub_images();
         let t = self.theme;
         let fullscreen = window.is_fullscreen();
         let client_decor = matches!(window.window_decorations(), Decorations::Client { .. }) && !fullscreen;
@@ -1720,7 +1767,6 @@ impl Render for PlayerView {
             .relative()
             .flex()
             .flex_col()
-            .bg(t.chrome)
             .text_color(t.text)
             .text_size(px(13.))
             .font_family(".SystemUIFont")
@@ -1755,7 +1801,7 @@ impl Render for PlayerView {
         if let Some(d) = self.render_dialog(window, cx) {
             root = root.child(d);
         }
-        root
+        root.into_any_element()
     }
 }
 

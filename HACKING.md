@@ -425,13 +425,18 @@ without an AppIndicator extension, say) closing the window quits as usual.
 - GPUI's renderer, blade-graphics, is patched (`third_party/blade-graphics`)
   never to enable Vulkan ray tracing, which NVIDIA's driver otherwise sets up
   for 50 MB in every process.
+  Big textures and upload buffers get exact-size memory, and its upload belt
+  (`third_party/blade-util`) frees idle frame-sized staging chunks instead of
+  keeping one per window size played at.
 - `mem.rs` installs a global allocator that keeps a few freed blocks of 1 MB
   or more for reuse at the same size (converted video frames), and fixes
   glibc's mmap threshold at 1 MB. Without that, glibc's per-thread arenas held
   30 to 70 MB of freed frames. Its thread returns idle memory and closes idle
   GPU devices every second.
-- Frames downloaded from a hardware decoder come from a buffer pool
-  (`DownloadPool` in `decoder.rs`).
+- With CUDA, pictures are resized and converted to BGRA on the GPU
+  (`scale_cuda`, needs FFmpeg 9.1 for BGRA) and downloaded once, at display
+  size, into pinned memory. Other frames downloaded from a hardware decoder
+  come from a buffer pool (`DownloadPool` in `decoder.rs`).
 - "Auto" decoder threads means at most 4 (8 for software decoding above
   1080p), not FFmpeg's one per CPU. Each frame thread holds its own pictures.
 - Files and discs are read 3 seconds ahead (`LOCAL_READ_AHEAD_SECS`); the

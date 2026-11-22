@@ -492,16 +492,26 @@ impl CallbackState {
                     self.last_end = Some((n.ctx.id, e, serial, speed));
                 }
             }
+            n.ctx.audio_dry_since.set(f64::NAN);
             n.ctx.promote();
         } else if let Some((pts, serial, speed)) = r.first {
+            ctx.audio_dry_since.set(f64::NAN);
             ctx.aclk.set_at(pts - (latency + r.lead as f64 / self.rate) * speed, serial, t);
             if let Some(e) = r.end_pts {
                 self.last_end = Some((ctx.id, e, serial, speed));
             }
-        } else if let Some((id, e, serial, speed)) = self.last_end {
+        } else {
             // Starved (buffering): hold the clock at the last audible sample.
-            if id == ctx.id && serial == ctx.aq.serial() {
+            if let Some((id, e, serial, speed)) = self.last_end
+                && id == ctx.id
+                && serial == ctx.aq.serial()
+            {
                 ctx.aclk.set_at(e - latency * speed, serial, t);
+            }
+            // Nothing on its way either: the track has a gap or has ended,
+            // and video may take over the clock (`audio_is_master`).
+            if ctx.aq.len() == 0 && !ctx.audio_dry_since.get().is_finite() {
+                ctx.audio_dry_since.set(t);
             }
         }
         // Volume: cubic curve like most players, ramped per buffer to avoid
@@ -865,6 +875,7 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, tb: ff::AVRational, o
                 continue;
             }
             DecodeResult::Frame => {}
+            DecodeResult::Restart => continue, // only video decoders use the GPU
         }
         let rate = frame.raw().sample_rate.max(1);
         let n = frame.nb_samples();

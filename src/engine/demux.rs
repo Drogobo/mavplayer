@@ -416,10 +416,12 @@ fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
 
 pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     let cfg = ctx.controls.config.lock().clone();
+    let _hold = match &source {
+        MediaSource::Dvd { path, .. } => super::disc::hold(path),
+        _ => None,
+    };
     #[cfg(has_dvdnav)]
-    if let MediaSource::Dvd { path, title: 0, .. } = &source
-        && cfg.dvd_menus
-    {
+    if let MediaSource::Dvd { path, title: 0, .. } = &source {
         let path = path.clone();
         return super::nav::run(ctx, source, path);
     }

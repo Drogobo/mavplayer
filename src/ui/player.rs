@@ -83,6 +83,11 @@ pub struct Scrub {
     resume: bool,
 }
 
+/// Renders a replaced texture is kept for before it is freed. GPUI's draw
+/// ends by waiting for the GPU to finish the draw before it, so two renders
+/// on, nothing can still be reading it. (Each extra one kept a whole frame,
+/// 8 MB at 1080p and 33 MB at 4K, in video memory.)
+const RETIRE_AFTER: u8 = 2;
 /// Minimum time between seeks while the progress bar is dragged.
 const SCRUB_INTERVAL: Duration = Duration::from_millis(60);
 /// How long the pointer must rest on the bar before an exact seek there.
@@ -116,6 +121,15 @@ pub struct PlayerView {
     pub sub_images: HashMap<u64, (Arc<RenderImage>, u32)>,
     pub subs: Vec<SubEvent>,
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The menu bar row, left uncovered by an open menu-bar menu's backdrop
+    /// so hovering another title switches menus.
+    pub menubar_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Draws the picture; a new frame notifies only it (see `picture`).
+    pub picture: Entity<super::picture::Picture>,
+    /// Everything else, made on the first render.
+    pub chrome: Option<Entity<super::picture::Chrome>>,
+    /// The subtitles last shown, to redraw the chrome when they change.
+    subs_signature: u64,
     /// Pause state just before the last single-click pause toggle, so the
     /// second click of a double-click can put it back.
     pub click_pause: Option<(bool, Instant)>,
@@ -256,7 +270,7 @@ impl Boot {
         player.set_audio_fx(settings.audio_fx.clone());
         let resume = ResumeStore::load();
         // A whole DVD (title 0) needs its titles probed first; that runs in the view.
-        let dvd_menus = engine::dvd_menus_available() && settings.dvd_menus;
+        let dvd_menus = engine::dvd_menus_available();
         let started = match sources.first() {
             Some(MediaSource::Dvd { title: 0, .. }) if !dvd_menus => false,
             Some(MediaSource::Cd { track: 0, .. }) | None => false,
@@ -368,6 +382,15 @@ impl PlayerView {
         let theme = Theme::resolve(settings.theme, window);
         let focus = cx.focus_handle();
         window.focus(&focus);
+        let video_bounds = Rc::new(Cell::new(Bounds::default()));
+        let picture = cx.new(|_| super::picture::Picture {
+            frame: None,
+            size: (0, 0),
+            pad: 0,
+            aspect: Aspect::Auto,
+            zoom: 1.0,
+            area: video_bounds.clone(),
+        });
         let mut v = Self {
             playlist: Playlist::new(settings.repeat, settings.shuffle),
             show_playlist: settings.show_playlist,
@@ -383,7 +406,11 @@ impl PlayerView {
             retired: VecDeque::new(),
             sub_images: HashMap::new(),
             subs: Vec::new(),
-            video_bounds: Rc::new(Cell::new(Bounds::default())),
+            video_bounds,
+            menubar_bounds: Default::default(),
+            picture,
+            chrome: None,
+            subs_signature: 0,
             click_pause: None,
             click_origin: 0,
             saved_volume: (settings.volume, settings.muted),
@@ -461,7 +488,12 @@ impl PlayerView {
 
     fn on_engine_wake(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.wake_pending.store(false, Ordering::Release);
+        // A new frame redraws the picture; the rest of the window (the
+        // chrome, see `picture`) only when what it shows changed.
+        let mut chrome = false;
         if let Some(f) = self.player.take_frame() {
+            // The placeholder screen goes, or subtitles move with the size.
+            chrome |= self.frame.is_none() || (f.width, f.height) != self.frame_size;
             if self.frame.is_none()
                 && let Some(t0) = crate::launch_instant()
             {
@@ -482,6 +514,12 @@ impl PlayerView {
                 let old = self.frame.replace(img);
                 self.retire_frame(old);
             }
+            self.picture.update(cx, |_, cx| cx.notify());
+            let subs = self.subtitle_signature();
+            if subs != self.subs_signature {
+                self.subs_signature = subs;
+                chrome = true;
+            }
             // Pictures arrive but nothing is drawn: the compositor isn't
             // showing the window. Stop converting frames for it until it is.
             if !self.video_hidden && self.last_render.elapsed() > Duration::from_millis(500) {
@@ -490,7 +528,9 @@ impl PlayerView {
                 log::debug!("ui: window not being drawn; pausing picture conversion");
             }
         }
-        for ev in self.player.drain_events() {
+        let events = self.player.drain_events();
+        chrome |= !events.is_empty();
+        for ev in events {
             match ev {
                 PlayerEvent::Loaded => self.on_loaded(window, cx),
                 PlayerEvent::EndOfFile => self.on_end_of_file(window, cx),
@@ -517,7 +557,9 @@ impl PlayerView {
                 PlayerEvent::ScreenshotSaved(p) => self.osd(format!("Screenshot saved: {}", p.display()), cx),
             }
         }
-        cx.notify();
+        if chrome {
+            cx.notify();
+        }
     }
 
     fn on_loaded(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -724,8 +766,6 @@ impl PlayerView {
         }
     }
 
-    /// Drops GPU textures of frames that have been off screen for a few
-    /// renders (the GPU may still be reading the most recent ones).
     /// Frees the texture of a picture no longer shown, a few frames later.
     /// A picture that was never drawn has none: it is just dropped.
     /// (Retiring those would pile up while the window isn't drawn.)
@@ -733,7 +773,7 @@ impl PlayerView {
         if let Some(old) = old
             && self.frame_painted
         {
-            self.retired.push_back((old.id, 3));
+            self.retired.push_back((old.id, RETIRE_AFTER));
         }
         self.frame_painted = false;
     }
@@ -755,18 +795,22 @@ impl PlayerView {
             stub.id = id;
             let _ = window.drop_image(Arc::new(stub));
         }
-        // Subtitle bitmaps not shown for a while.
+    }
+
+    /// Frees subtitle bitmaps not shown for a while (counted in chrome
+    /// renders, which show them).
+    pub fn age_sub_images(&mut self) {
         let stale: Vec<u64> = self
             .sub_images
             .iter_mut()
             .filter_map(|(id, (_, age))| {
                 *age += 1;
-                (*age > 120).then_some(*id)
+                (*age > 30).then_some(*id)
             })
             .collect();
         for id in stale {
             if let Some((img, _)) = self.sub_images.remove(&id) {
-                self.retired.push_back((img.id, 3));
+                self.retired.push_back((img.id, RETIRE_AFTER));
             }
         }
     }
@@ -1099,9 +1143,10 @@ impl PlayerView {
         .detach();
     }
 
-    /// DVDs start at their own menu.
+    /// A whole DVD (title 0) starts at its own menu, unless this build
+    /// can't show menus: then it plays the main feature.
     pub fn dvd_menus_on(&self) -> bool {
-        engine::dvd_menus_available() && self.settings.dvd_menus
+        engine::dvd_menus_available()
     }
 
     /// A DVD playing with its menus shows buttons: arrow keys, Enter and
@@ -1464,6 +1509,27 @@ impl PlayerView {
 
     /// Subtitles are on (the user's choice, kept across files and launches).
     /// A chosen track is hidden while they are off.
+    /// Identifies the subtitles on screen now (what `video_area` shows).
+    fn subtitle_signature(&mut self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut subs = std::mem::take(&mut self.subs);
+        subs.clear();
+        let dvd_nav = self.player.with_state(|s| s.dvd.is_some());
+        if (self.subs_visible() || dvd_nav) && self.player.is_active() {
+            self.player.subtitles_at(self.player.position() - self.sub_delay, &mut subs);
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for ev in &subs {
+            (ev.start.to_bits(), ev.end.to_bits()).hash(&mut h);
+            match &ev.content {
+                crate::engine::SubContent::Text(t) => t.hash(&mut h),
+                crate::engine::SubContent::Bitmap(b) => (Arc::as_ptr(b) as usize).hash(&mut h),
+            }
+        }
+        self.subs = subs;
+        h.finish()
+    }
+
     pub fn subs_visible(&self) -> bool {
         self.settings.show_subtitles
     }

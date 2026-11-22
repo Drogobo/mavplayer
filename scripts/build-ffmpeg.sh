@@ -15,7 +15,7 @@
 # development headers (see HACKING.md).
 set -euo pipefail
 
-FFMPEG_VERSION=9.0.2
+FFMPEG_VERSION=9.1
 DAV1D_VERSION=1.5.1
 ZIMG_VERSION=3.0.6
 DVDREAD_VERSION=7.1.1

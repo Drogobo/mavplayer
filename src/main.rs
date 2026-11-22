@@ -147,8 +147,22 @@ fn exit_with(r: anyhow::Result<String>) -> ! {
     }
 }
 
+/// Driver settings for the GPU work playback does, unless the user set them.
+/// Call before any thread starts (it changes the environment).
+fn gpu_env() {
+    // CUDA gives each context eight hardware work queues by default, each
+    // with its own command buffers in system memory. Decoding and resizing
+    // use one stream, so one queue does: the context then holds 37 MB of
+    // host memory instead of 84 MB (RTX 2070, driver 620), at no cost.
+    if std::env::var_os("CUDA_DEVICE_MAX_CONNECTIONS").is_none() {
+        // SAFETY: no other thread exists yet.
+        unsafe { std::env::set_var("CUDA_DEVICE_MAX_CONNECTIONS", "1") };
+    }
+}
+
 fn main() {
     mem::tune();
+    gpu_env();
     let start = std::time::Instant::now();
     *START.lock() = Some(start);
     let args = parse_args();

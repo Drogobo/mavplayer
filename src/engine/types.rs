@@ -697,9 +697,6 @@ pub struct EngineConfig {
     pub network_cache_secs: f64,
     pub decoder_threads: u32,
     pub dvd_region: u32,
-    /// Play DVDs with their menus (when libdvdnav is available).
-    #[cfg_attr(not(has_dvdnav), allow(dead_code))]
-    pub dvd_menus: bool,
     pub user_agent: String,
 }
 
@@ -726,7 +723,6 @@ impl Default for EngineConfig {
             network_cache_secs: 10.0,
             decoder_threads: 0,
             dvd_region: 0,
-            dvd_menus: true,
             user_agent: format!("MavPlayer/{}", env!("CARGO_PKG_VERSION")),
         }
     }

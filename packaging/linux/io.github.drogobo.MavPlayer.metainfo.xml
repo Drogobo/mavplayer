@@ -47,6 +47,13 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.3.0" date="2026-11-21">
+      <description>
+        <p>With NVIDIA GPUs, video is resized and converted on the GPU and copied out once at window size: playing 1080p60 in a window takes a fraction of the CPU it did, including AV1 and 10-bit H.264 that the GPU can't decode.</p>
+        <p>Much less memory: lean hardware decoders, smaller CUDA contexts, video memory that is reused or freed, and GPU devices that close when nothing plays. A new video frame no longer redraws the whole window.</p>
+        <p>DVD menus whose music ends before their animation no longer stall, Open Disc lists DVD titles faster, and the drive stays open between uses so the disc isn't read again. Menus and dialogs block the mouse from reaching what is behind them.</p>
+      </description>
+    </release>
     <release version="0.2.3" date="2026-11-21">
       <description>
         <p>DVD menus: DVDs start at the disc's own menu, with buttons that work with the keyboard and the mouse, and play what the disc chooses next. Or play the main feature straight away.</p>

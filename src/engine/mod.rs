@@ -56,6 +56,9 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
+/// How long audio must have run dry before video takes over the clock.
+const AUDIO_DRY_HANDOVER: f64 = 0.3;
+
 /// An `f64` stored in an `AtomicU64`.
 pub struct AtomicF64(AtomicU64);
 impl AtomicF64 {
@@ -154,6 +157,9 @@ pub struct SessionCtx {
     pub aclk: sync::Clock,
     pub vclk: sync::Clock,
     pub audio_active: AtomicBool,
+    /// When the audio output last ran out of samples with none queued
+    /// (`sync::now()` time; NaN while audio flows). See `audio_is_master`.
+    pub audio_dry_since: AtomicF64,
     /// Non-zero while an audio track's output device is still being opened.
     /// Holds the token of the component doing it, so a stale one can't clear
     /// a newer one's flag. Video shows its first frame but waits meanwhile.
@@ -177,7 +183,10 @@ pub struct SessionCtx {
     pub duration: AtomicF64,
     pub switch_req: Mutex<Vec<(TrackKind, Option<TrackId>)>>,
     pub subs: subs::SubStore,
-    pub last_frame: Mutex<Option<(av::Frame, f64)>>,
+    pub last_frame: Mutex<Option<present::LastFrame>>,
+    /// A screenshot for the video thread to take from the next picture,
+    /// downloaded whole: the one on screen was resized on the GPU.
+    pub screenshot_req: Mutex<Option<PathBuf>>,
     pub sub_canvas: AtomicU64,
     /// `Some` while this session is preloaded as the next item: it opens,
     /// decodes and buffers, but shows and plays nothing, and its state and
@@ -279,11 +288,7 @@ impl SessionCtx {
     /// The clock everything is synchronised to: the audio device when audio
     /// is playing, otherwise the video clock.
     pub fn master_clock(&self) -> f64 {
-        if self.audio_active.load(Ordering::Acquire) {
-            self.aclk.get(self.aq.serial())
-        } else {
-            self.vclk.get(self.vq.serial())
-        }
+        if self.audio_is_master() { self.aclk.get(self.aq.serial()) } else { self.vclk.get(self.vq.serial()) }
     }
 
     /// True while playback is held until the audio device is ready.
@@ -296,8 +301,16 @@ impl SessionCtx {
         let _ = self.audio_pending.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Relaxed);
     }
 
+    /// Audio drives the clock, unless it has run dry while video goes on:
+    /// a DVD menu whose music is shorter than its animation, or a file whose
+    /// audio track ends first. The audio clock stands still then, and the
+    /// pictures (and menu buttons) after it would wait for it.
     pub fn audio_is_master(&self) -> bool {
-        self.audio_active.load(Ordering::Acquire)
+        if !self.audio_active.load(Ordering::Acquire) {
+            return false;
+        }
+        let dry = self.audio_dry_since.get();
+        !(dry.is_finite() && sync::now() - dry > AUDIO_DRY_HANDOVER && self.video_active.load(Ordering::Acquire))
     }
 
     /// Playback position in seconds from the start of the media.
@@ -395,6 +408,7 @@ fn new_session(controls: &Arc<Controls>, shared: &Arc<Shared>, source: &MediaSou
         aclk: sync::Clock::new(),
         vclk: sync::Clock::new(),
         audio_active: AtomicBool::new(false),
+        audio_dry_since: AtomicF64::new(f64::NAN),
         audio_pending: AtomicU64::new(0),
         audio_tokens: AtomicU64::new(0),
         video_active: AtomicBool::new(false),
@@ -415,6 +429,7 @@ fn new_session(controls: &Arc<Controls>, shared: &Arc<Shared>, source: &MediaSou
         switch_req: Mutex::new(Vec::new()),
         subs: subs::SubStore::new(),
         last_frame: Mutex::new(None),
+        screenshot_req: Mutex::new(None),
         sub_canvas: AtomicU64::new(0),
         standby_flag: AtomicBool::new(standby.is_some()),
         standby: Mutex::new(standby),
@@ -840,8 +855,18 @@ impl Player {
 
     /// Saves the current picture at its native resolution.
     pub fn screenshot(&self, path: PathBuf) {
-        if let Some(s) = &self.session {
+        let Some(s) = &self.session else { return };
+        let resized = s.ctx.last_frame.lock().as_ref().is_some_and(|l| l.source.is_some());
+        if !resized {
             present::screenshot_async(s.ctx.clone(), path);
+            return;
+        }
+        // The picture on screen is window-sized: have the video thread save
+        // the next one whole. Without playback, decode this one again.
+        *s.ctx.screenshot_req.lock() = Some(path);
+        if self.paused() || s.ctx.eof.load(Ordering::Acquire) {
+            let pos = s.ctx.position();
+            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
         }
     }
 
@@ -884,6 +909,7 @@ pub fn init(verbose: bool) {
 pub fn release_idle_devices(idle: std::time::Duration) {
     decoder::release_idle_hw(idle);
     upscale::release_idle(idle);
+    disc::release_idle();
 }
 
 /// Lists audio output devices by name.

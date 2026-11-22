@@ -149,9 +149,9 @@ image or folder), `mavplayer dvd://2/dev/sr1` (title 2 of the disc in `/dev/sr1`
 `mavplayer cdda://` (the audio CD in the default drive), `mavplayer cdda://3`
 (from its third track), `mavplayer album.cue` (a CD image).
 
-`dvd://` with no title starts at the disc's menu. To skip menus by default,
-turn off **Preferences ▸ Network & Discs ▸ Start DVDs at the disc menu**;
-**Media ▸ Open Disc…** (<kbd>Ctrl</kbd>+<kbd>D</kbd>) offers both either way.
+`dvd://` with no title starts at the disc's menu. **Media ▸ Open Disc…**
+(<kbd>Ctrl</kbd>+<kbd>D</kbd>) offers both: **Play from Disc Menu** or **Play
+Main Feature**.
 
 ### Keyboard shortcuts
 

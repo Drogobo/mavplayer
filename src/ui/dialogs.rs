@@ -284,6 +284,9 @@ impl PlayerView {
                 .flex()
                 .items_center()
                 .justify_center()
+                // Nothing behind a dialog reacts to the mouse: no hover,
+                // tooltips, right-click menus or wheel.
+                .occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, w, cx| this.close_dialog(w, cx)))
                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .child(
@@ -1608,16 +1611,6 @@ impl PlayerView {
                         ),
                     ))
                     .child(self.section("DVD"))
-                    .when(engine::dvd_menus_available(), |c| {
-                        c.child(self.toggle_row(
-                            "dvd-menus",
-                            "Start DVDs at the disc menu",
-                            Some("Off: play the main feature straight away"),
-                            s.dvd_menus,
-                            |t, _| t.settings.dvd_menus = !t.settings.dvd_menus,
-                            cx,
-                        ))
-                    })
                     .child(
                         self.row(
                             "Player region",
@@ -2380,7 +2373,7 @@ impl PlayerView {
                     footer = footer.child(self.text_button(
                         "disc-menus",
                         "Play from Disc Menu",
-                        self.settings.dvd_menus,
+                        true,
                         move |this, _, w, cx| this.play_disc_dvd(p.clone(), true, w, cx),
                         cx,
                     ));
@@ -2388,7 +2381,7 @@ impl PlayerView {
                 footer = footer.child(self.text_button(
                     "disc-play",
                     "Play Main Feature",
-                    !menus || !self.settings.dvd_menus,
+                    !menus,
                     move |this, _, w, cx| this.play_disc_dvd(path.clone(), false, w, cx),
                     cx,
                 ));

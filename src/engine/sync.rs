@@ -138,6 +138,10 @@ pub struct VideoFrame {
     pub serial: i32,
     /// Sample aspect ratio (pixel width / pixel height).
     pub sar: f64,
+    /// Set when the picture was resized on the GPU: the size and pixel
+    /// aspect it was decoded at (what bitmap subtitles are positioned on,
+    /// and what a picture for another window size is resized from).
+    pub source: Option<(i32, i32, f64)>,
 }
 
 pub struct FrameQueue {

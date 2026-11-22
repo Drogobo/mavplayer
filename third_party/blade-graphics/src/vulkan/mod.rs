@@ -70,7 +70,11 @@ struct Device {
 
 struct MemoryManager {
     allocator: gpu_alloc::GpuAllocator<vk::DeviceMemory>,
-    slab: slab::Slab<gpu_alloc::MemoryBlock<vk::DeviceMemory>>,
+    /// Each block, and whether it is a big device-local block of its own
+    /// (MavPlayer patch: see `resource.rs`, `BIG_BLOCK`).
+    slab: slab::Slab<(gpu_alloc::MemoryBlock<vk::DeviceMemory>, bool)>,
+    /// Big blocks freed recently, kept for the next texture of the same size.
+    spare: Vec<(gpu_alloc::MemoryBlock<vk::DeviceMemory>, std::time::Instant)>,
     valid_ash_memory_types: u32,
 }
 

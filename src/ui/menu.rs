@@ -156,13 +156,16 @@ impl PlayerView {
         // Taller menus scroll rather than run off a short window.
         let max_h = (window.viewport_size().height - px(16.)).clamp(px(120.), px(560.));
         let open_left = menu.pos.x + px(MENU_W * 2.0) > win_w;
-        let mut layer = div().absolute().top_0().left_0().size_full().child(
+        // The backdrop takes every click and hover outside the menu, so
+        // nothing behind it reacts. A menu-bar menu leaves the menu bar
+        // uncovered: hovering another title there switches menus.
+        let backdrop = |id: &'static str| {
             div()
-                .id("menu-backdrop")
+                .id(id)
                 .absolute()
-                .top_0()
                 .left_0()
-                .size_full()
+                .w_full()
+                .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, _, cx| {
@@ -177,8 +180,24 @@ impl PlayerView {
                         cx.stop_propagation();
                     }),
                 )
-                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation())),
-        );
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|this, _, _, cx| {
+                        this.close_menu(cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+        };
+        let bar = self.menubar_bounds.get();
+        let mut layer = div().absolute().top_0().left_0().size_full();
+        layer = if menu.menubar_index.is_some() && bar.size.height > px(0.) {
+            layer
+                .child(backdrop("menu-backdrop-top").top_0().h(bar.top()))
+                .child(backdrop("menu-backdrop").top(bar.bottom()).bottom_0())
+        } else {
+            layer.child(backdrop("menu-backdrop").top_0().bottom_0())
+        };
         layer = layer.child(anchored().position(menu.pos).snap_to_window_with_margin(px(4.)).child(self.menu_panel(
             &menu.items,
             0,
@@ -247,6 +266,7 @@ impl PlayerView {
             .shadow_lg()
             .text_size(px(13.))
             .text_color(theme.text)
+            .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         let mut panel = div()
             .id(SharedString::from(format!("menu-panel-{level}")))

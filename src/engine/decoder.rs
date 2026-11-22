@@ -2,8 +2,9 @@
 //! packet → frame decode loop shared by the audio and video threads.
 
 use super::av::{self, CodecCtx, Frame, Packet, ff};
+use super::filters::Graph;
 use super::sync::PacketQueue;
-use super::types::HwDecode;
+use super::types::{HwDecode, ScaleQuality};
 use std::os::raw::c_int;
 use std::ptr;
 use std::sync::Arc;
@@ -19,6 +20,8 @@ pub struct OpenedCodec {
     pub hw: Option<HwInfo>,
     pub decoder_name: String,
     reopen: Option<Reopen>,
+    /// Opened with one thread for the hardware decoder (see `auto_video_threads`).
+    lean: bool,
 }
 
 /// What it takes to open a decoder again after `Decoder::park`.
@@ -135,6 +138,10 @@ fn hw_device(ty: ff::AVHWDeviceType) -> Option<*mut ff::AVBufferRef> {
             log::debug!("hw device {:?} unavailable: {}", ty, av::err_str(r));
             HwSlot::Unavailable
         } else {
+            #[cfg(target_os = "linux")]
+            if ty == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA {
+                unsafe { trim_cuda_context(dev) };
+            }
             log::debug!("hw device {:?} ready in {:.0} ms", ty, t0.elapsed().as_secs_f64() * 1000.0);
             HwSlot::Ready(HwDevice(dev), std::time::Instant::now())
         };
@@ -146,6 +153,46 @@ fn hw_device(ty: ff::AVHWDeviceType) -> Option<*mut ff::AVBufferRef> {
             (!r.is_null()).then_some(r)
         }
         _ => None,
+    }
+}
+
+/// Shrinks the per-thread stack of a new CUDA context from 1 KB to 256
+/// bytes. CUDA reserves local memory for that stack for every thread the GPU
+/// can run at once, 30 of a context's 102 MB of VRAM on an RTX 2070; NVDEC
+/// is fixed-function hardware and FFmpeg's scaling kernels need no stack.
+/// (A kernel that needs more gets it: the driver grows local memory to fit
+/// at launch.)
+#[cfg(target_os = "linux")]
+unsafe fn trim_cuda_context(dev: *mut ff::AVBufferRef) {
+    type Push = unsafe extern "C" fn(ctx: ff::CUcontext) -> c_int;
+    type Pop = unsafe extern "C" fn(ctx: *mut ff::CUcontext) -> c_int;
+    type SetLimit = unsafe extern "C" fn(limit: c_int, value: usize) -> c_int;
+    const CU_LIMIT_STACK_SIZE: c_int = 0;
+    unsafe {
+        // FFmpeg has loaded the driver library already.
+        let lib = libc::dlopen(c"libcuda.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
+        if lib.is_null() {
+            return;
+        }
+        let push = libc::dlsym(lib, c"cuCtxPushCurrent_v2".as_ptr());
+        let pop = libc::dlsym(lib, c"cuCtxPopCurrent_v2".as_ptr());
+        let set = libc::dlsym(lib, c"cuCtxSetLimit".as_ptr());
+        if !push.is_null() && !pop.is_null() && !set.is_null() {
+            let push = std::mem::transmute::<*mut libc::c_void, Push>(push);
+            let pop = std::mem::transmute::<*mut libc::c_void, Pop>(pop);
+            let set = std::mem::transmute::<*mut libc::c_void, SetLimit>(set);
+            let hw = (*dev).data as *const ff::AVHWDeviceContext;
+            let cu = (*hw).hwctx as *const ff::AVCUDADeviceContext;
+            if push((*cu).cuda_ctx) == 0 {
+                let r = set(CU_LIMIT_STACK_SIZE, 256);
+                let mut popped = ptr::null_mut();
+                pop(&mut popped);
+                if r != 0 {
+                    log::debug!("cuCtxSetLimit failed: {r}");
+                }
+            }
+        }
+        libc::dlclose(lib);
     }
 }
 
@@ -246,13 +293,20 @@ fn hw_worth_it(par: &ff::AVCodecParameters, mode: HwDecode) -> bool {
 /// Decoder threads for "auto". FFmpeg's own choice is one per CPU plus one,
 /// and with frame threading every thread holds its own decoder state and
 /// pictures in flight: 17 threads cost about 90 MB more than 4 for 1080p
-/// H.264, for no gain at that size. With a hardware decoder the threads only
-/// do bookkeeping; a few are kept for when the GPU turns the stream down and
-/// FFmpeg decodes it in software instead.
+/// H.264, for no gain at that size.
+///
+/// A hardware decoder gets one: the threads only parse headers there, and
+/// each one keeps its own pool of per-picture tables that H.264 allocates
+/// even when the GPU decodes (16 MB of RAM and 8-20 MB of VRAM for 1080p;
+/// 4K HEVC decodes at 413 fps either way). If the GPU then turns the stream
+/// down, `Decoder::decode` reopens it with software threads.
 fn auto_video_threads(par: &ff::AVCodecParameters, hw: bool) -> usize {
+    if hw {
+        return 1;
+    }
     let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
     let big = par.width as i64 * par.height as i64 > 1920 * 1088;
-    cpus.min(if big && !hw { 8 } else { 4 })
+    cpus.min(if big { 8 } else { 4 })
 }
 
 /// Opens a decoder for `stream`.
@@ -303,10 +357,10 @@ unsafe fn open_par(
             Some(m) if hw_worth_it(&*par, m) => try_setup_hw(ctx.0, codec),
             _ => None,
         };
+        let video = (*par).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO;
+        let lean = video && threads == 0 && hw.is_some();
         let threads_s = match threads {
-            0 if (*par).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO => {
-                auto_video_threads(&*par, hw.is_some()).to_string()
-            }
+            0 if video => auto_video_threads(&*par, hw.is_some()).to_string(),
             0 => "auto".to_string(),
             n => n.to_string(),
         };
@@ -320,7 +374,7 @@ unsafe fn open_par(
             anyhow::bail!("could not open decoder: {}", av::err_str(r));
         }
         let decoder_name = av::from_cstr((*codec).name).unwrap_or_default();
-        Ok(OpenedCodec { ctx, hw, decoder_name, reopen: None })
+        Ok(OpenedCodec { ctx, hw, decoder_name, reopen: None, lean })
     }
 }
 
@@ -329,6 +383,301 @@ pub enum DecodeResult {
     /// The decoder was fully drained (end of stream for this serial).
     Eof,
     Aborted,
+    /// The GPU turned the stream down and the decoder was reopened for
+    /// software decoding: it needs a keyframe (seek to where playback is).
+    Restart,
+}
+
+/// A picture size for [`Decoder::resize_on_gpu`] to resize hardware frames
+/// to on the GPU, and the scaling filter to use.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuResize {
+    pub w: i32,
+    pub h: i32,
+    pub quality: ScaleQuality,
+}
+
+/// The GPU filter graph [`GpuResize`] runs: `scale_cuda` to NV12 at display
+/// size.
+///
+/// Downloading the full picture and resizing it with swscale cost most of a
+/// CPU core for 1080p60 in a window (bicubic 1920×1080 → 1326×746 takes
+/// 6 ms a frame); on the GPU it costs nothing measurable. Its bicubic and
+/// Lanczos adapt to the scale like swscale's (checked against swscale's
+/// Lanczos: 42–44 dB for both bicubics, ~50 dB for its Lanczos). Output
+/// stays NV12, a third of BGRA's size, for the frames waiting in the queue:
+/// they stay on the GPU, and the presenter converts each to BGRA there as it
+/// downloads it (`present::GpuConvert`). 10-bit pictures become 8-bit,
+/// which the BGRA output is anyway. An NV12 picture that keeps its size
+/// passes through untouched: NVDEC hands out copies of its surfaces, from a
+/// pool that grows as needed, so the queue may hold them.
+struct GpuScaler {
+    graph: Option<(GpuKey, Graph)>,
+    out: Frame,
+    /// The graph failed for these pictures: download them whole instead.
+    broken: Option<GpuKey>,
+}
+
+/// What a [`GpuScaler`] graph is built for: the frames context (device,
+/// format, size) pictures come from, and the resize.
+#[derive(Clone, Copy, PartialEq)]
+struct GpuKey {
+    frames: usize,
+    resize: GpuResize,
+    colorspace: c_int,
+    range: c_int,
+}
+
+impl GpuScaler {
+    fn new() -> Self {
+        Self { graph: None, out: Frame::new(), broken: None }
+    }
+
+    /// Whether `frame` (a hardware frame) is on a device this can resize on.
+    fn supports(frame: &Frame) -> bool {
+        let r = frame.raw();
+        if r.hw_frames_ctx.is_null() || !av::filter_available("scale_cuda") {
+            return false;
+        }
+        unsafe {
+            let fc = (*r.hw_frames_ctx).data as *const ff::AVHWFramesContext;
+            let dev = (*(*fc).device_ref).data as *const ff::AVHWDeviceContext;
+            (*dev).type_ == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA
+        }
+    }
+
+    /// Resizes `frame` in place, still on the GPU.
+    fn run(&mut self, frame: &mut Frame, resize: GpuResize) -> anyhow::Result<()> {
+        tag_matrix(frame);
+        let r = frame.raw();
+        // The YUV matrix travels with the frame for the presenter; it is
+        // only part of the key because the graph's source declares it.
+        let key = GpuKey {
+            // Each frame has its own reference; the context is shared.
+            frames: unsafe { (*r.hw_frames_ctx).data } as usize,
+            resize,
+            colorspace: r.colorspace as c_int,
+            range: r.color_range as c_int,
+        };
+        if self.broken == Some(key) {
+            anyhow::bail!("failed before");
+        }
+        if self.graph.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.graph = None;
+            let t0 = std::time::Instant::now();
+            match Self::build(frame, resize) {
+                Ok(g) => {
+                    log::debug!(
+                        "gpu resize: {}x{} → {}x{} graph built in {:.1} ms",
+                        r.width,
+                        r.height,
+                        resize.w,
+                        resize.h,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    self.graph = Some((key, g));
+                }
+                Err(e) => {
+                    self.broken = Some(key);
+                    return Err(e);
+                }
+            }
+        }
+        let Some((_, g)) = self.graph.as_mut() else { unreachable!() };
+        let pulled = g.push(frame).map(|()| g.pull(&mut self.out));
+        if !matches!(pulled, Ok(true)) {
+            self.graph = None;
+            self.broken = Some(key);
+            anyhow::bail!("no picture came out");
+        }
+        unsafe {
+            // Square pixels at display size (the size accounts for the
+            // pixel aspect already).
+            (*self.out.0).sample_aspect_ratio = ff::AVRational { num: 1, den: 1 };
+        }
+        frame.unref();
+        unsafe { ff::av_frame_move_ref(frame.0, self.out.0) };
+        Ok(())
+    }
+
+    fn build(frame: &Frame, resize: GpuResize) -> anyhow::Result<Graph> {
+        let r = frame.raw();
+        let sar = if r.sample_aspect_ratio.num > 0 { r.sample_aspect_ratio } else { ff::AVRational { num: 1, den: 1 } };
+        let args = format!(
+            "video_size={}x{}:pix_fmt={}:time_base=1/1000:pixel_aspect={}/{}:colorspace={}:range={}",
+            r.width, r.height, r.format, sar.num, sar.den, r.colorspace as c_int, r.color_range as c_int
+        );
+        let chain =
+            format!("scale_cuda=w={}:h={}:interp_algo={}:format=nv12", resize.w, resize.h, cuda_algo(resize.quality));
+        Graph::hw(&args, r.hw_frames_ctx, &chain)
+    }
+}
+
+/// A reference to the shared CUDA device if it is open already. Never opens
+/// it: a CUDA device costs about 100 MB, which only a video that decodes on
+/// the GPU (or the prewarm for one, `prewarm_hw`) should start paying.
+fn cuda_device_if_open() -> Option<*mut ff::AVBufferRef> {
+    let slot = HW_SLOTS
+        .lock()
+        .iter()
+        .find(|(t, _)| *t == ff::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA)
+        .map(|(_, s)| s.clone())?;
+    let mut slot = slot.try_lock()?;
+    let HwSlot::Ready(d, used) = &mut *slot else { return None };
+    *used = std::time::Instant::now();
+    let r = unsafe { ff::av_buffer_ref(d.0) };
+    (!r.is_null()).then_some(r)
+}
+
+/// Resizes pictures decoded in software on the GPU: `hwupload` to the shared
+/// CUDA device, then `scale_cuda` to NV12 at display size, the same picture
+/// a hardware decoder's [`GpuScaler`] makes (and the presenter converts it
+/// on the GPU too).
+///
+/// swscale took 7 ms a frame to bring 1080p AV1 (which GPUs before NVIDIA's
+/// RTX 30 series can't decode) down to a 1446×814 window, 40% of a core at
+/// 60 fps; uploading a picture costs a copy into the driver's staging
+/// buffer. Only for pictures that are resized, or not 8-bit 4:2:0 (swscale's
+/// fast paths), and only while a CUDA device is open anyway.
+pub struct GpuUpload {
+    graph: Option<(UploadKey, Graph)>,
+    out: Frame,
+    /// Pictures the graph failed for: they stay on the CPU.
+    broken: Vec<UploadKey>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct UploadKey {
+    size: (c_int, c_int),
+    format: c_int,
+    sar: (c_int, c_int),
+    resize: GpuResize,
+    colorspace: c_int,
+    range: c_int,
+}
+
+impl GpuUpload {
+    pub fn new() -> Self {
+        Self { graph: None, out: Frame::new(), broken: Vec::new() }
+    }
+
+    /// Whether [`GpuUpload::run`] is worth trying for a `frame` (in system
+    /// memory) shown at `resize`.
+    pub fn worth_it(frame: &Frame, resize: GpuResize) -> bool {
+        use ff::AVPixelFormat::*;
+        let r = frame.raw();
+        let fast = r.format == AV_PIX_FMT_YUV420P as c_int
+            || r.format == AV_PIX_FMT_YUVJ420P as c_int
+            || r.format == AV_PIX_FMT_NV12 as c_int;
+        r.hw_frames_ctx.is_null()
+            && r.width as i64 * r.height as i64 >= 640 * 360
+            && ((resize.w, resize.h) != (r.width, r.height) || !fast)
+    }
+
+    /// Uploads `frame` and resizes it to `resize` on the GPU, in place.
+    /// False if it can't: the frame is left as it was.
+    pub fn run(&mut self, frame: &mut Frame, resize: GpuResize) -> bool {
+        // yuvj420p is yuv420p in full range, which CUDA doesn't know by name.
+        if frame.raw().format == ff::AVPixelFormat::AV_PIX_FMT_YUVJ420P as c_int {
+            unsafe {
+                (*frame.0).format = ff::AVPixelFormat::AV_PIX_FMT_YUV420P as c_int;
+                (*frame.0).color_range = ff::AVColorRange::AVCOL_RANGE_JPEG;
+            }
+        }
+        tag_matrix(frame);
+        let r = frame.raw();
+        let sar = if r.sample_aspect_ratio.num > 0 { r.sample_aspect_ratio } else { ff::AVRational { num: 1, den: 1 } };
+        let key = UploadKey {
+            size: (r.width, r.height),
+            format: r.format,
+            sar: (sar.num, sar.den),
+            resize,
+            colorspace: r.colorspace as c_int,
+            range: r.color_range as c_int,
+        };
+        if self.broken.contains(&key) {
+            return false;
+        }
+        if self.graph.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.graph = None;
+            let Some(mut dev) = cuda_device_if_open() else { return false };
+            let args = format!(
+                "video_size={}x{}:pix_fmt={}:time_base=1/1000:pixel_aspect={}/{}:colorspace={}:range={}",
+                r.width, r.height, r.format, sar.num, sar.den, key.colorspace, key.range
+            );
+            let chain = format!(
+                "hwupload,scale_cuda=w={}:h={}:interp_algo={}:format=nv12",
+                resize.w,
+                resize.h,
+                cuda_algo(resize.quality)
+            );
+            let t0 = std::time::Instant::now();
+            let g = Graph::with_setup("buffer", &args, "buffersink", &chain, 1, &mut |f| {
+                unsafe {
+                    if av::from_cstr((*(*f).filter).name).as_deref() == Some("hwupload") {
+                        (*f).hw_device_ctx = ff::av_buffer_ref(dev);
+                    }
+                }
+                Ok(())
+            });
+            unsafe { ff::av_buffer_unref(&mut dev) };
+            match g {
+                Ok(g) => {
+                    log::debug!(
+                        "gpu resize: {}x{} {} uploaded → {}x{}, graph built in {:.1} ms",
+                        r.width,
+                        r.height,
+                        av::pix_fmt_name(r.format),
+                        resize.w,
+                        resize.h,
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    self.graph = Some((key, g));
+                }
+                Err(e) => {
+                    log::debug!("gpu resize: can't upload {}: {e:#}", av::pix_fmt_name(r.format));
+                    self.broken.push(key);
+                    return false;
+                }
+            }
+        }
+        let Some((_, g)) = self.graph.as_mut() else { return false };
+        if g.push(frame).is_err() || !g.pull(&mut self.out) {
+            self.graph = None;
+            self.broken.push(key);
+            return false;
+        }
+        unsafe {
+            (*self.out.0).sample_aspect_ratio = ff::AVRational { num: 1, den: 1 };
+        }
+        frame.unref();
+        unsafe { ff::av_frame_move_ref(frame.0, self.out.0) };
+        true
+    }
+}
+
+/// `scale_cuda`'s name for a scaling quality.
+fn cuda_algo(q: ScaleQuality) -> &'static str {
+    match q {
+        ScaleQuality::Nearest => "nearest",
+        ScaleQuality::Linear => "bilinear",
+        ScaleQuality::Good => "bicubic",
+        ScaleQuality::Best => "lanczos",
+    }
+}
+
+/// Gives an untagged picture the YUV matrix the presenter's swscale path
+/// assumes for it (BT.709 for HD, BT.601 below), judged by the size it was
+/// decoded at. The GPU's conversion (and swscale, once the picture is
+/// window-sized) would otherwise take BT.601 for HD as well, or judge it by
+/// the smaller size.
+fn tag_matrix(frame: &mut Frame) {
+    use ff::AVColorSpace::*;
+    let r = frame.raw();
+    if r.colorspace == AVCOL_SPC_UNSPECIFIED || r.colorspace == AVCOL_SPC_RESERVED {
+        let cs = if r.height > 576 { AVCOL_SPC_BT709 } else { AVCOL_SPC_SMPTE170M };
+        unsafe { (*frame.0).colorspace = cs };
+    }
 }
 
 /// Feeds packets from a queue into a decoder and pulls frames out.
@@ -346,6 +695,12 @@ pub struct Decoder {
     /// Decoded to the end of the stream, nothing sent since.
     drained: bool,
     reopen: Option<Reopen>,
+    /// Hand hardware frames out as they are (video: they may be resized on
+    /// the GPU and presented from there). Otherwise they are downloaded.
+    pub keep_hw: bool,
+    gpu: GpuScaler,
+    /// See `OpenedCodec::lean`.
+    lean: bool,
 }
 
 /// Picture buffers for downloads from a hardware decoder. Without it every
@@ -417,6 +772,45 @@ impl Decoder {
             pool: DownloadPool { pool: ptr::null_mut(), key: (0, 0, 0) },
             drained: false,
             reopen: opened.reopen,
+            keep_hw: false,
+            gpu: GpuScaler::new(),
+            lean: opened.lean,
+        }
+    }
+
+    /// Whether `frame` is still in GPU memory (see `keep_hw`).
+    pub fn is_hw(&self, frame: &Frame) -> bool {
+        self.hw_pix_fmt == Some(frame.format())
+    }
+
+    /// Whether [`Decoder::resize_on_gpu`] can resize `frame`.
+    pub fn can_resize(&self, frame: &Frame) -> bool {
+        self.is_hw(frame) && GpuScaler::supports(frame)
+    }
+
+    /// Frees the buffers kept for downloads (`DownloadPool`), while frames
+    /// stay on the GPU: the first pictures, decoded before the window had a
+    /// size, are downloaded whole, and their buffers (30 MB for 10-bit
+    /// 1080p) would otherwise be kept for good.
+    pub fn release_downloads(&mut self) {
+        if !self.pool.pool.is_null() {
+            self.pool = DownloadPool { pool: ptr::null_mut(), key: (0, 0, 0) };
+        }
+    }
+
+    /// Resizes a hardware frame from [`Decoder::decode`] to `resize` on the
+    /// GPU, in place (it stays there). False if the GPU can't: the frame is
+    /// left as it was.
+    pub fn resize_on_gpu(&mut self, frame: &mut Frame, resize: GpuResize) -> bool {
+        if !self.is_hw(frame) || !GpuScaler::supports(frame) {
+            return false;
+        }
+        match self.gpu.run(frame, resize) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("gpu resize unavailable, resizing on the CPU instead: {e:#}");
+                false
+            }
         }
     }
 
@@ -431,8 +825,14 @@ impl Decoder {
                     }
                     let r = unsafe { ff::avcodec_receive_frame(self.ctx.0, frame.0) };
                     if r >= 0 {
+                        if self.lean && self.hw_pix_fmt.is_some_and(|hw| frame.format() != hw) && self.reopen_software()
+                        {
+                            frame.unref();
+                            return DecodeResult::Restart;
+                        }
                         if let Some(hw) = self.hw_pix_fmt
                             && frame.format() == hw
+                            && !self.keep_hw
                             && !self.download(frame)
                         {
                             frame.unref();
@@ -502,12 +902,36 @@ impl Decoder {
         }
     }
 
+    /// The GPU turned the stream down (FFmpeg decodes it in software now,
+    /// with the single thread a hardware decoder gets): opens the codec again
+    /// for software decoding with its usual threads.
+    fn reopen_software(&mut self) -> bool {
+        self.lean = false;
+        let Some(r) = self.reopen.as_mut() else { return false };
+        r.hw_mode = None; // and when it is reopened after `park`
+        log::info!("the GPU can't decode this video; decoding it in software");
+        match unsafe { open_par(r.par, r.time_base, r.threads, None, None) } {
+            Ok(opened) => {
+                self.ctx = opened.ctx;
+                self.hw_pix_fmt = None;
+                self.pending = None;
+                self.gpu = GpuScaler::new();
+                true
+            }
+            Err(e) => {
+                log::warn!("could not reopen the decoder: {e:#}");
+                false
+            }
+        }
+    }
+
     /// Frees the codec, its GPU device reference and the picture pools.
     fn park(&mut self) {
         log::debug!("decoder idle at the end of the file: closing it until a seek");
         self.ctx = CodecCtx(ptr::null_mut());
         self.sw.unref();
         self.pool = DownloadPool { pool: ptr::null_mut(), key: (0, 0, 0) };
+        self.gpu = GpuScaler::new(); // its graph holds the device too
     }
 
     /// Opens the codec again after `park` (a seek arrived). The packet that
@@ -519,6 +943,7 @@ impl Decoder {
                 log::debug!("decoder reopened");
                 self.ctx = opened.ctx;
                 self.hw_pix_fmt = opened.hw.as_ref().map(|h| h.pix_fmt);
+                self.lean = opened.lean;
                 true
             }
             Err(e) => {
@@ -528,7 +953,8 @@ impl Decoder {
         }
     }
 
-    fn download(&mut self, frame: &mut Frame) -> bool {
+    /// Downloads a hardware frame whole, in place.
+    pub fn download(&mut self, frame: &mut Frame) -> bool {
         unsafe {
             self.sw.unref();
             let src = frame.0;

@@ -201,6 +201,15 @@ impl Frame {
     pub fn nb_samples(&self) -> i32 {
         self.raw().nb_samples
     }
+    /// The pixel format of the picture's data: for a hardware frame, the
+    /// format it has in GPU memory (what a download produces).
+    pub fn sw_format(&self) -> c_int {
+        let r = self.raw();
+        if r.hw_frames_ctx.is_null() {
+            return r.format;
+        }
+        unsafe { (*((*r.hw_frames_ctx).data as *const ff::AVHWFramesContext)).sw_format as c_int }
+    }
 }
 
 impl Drop for Frame {

@@ -216,8 +216,6 @@ pub struct Settings {
     pub network_cache_secs: f64,
     pub dvd_region: u32,
     pub dvd_device: Option<String>,
-    /// Start DVDs at the disc's own menu (otherwise straight into the main feature).
-    pub dvd_menus: bool,
     // Advanced
     pub decoder_threads: u32,
     // Remembered state
@@ -291,7 +289,6 @@ impl Default for Settings {
             network_cache_secs: 10.0,
             dvd_region: 0,
             dvd_device: None,
-            dvd_menus: true,
             decoder_threads: 0,
             volume: 1.0,
             muted: false,
@@ -345,7 +342,6 @@ impl Settings {
             network_cache_secs: self.network_cache_secs,
             decoder_threads: self.decoder_threads,
             dvd_region: self.dvd_region,
-            dvd_menus: self.dvd_menus,
             ..EngineConfig::default()
         }
     }

@@ -183,13 +183,15 @@ fn detect_dvdnav() {
         }
         return;
     }
-    if let Some(libs) = pkg_config(&["--libs", "dvdnav"]) {
+    if let Some(libs) = pkg_config(&["--libs", "dvdnav", "dvdread"]) {
         for tok in libs.split_whitespace() {
             if let Some(dir) = tok.strip_prefix("-L") {
                 println!("cargo:rustc-link-search=native={dir}");
             }
         }
         println!("cargo:rustc-link-lib=dylib=dvdnav");
+        // libdvdnav's own dependency, called directly for the IFO files.
+        println!("cargo:rustc-link-lib=dylib=dvdread");
         println!("cargo:rustc-cfg=has_dvdnav");
     }
 }

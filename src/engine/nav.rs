@@ -137,6 +137,137 @@ mod sys {
     unsafe extern "C" {
         pub fn free(p: *mut std::ffi::c_void);
     }
+
+    // libdvdread, for reading the IFO files themselves.
+    #[repr(C)]
+    pub struct dvd_reader_t {
+        _p: [u8; 0],
+    }
+    #[repr(C)]
+    pub struct dvd_file_t {
+        _p: [u8; 0],
+    }
+    /// `DVD_READ_INFO_FILE`: a title set's (or the disc's) .IFO.
+    pub const READ_INFO_FILE: c_int = 0;
+
+    unsafe extern "C" {
+        pub fn DVDOpen(path: *const c_char) -> *mut dvd_reader_t;
+        pub fn DVDClose(dvd: *mut dvd_reader_t);
+        pub fn DVDOpenFile(dvd: *mut dvd_reader_t, title: c_int, domain: c_int) -> *mut dvd_file_t;
+        pub fn DVDCloseFile(f: *mut dvd_file_t);
+        pub fn DVDFileSeek(f: *mut dvd_file_t, offset: i32) -> i32;
+        pub fn DVDReadBytes(f: *mut dvd_file_t, data: *mut std::ffi::c_void, size: usize) -> isize;
+    }
+}
+
+/// The disc's titles, from its tables alone: durations and chapters from
+/// libdvdnav, languages from the title sets' IFO attributes. Nothing of the
+/// video is read, unlike opening each title with FFmpeg.
+pub fn list_titles(path: &str) -> Option<Vec<super::disc::DvdTitle>> {
+    let c = av::cstr(path);
+    let mut dvd: *mut sys::dvdnav_t = ptr::null_mut();
+    if unsafe { sys::dvdnav_open(&mut dvd, c.as_ptr()) } != sys::OK || dvd.is_null() {
+        return None;
+    }
+    let mut n = 0;
+    unsafe { sys::dvdnav_get_number_of_titles(dvd, &mut n) };
+    let mut titles = Vec::new();
+    for t in 1..=n.max(0) {
+        let mut times: *mut u64 = ptr::null_mut();
+        let mut dur = 0u64;
+        let chapters = unsafe { sys::dvdnav_describe_title_chapters(dvd, t, &mut times, &mut dur) };
+        if !times.is_null() {
+            unsafe { sys::free(times as *mut c_void) };
+        }
+        if chapters == 0 || dur == 0 {
+            continue;
+        }
+        titles.push(super::disc::DvdTitle {
+            number: t as u32,
+            duration: dur as f64 / 90000.0,
+            chapters: chapters as usize,
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+        });
+    }
+    unsafe { sys::dvdnav_close(dvd) };
+    if let Some(langs) = Ifo::open(&c).and_then(|ifo| ifo.languages()) {
+        for t in &mut titles {
+            if let Some((a, s)) = langs.get(t.number as usize - 1) {
+                (t.audio, t.subtitles) = (a.clone(), s.clone());
+            }
+        }
+    }
+    Some(titles)
+}
+
+/// The disc's IFO files, read with libdvdread.
+struct Ifo(*mut sys::dvd_reader_t);
+
+impl Drop for Ifo {
+    fn drop(&mut self) {
+        unsafe { sys::DVDClose(self.0) };
+    }
+}
+
+impl Ifo {
+    fn open(path: &std::ffi::CStr) -> Option<Ifo> {
+        let r = unsafe { sys::DVDOpen(path.as_ptr()) };
+        (!r.is_null()).then_some(Ifo(r))
+    }
+
+    /// `len` bytes at `offset` of IFO `n` (0: VIDEO_TS.IFO, else VTS_n_0.IFO).
+    fn read(&self, n: i32, offset: usize, len: usize) -> Option<Vec<u8>> {
+        unsafe {
+            let f = sys::DVDOpenFile(self.0, n, sys::READ_INFO_FILE);
+            if f.is_null() {
+                return None;
+            }
+            let mut buf = vec![0u8; len];
+            let ok = sys::DVDFileSeek(f, offset as i32) == offset as i32
+                && sys::DVDReadBytes(f, buf.as_mut_ptr() as *mut c_void, len) == len as isize;
+            sys::DVDCloseFile(f);
+            ok.then_some(buf)
+        }
+    }
+
+    /// Audio and subtitle language names of each title (in title order).
+    fn languages(&self) -> Option<Vec<(Vec<String>, Vec<String>)>> {
+        let be16 = |b: &[u8], o: usize| (b[o] as u16) << 8 | b[o + 1] as u16;
+        let be32 = |b: &[u8], o: usize| u32::from_be_bytes(b[o..o + 4].try_into().unwrap());
+        let vmgi = self.read(0, 0, 0x100)?;
+        if &vmgi[..12] != b"DVDVIDEO-VMG" {
+            return None;
+        }
+        // TT_SRPT: title count, then 12 bytes per title (byte 6: its title set).
+        let at = be32(&vmgi, 0xc4) as usize * BLOCK;
+        let count = (be16(&self.read(0, at, 8)?, 0) as usize).min(99);
+        let srpt = self.read(0, at, 8 + count * 12)?;
+        let mut sets: HashMap<u8, (Vec<String>, Vec<String>)> = HashMap::new();
+        let name = |code: u16| lang_code(code).map(|l| language_name(&l)).unwrap_or_else(|| "?".into());
+        let mut out = Vec::new();
+        for i in 0..count {
+            let vts = srpt[8 + i * 12 + 6];
+            let l = sets.entry(vts).or_insert_with(|| {
+                // VTSI_MAT: audio streams at 0x202/0x204 (8 bytes each),
+                // subpictures at 0x254/0x256 (6 bytes each); language codes
+                // at bytes 2–3 of each.
+                match self.read(vts as i32, 0, 0x400) {
+                    Some(m) if &m[..12] == b"DVDVIDEO-VTS" => {
+                        let na = (be16(&m, 0x202) as usize).min(8);
+                        let ns = (be16(&m, 0x254) as usize).min(32);
+                        (
+                            (0..na).map(|k| name(be16(&m, 0x204 + k * 8 + 2))).collect(),
+                            (0..ns).map(|k| name(be16(&m, 0x256 + k * 6 + 2))).collect(),
+                        )
+                    }
+                    _ => Default::default(),
+                }
+            });
+            out.push(l.clone());
+        }
+        Some(out)
+    }
 }
 
 const BLOCK: usize = 2048;
