@@ -335,7 +335,13 @@ pub fn run_decoder(ctx: Arc<SessionCtx>, mut dec: Decoder, info: StreamInfo, sto
                 #[cfg(not(has_dvdnav))]
                 let nav = false;
                 if !nav {
-                    ctx.request_seek(super::SeekRequest { target: ctx.position(), relative: false, precise: true });
+                    ctx.request_seek(super::SeekRequest {
+                        target: ctx.position(),
+                        relative: false,
+                        precise: true,
+                        direction: 0,
+                        origin: 0.0,
+                    });
                 }
                 graph = None;
                 continue;

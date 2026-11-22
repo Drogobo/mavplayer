@@ -1436,7 +1436,13 @@ fn play_segment(
             ctx.update_state(|st| st.selected = sel);
             ctx.emit(PlayerEvent::TracksChanged);
             if info.seekable {
-                ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
+                ctx.request_seek(SeekRequest {
+                    target: pos,
+                    relative: false,
+                    precise: true,
+                    direction: 0,
+                    origin: 0.0,
+                });
             }
         }
 

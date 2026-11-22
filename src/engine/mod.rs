@@ -141,6 +141,12 @@ pub struct SeekRequest {
     pub target: f64,
     pub relative: bool,
     pub precise: bool,
+    /// Direction of a relative seek: -1 backward, 1 forward, 0 absolute.
+    /// Preserved when the request is converted to an absolute target.
+    pub direction: i8,
+    /// Playback position before the relative jump (seconds from media start).
+    /// Used only for non-precise, directional seeks.
+    pub origin: f64,
 }
 
 /// Everything shared by the threads of one opened file.
@@ -349,14 +355,18 @@ impl SessionCtx {
     }
 
     pub fn request_seek(&self, req: SeekRequest) {
-        if !req.relative {
-            self.seek_display.set(req.target.max(0.0));
-        } else {
-            let base = if self.seeking.load(Ordering::Acquire) { self.seek_display.get() } else { self.position() };
-            self.seek_display.set((base + req.target).max(0.0));
-        }
-        // Coalesce: an absolute target replaces whatever was pending.
-        let abs = SeekRequest { target: self.seek_display.get(), relative: false, precise: req.precise };
+        let base = if self.seeking.load(Ordering::Acquire) { self.seek_display.get() } else { self.position() };
+        let target = if req.relative { (base + req.target).max(0.0) } else { req.target.max(0.0) };
+        self.seek_display.set(target);
+        // Preserve both the direction and the starting position when
+        // converting a relative seek into a coalesced absolute request.
+        let abs = SeekRequest {
+            target,
+            relative: false,
+            precise: req.precise,
+            direction: req.direction,
+            origin: if req.relative { base } else { target },
+        };
         *self.seek_req.lock() = Some(abs);
         self.seeking.store(true, Ordering::Release);
         self.wake_demuxer();
@@ -673,7 +683,13 @@ impl Player {
             if was && !paused && ctx.stepped.swap(false, Ordering::AcqRel) {
                 // Frame stepping desynchronised audio; realign precisely.
                 let pos = ctx.position();
-                ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
+                ctx.request_seek(SeekRequest {
+                    target: pos,
+                    relative: false,
+                    precise: true,
+                    direction: 0,
+                    origin: 0.0,
+                });
             }
             ctx.update_state(|st| {
                 if matches!(st.status, Status::Playing | Status::Paused) {
@@ -703,7 +719,18 @@ impl Player {
         }
         self.adopt();
         if let Some(s) = &self.session {
-            s.ctx.request_seek(SeekRequest { target, relative, precise });
+            let direction = if relative {
+                if target > 0.0 {
+                    1
+                } else if target < 0.0 {
+                    -1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            s.ctx.request_seek(SeekRequest { target, relative, precise, direction, origin: 0.0 });
             s.ctx.update_state(|st| {
                 if st.status == Status::Ended {
                     st.status = if s.ctx.paused() { Status::Paused } else { Status::Playing };
@@ -728,7 +755,13 @@ impl Player {
             let fps = self.with_state(|st| st.video.as_ref().map(|v| v.fps).unwrap_or(25.0));
             let fd = if fps > 1.0 { 1.0 / fps } else { 0.04 };
             let pos = s.ctx.position();
-            s.ctx.request_seek(SeekRequest { target: (pos - fd * 1.5).max(0.0), relative: false, precise: true });
+            s.ctx.request_seek(SeekRequest {
+                target: (pos - fd * 1.5).max(0.0),
+                relative: false,
+                precise: true,
+                direction: 0,
+                origin: 0.0,
+            });
             s.ctx.stepped.store(true, Ordering::Release);
         }
         let _ = s;
@@ -803,7 +836,7 @@ impl Player {
             && self.paused()
         {
             let pos = s.ctx.position();
-            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
+            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true, direction: 0, origin: 0.0 });
         }
     }
 
@@ -890,7 +923,7 @@ impl Player {
         *s.ctx.screenshot_req.lock() = Some(path);
         if self.paused() || s.ctx.eof.load(Ordering::Acquire) {
             let pos = s.ctx.position();
-            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true });
+            s.ctx.request_seek(SeekRequest { target: pos, relative: false, precise: true, direction: 0, origin: 0.0 });
         }
     }
 
