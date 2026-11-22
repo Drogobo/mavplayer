@@ -1229,6 +1229,17 @@ impl PlayerView {
                         cx,
                     ))
                     .child(self.toggle_row(
+                        "dragvideo",
+                        "Drag video to move window",
+                        Some("Move the player window by dragging the video area"),
+                        s.drag_video_to_move_window,
+                        |t, _| {
+                            t.settings.drag_video_to_move_window = !t.settings.drag_video_to_move_window;
+                            t.window_move_origin = None;
+                        },
+                        cx,
+                    ))
+                    .child(self.toggle_row(
                         "dblfs",
                         "Double-click for fullscreen",
                         None,
