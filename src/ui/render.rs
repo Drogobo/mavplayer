@@ -1781,9 +1781,17 @@ impl PlayerView {
             }))
             .drag_over::<ExternalPaths>(|s, _, _, _| s)
             .on_hover(cx.listener(|this, h: &bool, _, cx| {
-                if !*h && this.dropping {
+                if !*h {
+                    // When the pointer leaves the window over the fullscreen
+                    // control bar, its hover-exit event may not be delivered.
+                    // Clear the stale state so the autohide timer can work.
+                    let had_hover = this.pointer_over_controls;
+                    let was_dropping = this.dropping;
+                    this.pointer_over_controls = false;
                     this.dropping = false;
-                    cx.notify();
+                    if had_hover || was_dropping {
+                        cx.notify();
+                    }
                 }
             }));
         root = self.register_actions(root, cx);
