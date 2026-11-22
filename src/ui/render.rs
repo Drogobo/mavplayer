@@ -522,8 +522,22 @@ impl PlayerView {
             .bg(t.video_bg)
             .child(picture)
             .when(active && !show_controls && self.menu.is_none(), |d| d.cursor(CursorStyle::None))
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.note_activity(cx);
+                if let Some(start) = this.window_move_origin {
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        this.window_move_origin = None;
+                    } else if !window.is_fullscreen() && this.drag.is_none() && this.scrub.is_none() {
+                        let dx = f32::from(ev.position.x - start.x);
+                        let dy = f32::from(ev.position.y - start.y);
+                        if dx * dx + dy * dy >= 25.0 {
+                            this.window_move_origin = None;
+                            this.window_move_started = true;
+                            window.start_window_move();
+                            return;
+                        }
+                    }
+                }
                 // DVD menus: the button under the pointer lights up.
                 if this.dvd_buttons()
                     && let Some((x, y)) = this.dvd_point(ev.position)
@@ -533,7 +547,19 @@ impl PlayerView {
             }))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, ev: &MouseDownEvent, _, _| {
+                cx.listener(|this, ev: &MouseDownEvent, window, _| {
+                    this.window_move_started = false;
+                    this.window_move_origin = if !window.is_fullscreen()
+                        && !this.dvd_buttons()
+                        && this.menu.is_none()
+                        && this.dialog.is_none()
+                        && this.drag.is_none()
+                        && this.scrub.is_none()
+                    {
+                        Some(ev.position)
+                    } else {
+                        None
+                    };
                     if ev.click_count <= 1 {
                         this.click_origin = this.load_counter;
                     }
@@ -541,6 +567,10 @@ impl PlayerView {
             )
             .on_click(cx.listener(|this, ev: &ClickEvent, window, cx| {
                 if ev.is_right_click() {
+                    return;
+                }
+                if this.window_move_started {
+                    this.window_move_started = false;
                     return;
                 }
                 // A click on a DVD menu button presses it (instead of pausing).
@@ -1727,7 +1757,13 @@ impl Render for PlayerView {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.handle_drag_move(ev, window, cx);
             }))
-            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| this.end_drag(window, cx)))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.window_move_origin = None;
+                    this.end_drag(window, cx);
+                }),
+            )
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.dropping = false;
                 let p = paths.paths().to_vec();

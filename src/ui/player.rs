@@ -16,8 +16,8 @@ use crate::playlist::{self, Playlist};
 use crate::settings::{RepeatMode, ResumeStore, Settings};
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, ImageId, PathPromptOptions, Pixels, RenderImage,
-    Subscription, Window, px, size,
+    App, AppContext, Bounds, Context, Entity, FocusHandle, Focusable, ImageId, PathPromptOptions, Pixels, Point,
+    RenderImage, Subscription, Window, px, size,
 };
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -123,6 +123,10 @@ pub struct PlayerView {
     /// click that started before the current file loaded (on the start
     /// screen's Recent list, say) mustn't count as a click on the video.
     pub click_origin: u64,
+    /// Start position of a left-button press on the video area.
+    pub window_move_origin: Option<Point<Pixels>>,
+    /// A window drag started; suppress the corresponding video click.
+    pub window_move_started: bool,
     /// Volume and mute as last written to the settings file, and a change
     /// waiting to be written (saved once it stops changing).
     saved_volume: (f64, bool),
@@ -386,6 +390,8 @@ impl PlayerView {
             video_bounds: Rc::new(Cell::new(Bounds::default())),
             click_pause: None,
             click_origin: 0,
+            window_move_origin: None,
+            window_move_started: false,
             saved_volume: (settings.volume, settings.muted),
             volume_change: None,
             last_activity: Instant::now(),
