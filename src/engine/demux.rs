@@ -512,7 +512,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
     }
 
     if let Some(t) = opts.start_at.filter(|t| *t > 0.5) {
-        ctx.request_seek(super::SeekRequest { target: t, relative: false, precise: true });
+        ctx.request_seek(super::SeekRequest { target: t, relative: false, precise: true, direction: 0, origin: 0.0 });
     }
 
     let mut pkt = Packet::new();
@@ -580,7 +580,13 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
             }
             ctx.emit(PlayerEvent::TracksChanged);
             if info.seekable {
-                ctx.request_seek(super::SeekRequest { target: pos, relative: false, precise: true });
+                ctx.request_seek(super::SeekRequest {
+                    target: pos,
+                    relative: false,
+                    precise: true,
+                    direction: 0,
+                    origin: 0.0,
+                });
             }
         }
 
@@ -593,16 +599,25 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
                 target = target.min((dur - 0.05).max(0.0));
             }
             let ts = ((start + target) * ff::AV_TIME_BASE as f64) as i64;
-            let r = unsafe {
-                if req.precise {
-                    ff::avformat_seek_file(ic.0, -1, i64::MIN, ts, ts, 0)
-                } else {
-                    ff::avformat_seek_file(ic.0, -1, i64::MIN, ts, i64::MAX, 0)
-                }
+            // Approximate relative seeks choose a keyframe nearest the target,
+            // but never on the opposite side of the original playback position.
+            // Exact and absolute seeks retain their previous ranges.
+            let origin_ts = ((start + req.origin.max(0.0)) * ff::AV_TIME_BASE as f64) as i64;
+            let (min_ts, max_ts) = if req.precise {
+                (i64::MIN, ts)
+            } else if req.direction > 0 {
+                (origin_ts.saturating_add(1).min(ts), i64::MAX)
+            } else if req.direction < 0 {
+                (i64::MIN, origin_ts.saturating_sub(1).max(ts))
+            } else {
+                (i64::MIN, i64::MAX)
             };
+            let r = unsafe { ff::avformat_seek_file(ic.0, -1, min_ts, ts, max_ts, 0) };
             let r = if r < 0 {
-                // Some demuxers only support seeking backwards to a keyframe.
-                unsafe { ff::av_seek_frame(ic.0, -1, ts, ff::AVSEEK_FLAG_BACKWARD as c_int) }
+                // Old demuxers may not support avformat_seek_file. Preserve
+                // direction in the fallback instead of always seeking backward.
+                let flags = if !req.precise && req.direction > 0 { 0 } else { ff::AVSEEK_FLAG_BACKWARD as c_int };
+                unsafe { ff::av_seek_frame(ic.0, -1, ts, flags) }
             } else {
                 r
             };

@@ -755,7 +755,13 @@ pub fn run(ctx: Arc<SessionCtx>, stop: Arc<AtomicBool>) {
             {
                 refreshed = Some(look);
                 log::debug!("video: redoing the paused picture for a {}x{} window", look.0.0, look.0.1);
-                ctx.request_seek(SeekRequest { target: ctx.position(), relative: false, precise: true });
+                ctx.request_seek(SeekRequest {
+                    target: ctx.position(),
+                    relative: false,
+                    precise: true,
+                    direction: 0,
+                    origin: 0.0,
+                });
             }
             // Keep the next picture converted so un-pausing is instant.
             ensure_prepared(&ctx, &mut conv, &mut prepared, serial, &mut stats);
