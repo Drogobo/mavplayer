@@ -528,19 +528,19 @@ impl PlayerView {
             .when(active && !show_controls && self.menu.is_none(), |d| d.cursor(CursorStyle::None))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 this.note_activity(cx);
-                if this.settings.drag_video_to_move_window {
-                    if let Some(start) = this.window_move_origin {
-                        if ev.pressed_button != Some(MouseButton::Left) {
+                if this.settings.drag_video_to_move_window
+                    && let Some(start) = this.window_move_origin
+                {
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        this.window_move_origin = None;
+                    } else if !window.is_fullscreen() && this.drag.is_none() && this.scrub.is_none() {
+                        let dx = f32::from(ev.position.x - start.x);
+                        let dy = f32::from(ev.position.y - start.y);
+                        if dx * dx + dy * dy >= 25.0 {
                             this.window_move_origin = None;
-                        } else if !window.is_fullscreen() && this.drag.is_none() && this.scrub.is_none() {
-                            let dx = f32::from(ev.position.x - start.x);
-                            let dy = f32::from(ev.position.y - start.y);
-                            if dx * dx + dy * dy >= 25.0 {
-                                this.window_move_origin = None;
-                                this.window_move_started = true;
-                                window.start_window_move();
-                                return;
-                            }
+                            this.window_move_started = true;
+                            window.start_window_move();
+                            return;
                         }
                     }
                 }
