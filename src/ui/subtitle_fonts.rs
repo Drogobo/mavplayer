@@ -20,14 +20,13 @@ pub(crate) enum DefaultFontSource {
     Unavailable,
 }
 
-/// Resolve the *default* family through the same GPUI path as subtitles.
-/// Unlike a fontdb lookup, this distinguishes an available system face from
-/// the embedded face that MavPlayer actually registered.
+/// Report the actual source of the default font, not merely whether GPUI
+/// resolves its family name (which can be a substitute on Windows).
 pub(super) fn default_font_source(cx: &mut Context<PlayerView>) -> DefaultFontSource {
     if BUNDLED_SUB_FONT_REGISTERED.load(Ordering::Relaxed) {
         return DefaultFontSource::Bundled;
     }
-    if has_family(DEFAULT_SUB_FONT_FAMILY, cx) {
+    if system_has_default() && has_family(DEFAULT_SUB_FONT_FAMILY, cx) {
         return DefaultFontSource::System;
     }
     let _ = resolve_family("", cx);
@@ -55,10 +54,12 @@ pub(super) fn resolve_family(requested: &str, cx: &mut Context<PlayerView>) -> S
     if !requested.is_empty() && has_family(requested, cx) {
         return requested.to_owned();
     }
-    if has_family(DEFAULT_SUB_FONT_FAMILY, cx) {
+    if BUNDLED_SUB_FONT_REGISTERED.load(Ordering::Relaxed)
+        || (system_has_default() && has_family(DEFAULT_SUB_FONT_FAMILY, cx))
+    {
         return DEFAULT_SUB_FONT_FAMILY.to_owned();
     }
-    // No system fallback: make sure the executable always has a font available.
+    // No verified system fallback: make sure the executable always has a font available.
     // After successful registration has_family() will succeed, so subsequent
     // subtitle frames will not reload the same bytes.
     use std::borrow::Cow;
@@ -75,17 +76,32 @@ pub(super) fn resolve_family(requested: &str, cx: &mut Context<PlayerView>) -> S
     DEFAULT_SUB_FONT_FAMILY.to_owned()
 }
 
-/// Cached system font metadata. This is initialized only when the subtitle
-/// preferences ask for a family's weights, never during player startup.
-fn font_catalog() -> &'static fontdb::Database {
-    static CATALOG: std::sync::OnceLock<fontdb::Database> = std::sync::OnceLock::new();
+/// The system snapshot must be inspected BEFORE adding the bundled face.
+/// Keep it together with the existing lazy font catalog to avoid a second
+/// system-font scan. Nothing is scanned at application startup unless a
+/// subtitle (or the font preferences) actually requests this information.
+struct FontCatalog {
+    db: fontdb::Database,
+    system_has_default: bool,
+}
+
+fn font_catalog() -> &'static FontCatalog {
+    static CATALOG: std::sync::OnceLock<FontCatalog> = std::sync::OnceLock::new();
     CATALOG.get_or_init(|| {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
-        // Also offer the weights of our built-in fallback when the field is empty.
+        let system_has_default = db
+            .faces()
+            .any(|face| face.families.iter().any(|(name, _)| name.eq_ignore_ascii_case(DEFAULT_SUB_FONT_FAMILY)));
+        // Bundled font is for weight metadata only; it must never be counted
+        // as an installed system font.
         db.load_font_data(EMBEDDED_SUB_FONT.to_vec());
-        db
+        FontCatalog { db, system_has_default }
     })
+}
+
+fn system_has_default() -> bool {
+    font_catalog().system_has_default
 }
 
 /// Declared upright weights for the selected family. Variable fonts contribute
@@ -94,7 +110,7 @@ fn font_catalog() -> &'static fontdb::Database {
 pub(super) fn available_weights(family: &str) -> Vec<u16> {
     use std::collections::BTreeSet;
     let family = if family.trim().is_empty() { DEFAULT_SUB_FONT_FAMILY } else { family.trim() };
-    let db = font_catalog();
+    let db = &font_catalog().db;
     let mut weights = BTreeSet::new();
     for face in db.faces() {
         if face.style != fontdb::Style::Normal
@@ -146,7 +162,7 @@ pub(super) fn installed_families() -> &'static [String] {
     static FAMILIES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     FAMILIES.get_or_init(|| {
         let mut families: Vec<String> =
-            font_catalog().faces().flat_map(|face| face.families.iter().map(|(name, _)| name.clone())).collect();
+            font_catalog().db.faces().flat_map(|face| face.families.iter().map(|(name, _)| name.clone())).collect();
         families.sort_unstable_by_key(|name| name.to_lowercase());
         families.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
         families
