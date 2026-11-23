@@ -105,6 +105,27 @@ pub(super) fn installed_subtitle_font(family: &str, cx: &mut Context<PlayerView>
     subtitle_fonts::has_family(family, cx)
 }
 
+/// Reports the source selected for the default subtitle font.
+pub(super) use subtitle_fonts::DefaultFontSource;
+
+pub(super) fn default_subtitle_font_source(cx: &mut Context<PlayerView>) -> DefaultFontSource {
+    subtitle_fonts::default_font_source(cx)
+}
+
+/// Font metadata for Preferences, independent of subtitle rendering.
+pub(super) fn subtitle_available_weights(family: &str) -> Vec<u16> {
+    subtitle_fonts::available_weights(family)
+}
+
+pub(super) fn subtitle_weight_supported(family: &str, weight: u16) -> u16 {
+    subtitle_fonts::supported_weight(family, weight)
+}
+
+/// Available installed font families for the Preferences picker.
+pub(super) fn subtitle_font_families() -> &'static [String] {
+    subtitle_fonts::installed_families()
+}
+
 impl PlayerView {
     // ───────────────────────── reusable controls ─────────────────────────
 

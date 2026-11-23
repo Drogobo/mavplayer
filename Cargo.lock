@@ -3423,6 +3423,7 @@ dependencies = [
  "souvlaki",
  "sys-locale",
  "tray-icon",
+ "ttf-parser 0.20.0",
  "unicode-segmentation",
  "winresource",
 ]

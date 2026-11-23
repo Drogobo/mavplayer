@@ -154,6 +154,12 @@ pub struct PlayerView {
     pub menu: Option<OpenMenu>,
     pub media_keys: Option<super::media_keys::MediaKeys>,
     pub dialog: Option<Dialog>,
+    /// Offset from the centered position of the current modal (logical pixels).
+    pub modal_offset: (f32, f32),
+    /// Pointer position and modal offset when title-bar dragging began.
+    pub modal_drag_origin: Option<(Point<Pixels>, (f32, f32), (f32, f32, f32, f32))>,
+    /// Actual bounds of the modal, updated after layout.
+    pub modal_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub drag: Option<Drag>,
     pub seek_hover: Option<f32>,
     pub scrub: Option<Scrub>,
@@ -438,6 +444,9 @@ impl PlayerView {
             menu: None,
             media_keys,
             dialog: None,
+            modal_offset: (0.0, 0.0),
+            modal_drag_origin: None,
+            modal_bounds: Rc::new(Cell::new(Bounds::default())),
             drag: None,
             seek_hover: None,
             scrub: None,
@@ -1480,6 +1489,9 @@ impl PlayerView {
     }
 
     pub fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.modal_drag_origin = None;
+        self.close_menu(cx);
+
         if let Some(Dialog::Integrate) = self.dialog {
             let _ = std::fs::create_dir_all(crate::settings::config_dir());
             let _ = std::fs::write(crate::integration::prompt_marker(), b"asked");

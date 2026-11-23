@@ -15,8 +15,8 @@ use crate::settings::{
     ThemeMode,
 };
 use gpui::{
-    AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, Resource, SharedString, Window, deferred,
-    div, img, prelude::*, px, relative,
+    AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Resource,
+    SharedString, Window, canvas, deferred, div, img, prelude::*, px, relative,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,6 +57,11 @@ pub const EQ_PRESETS: &[(&str, [f32; 10])] = &[
 
 impl PlayerView {
     pub fn show_dialog(&mut self, d: Dialog, window: &mut Window, cx: &mut Context<Self>) {
+        // Preserve the position when switching Preferences tabs.
+        if self.dialog.is_none() {
+            self.modal_offset = (0.0, 0.0);
+        }
+        self.modal_drag_origin = None;
         self.menu = None;
         self.dialog = Some(d);
         // Every dialog (and settings tab) opens scrolled to the top.
@@ -82,7 +87,6 @@ impl PlayerView {
                     ("sub_langs", self.settings.sub_langs.clone(), "e.g. en, fr"),
                     ("sub_charset", self.settings.sub_charset.clone(), "auto (e.g. CP1251, Shift_JIS)"),
                     ("sub_font_family", self.settings.sub_font_family.clone(), DEFAULT_SUB_FONT_FAMILY),
-                    ("sub_font_weight", self.settings.sub_font_weight.to_string(), "100–900"),
                 ] {
                     let i = self.input(k, ph, window, cx);
                     i.update(cx, |i, cx| i.set_text(v, cx));
@@ -187,7 +191,6 @@ impl PlayerView {
                 // Valid values were already applied by on_input_changed.
                 cx.notify();
             }
-            "sub_font_weight" => self.apply_settings(cx),
             "shortcut_search" => {}
             _ => self.close_dialog(window, cx),
         }
@@ -214,19 +217,12 @@ impl PlayerView {
                     && self.settings.sub_font_family != family
                 {
                     self.settings.sub_font_family = family.to_owned();
+                    self.settings.sub_font_weight =
+                        super::render::subtitle_weight_supported(family, self.settings.sub_font_weight);
                     self.apply_settings(cx);
                 } else {
                     // Refresh the inline validation message without saving.
                     cx.notify();
-                }
-                return;
-            }
-            "sub_font_weight" => {
-                if let Ok(weight) = text.trim().parse::<u16>()
-                    && (100..=900).contains(&weight)
-                {
-                    self.settings.sub_font_weight = weight;
-                    self.apply_settings(cx);
                 }
                 return;
             }
@@ -313,6 +309,8 @@ impl PlayerView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
+        let (offset_x, offset_y) = self.modal_offset;
+        let bounds_cell = self.modal_bounds.clone();
         deferred(
             div()
                 .id("modal-backdrop")
@@ -326,10 +324,33 @@ impl PlayerView {
                 // tooltips, right-click menus or wheel.
                 .occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, w, cx| this.close_dialog(w, cx)))
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                    let Some((start, initial, (min_x, max_x, min_y, max_y))) = this.modal_drag_origin else { return };
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        this.modal_drag_origin = None;
+                        return;
+                    }
+                    // The bounds are snapshotted at mouse-down. Using the live,
+                    // moved bounds here creates a feedback loop near the edges.
+                    let dx = f32::from(ev.position.x - start.x);
+                    let dy = f32::from(ev.position.y - start.y);
+                    this.modal_offset = ((initial.0 + dx).clamp(min_x, max_x), (initial.1 + dy).clamp(min_y, max_y));
+                    cx.notify();
+                    cx.stop_propagation();
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| {
+                        this.modal_drag_origin = None;
+                    }),
+                )
                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .child(
                     div()
                         .id("modal")
+                        .relative()
+                        .left(px(offset_x))
+                        .top(px(offset_y))
                         .w(px(width))
                         .max_w(relative(0.95))
                         .max_h(relative(0.9))
@@ -344,10 +365,44 @@ impl PlayerView {
                         .overflow_hidden()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
+                            canvas(
+                                move |bounds, _, _| {
+                                    bounds_cell.set(bounds);
+                                    bounds
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .child(
                             div()
+                                .id("modal-titlebar")
                                 .flex()
                                 .items_center()
                                 .h(px(46.))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                        let bounds = this.modal_bounds.get();
+                                        let viewport = window.viewport_size();
+                                        let center_x = f32::from(bounds.origin.x) - this.modal_offset.0;
+                                        let center_y = f32::from(bounds.origin.y) - this.modal_offset.1;
+                                        let limit_x =
+                                            f32::from(viewport.width) - center_x - f32::from(bounds.size.width);
+                                        let limit_y =
+                                            f32::from(viewport.height) - center_y - f32::from(bounds.size.height);
+                                        let limits = (
+                                            (-center_x).min(limit_x),
+                                            (-center_x).max(limit_x),
+                                            (-center_y).min(limit_y),
+                                            (-center_y).max(limit_y),
+                                        );
+                                        this.modal_drag_origin = Some((ev.position, this.modal_offset, limits));
+                                        cx.stop_propagation();
+                                    }),
+                                )
                                 .px_4()
                                 .border_b_1()
                                 .border_color(t.border)
@@ -678,6 +733,77 @@ impl PlayerView {
                 this.apply_settings(cx);
             })))
             .into_any_element()
+    }
+
+    /// Editable font family field with a menu sourced from the cached fontdb catalog.
+    /// The arrow shows all fonts when the field holds the selected family.
+    /// A partially typed family filters the menu on the next arrow click.
+    fn font_family_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let field = self.input_box("sub_font_family");
+        let arrow = div()
+            .id("subtitle-font-family-menu")
+            .size(px(30.))
+            .flex_none()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_alt)
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover(|d| d.bg(theme.hover))
+            .child(icon(Icon::DropDown, px(13.), theme.text_dim))
+            .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                let entered = this.inputs.get("sub_font_family").map(|input| input.read(cx).text()).unwrap_or_default();
+                // The input initially contains the selected font, not a search
+                // query. On the first click show *all* families. Once the user
+                // edits it to an incomplete name, treat that draft as a filter.
+                let query = entered.trim();
+                let filter = if query.eq_ignore_ascii_case(this.settings.sub_font_family.trim()) { "" } else { query };
+                let mut items = vec![
+                    M::action(format!("Default ({DEFAULT_SUB_FONT_FAMILY})"), |this, _, cx| {
+                        this.select_subtitle_font("", cx)
+                    })
+                    .selected(this.settings.sub_font_family.is_empty()),
+                ];
+
+                // The existing GPUI menu already has a scrolling viewport,
+                // so truncating to 80 families made the rest inaccessible.
+                let matches = super::render::subtitle_font_families()
+                    .iter()
+                    .filter(|family| filter.is_empty() || family.to_lowercase().contains(&filter.to_lowercase()));
+                for family in matches {
+                    let chosen = family.clone();
+                    let selected = this.settings.sub_font_family.eq_ignore_ascii_case(family);
+                    items.push(
+                        M::action(family.clone(), move |this, _, cx| {
+                            this.select_subtitle_font(&chosen, cx);
+                        })
+                        .selected(selected),
+                    );
+                }
+                let pos = ev.position();
+                this.open_menu(items, gpui::point(pos.x - px(210.), pos.y + px(12.)), None, cx);
+                cx.stop_propagation();
+            }));
+        div().flex().items_center().gap_1().child(field).child(arrow).into_any_element()
+    }
+
+    fn select_subtitle_font(&mut self, family: &str, cx: &mut Context<Self>) {
+        if let Some(input) = self.inputs.get("sub_font_family").cloned() {
+            // Update the visible field even when the value is unchanged.
+            input.update(cx, |input, cx| input.set_text(family.to_owned(), cx));
+        }
+        if self.settings.sub_font_family != family {
+            self.settings.sub_font_family = family.to_owned();
+            self.settings.sub_font_weight =
+                super::render::subtitle_weight_supported(family, self.settings.sub_font_weight);
+            self.apply_settings(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn input_box(&self, key: &'static str) -> AnyElement {
@@ -1684,64 +1810,84 @@ impl PlayerView {
                             let entered =
                                 self.inputs.get("sub_font_family").map(|i| i.read(cx).text()).unwrap_or_default();
                             let candidate = entered.trim();
-                            let valid = super::render::installed_subtitle_font(candidate, cx);
-                            let message = if candidate.is_empty() {
-                                "Default subtitle font (Noto Sans)"
-                            } else if valid {
-                                "Font available"
+                            let status = if candidate.is_empty() {
+                                let source = super::render::default_subtitle_font_source(cx);
+                                Some((
+                                    match source {
+                                        super::render::DefaultFontSource::System => {
+                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY} (system font)")
+                                        }
+                                        super::render::DefaultFontSource::Bundled => {
+                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY} (bundled font)")
+                                        }
+                                        super::render::DefaultFontSource::Unavailable => {
+                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY} (font unavailable)")
+                                        }
+                                    },
+                                    source == super::render::DefaultFontSource::Unavailable,
+                                ))
+                            } else if super::render::installed_subtitle_font(candidate, cx) {
+                                None
                             } else {
-                                "Font not available"
+                                Some(("Font not available".to_owned(), true))
                             };
                             div()
                                 .flex()
                                 .flex_col()
                                 .gap_1()
-                                .child(self.input_box("sub_font_family"))
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(if candidate.is_empty() || valid {
-                                            self.theme.text_dim
-                                        } else {
-                                            self.theme.danger
-                                        })
-                                        .child(message),
-                                )
+                                .child(self.font_family_picker(cx))
+                                .when_some(status, |d, (message, warning)| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(if warning { self.theme.danger } else { self.theme.text_dim })
+                                            .child(message),
+                                    )
+                                })
                                 .into_any_element()
                         },
                     ))
                     .child(
                         self.row(
                             "Font weight",
-                            Some("100–900; choose a preset or enter a number"),
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(self.input_box_width("sub_font_weight", 80.))
-                                .child(self.choice(
-                                    "subweight",
-                                    vec![
-                                        ("Thin (100)".into(), 100_u16),
-                                        ("Extra Light (200)".into(), 200),
-                                        ("Light (300)".into(), 300),
-                                        ("Regular (400)".into(), 400),
-                                        ("Medium (500)".into(), 500),
-                                        ("Semibold (600)".into(), 600),
-                                        ("Bold (700)".into(), 700),
-                                        ("Extra Bold (800)".into(), 800),
-                                        ("Black (900)".into(), 900),
-                                    ],
-                                    s.sub_font_weight,
-                                    |this, weight, cx| {
-                                        this.settings.sub_font_weight = weight;
-                                        if let Some(input) = this.inputs.get("sub_font_weight").cloned() {
-                                            input.update(cx, |i, cx| i.set_text(weight.to_string(), cx));
-                                        }
-                                    },
-                                    cx,
-                                ))
-                                .into_any_element(),
+                            Some("Only the weights supported by the selected font are offered"),
+                            self.choice(
+                                "subweight",
+                                {
+                                    let weights = super::render::subtitle_available_weights(&s.sub_font_family);
+                                    // A variable font may expose hundreds of valid numeric
+                                    // weights. Offer standard steps and the current
+                                    // value so the menu remains manageable.
+                                    if weights.len() > 40 {
+                                        weights
+                                            .into_iter()
+                                            .filter(|w| w % 100 == 0 || *w == s.sub_font_weight)
+                                            .collect::<Vec<_>>()
+                                    } else {
+                                        weights
+                                    }
+                                }
+                                .into_iter()
+                                .map(|weight| {
+                                    let name = match weight {
+                                        100 => "Thin",
+                                        200 => "Extra Light",
+                                        300 => "Light",
+                                        400 => "Regular",
+                                        500 => "Medium",
+                                        600 => "Semibold",
+                                        700 => "Bold",
+                                        800 => "Extra Bold",
+                                        900 => "Black",
+                                        _ => "Weight",
+                                    };
+                                    (format!("{name} ({weight})"), weight)
+                                })
+                                .collect(),
+                                s.sub_font_weight,
+                                |this, weight, _| this.settings.sub_font_weight = weight,
+                                cx,
+                            ),
                         ),
                     )
                     .child(self.row(
