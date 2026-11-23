@@ -11,8 +11,8 @@ use crate::engine::{
 use crate::icons::Icon;
 use crate::playlist;
 use crate::settings::{
-    BarControl, DEFAULT_SUB_FONT_FAMILY, IconTheme, OpenMode, RunningMode, ScrollAction, SeekDragMode, SubStyle,
-    ThemeMode,
+    BarControl, DEFAULT_SUB_FONT_FAMILY, IconTheme, OpenMode, RunningMode, ScrollAction, SeekDragMode, SubPosition,
+    SubStyle, ThemeMode,
 };
 use gpui::{
     AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Resource,
@@ -1804,6 +1804,20 @@ impl PlayerView {
                     ))
                     .child(self.section("Appearance"))
                     .child(self.row(
+                        "Style",
+                        None,
+                        self.choice(
+                            "substyle",
+                            vec![
+                                ("Outlined text".into(), SubStyle::Outline),
+                                ("Text on dark box".into(), SubStyle::Box),
+                            ],
+                            s.sub_style,
+                            |t, v, _| t.settings.sub_style = v,
+                            cx,
+                        ),
+                    ))
+                    .child(self.row(
                         "Font family",
                         Some("Leave empty for the default font; unknown names are not saved"),
                         {
@@ -1901,26 +1915,27 @@ impl PlayerView {
                         ),
                     ))
                     .child(self.row(
-                        "Distance from bottom",
-                        None,
-                        self.stepper(
-                            "submargin",
-                            format!("{:.0} %", s.sub_margin * 100.0),
-                            |t, d, _| t.settings.sub_margin = (t.settings.sub_margin + d as f32 * 0.01).clamp(0.0, 0.4),
+                        "Subtitle position",
+                        Some("Automatic uses the black bar when possible; distance is always a percentage of video height"),
+                        self.choice(
+                            "subposition",
+                            vec![
+                                ("Automatic".into(), SubPosition::Automatic),
+                                ("Video picture".into(), SubPosition::VideoPicture),
+                                ("Player window".into(), SubPosition::PlayerWindow),
+                            ],
+                            s.sub_position,
+                            |t, v, _| t.settings.sub_position = v,
                             cx,
                         ),
                     ))
                     .child(self.row(
-                        "Style",
-                        None,
-                        self.choice(
-                            "substyle",
-                            vec![
-                                ("Outlined text".into(), SubStyle::Outline),
-                                ("Text on dark box".into(), SubStyle::Box),
-                            ],
-                            s.sub_style,
-                            |t, v, _| t.settings.sub_style = v,
+                        "Distance from bottom",
+                        Some("Percentage of video picture height"),
+                        self.stepper(
+                            "submargin",
+                            format!("{:.0} %", s.sub_margin * 100.0),
+                            |t, d, _| t.settings.sub_margin = (t.settings.sub_margin + d as f32 * 0.01).clamp(0.0, 0.4),
                             cx,
                         ),
                     ));

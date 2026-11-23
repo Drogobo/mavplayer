@@ -47,6 +47,18 @@ pub enum SubStyle {
     Box,
 }
 
+/// Reference edge for positioning text subtitles.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubPosition {
+    /// Prefer the lower letterbox bar, but respect the player area's bottom margin.
+    #[default]
+    Automatic,
+    /// Keep the subtitle block above the bottom edge of the video picture.
+    VideoPicture,
+    /// Keep the subtitle block above the bottom edge of the player area.
+    PlayerWindow,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenMode {
     /// Opening files replaces the playlist.
@@ -222,6 +234,7 @@ pub struct Settings {
     pub auto_load_subs: bool,
     pub sub_scale: f32,
     pub sub_margin: f32,
+    pub sub_position: SubPosition,
     pub sub_style: SubStyle,
     /// Font family used by text subtitles.
     pub sub_font_family: String,
@@ -303,6 +316,7 @@ impl Default for Settings {
             auto_load_subs: true,
             sub_scale: 1.0,
             sub_margin: 0.05,
+            sub_position: SubPosition::Automatic,
             sub_style: SubStyle::Outline,
             sub_font_family: DEFAULT_SUB_FONT_FAMILY.into(),
             sub_font_weight: DEFAULT_SUB_FONT_WEIGHT,

@@ -28,6 +28,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const TITLEBAR_H: f32 = 34.0;
+/// Fullscreen control bar height: seek row (18) + gap (4) + buttons row (38)
+/// + vertical padding (6 + 8). The extra 40 px above it is only a gradient.
+const FULLSCREEN_CONTROL_BAR_H: f32 = 74.0;
 const RESIZE_EDGE: f32 = 6.0;
 /// Playlist row height and the list's vertical padding (`py_1`).
 const ROW_H: f32 = 34.0;
@@ -672,7 +675,7 @@ impl PlayerView {
 
         // Text subtitles.
         if !texts.is_empty() {
-            root = root.child(self.text_subtitles(&texts, sub_rect, area, cx));
+            root = root.child(self.text_subtitles(&texts, sub_rect, area, fullscreen && show_controls, cx));
         }
 
         // Idle / audio-only / loading screens.
@@ -799,13 +802,14 @@ impl PlayerView {
         texts: &[String],
         rect: Bounds<Pixels>,
         area: Bounds<Pixels>,
+        fullscreen_controls_visible: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let h = f32::from(rect.size.height).max(100.0);
         let font = subtitle_style::font_size(h, self.settings.sub_scale);
-        let margin = f32::from(area.size.height)
-            - (f32::from(rect.origin.y - area.origin.y) + f32::from(rect.size.height))
-            + h * self.settings.sub_margin;
+        let picture_bottom = f32::from(rect.origin.y - area.origin.y) + f32::from(rect.size.height);
+        let area_height = f32::from(area.size.height);
+        let distance = h * self.settings.sub_margin;
         let left = f32::from(rect.origin.x - area.origin.x);
         let width = f32::from(rect.size.width);
         let lines: Vec<String> = texts
@@ -818,16 +822,41 @@ impl PlayerView {
         let gpui_weight = gpui::FontWeight(f32::from(font_weight));
         // Lazy embedded fallback registration, only when a text subtitle needs it.
         let font_family = subtitle_fonts::resolve_family(&self.settings.sub_font_family, cx);
+        let line_height = subtitle_style::line_height(font);
         let row_pad = font * subtitle_style::BOX_VERTICAL_PADDING_FACTOR;
+        let line_gap = font
+            * if style == SubStyle::Outline {
+                subtitle_style::OUTLINE_LINE_GAP_FACTOR
+            } else {
+                subtitle_style::LINE_GAP_FACTOR
+            };
+        let line_count = lines.len();
+        let row_height = line_height + if style == SubStyle::Box { 2.0 * row_pad } else { 0.0 };
+        let block_height = row_height * line_count as f32 + line_gap * line_count.saturating_sub(1) as f32;
+        let margin = subtitle_style::bottom_margin(
+            self.settings.sub_position,
+            picture_bottom,
+            area_height,
+            distance,
+            block_height,
+        );
+        // Fullscreen controls overlay the video. Keep the entire subtitle block
+        // at least `distance` above the control bar, regardless of position mode.
+        // Windowed controls are outside the video area and need no adjustment.
+        let margin = subtitle_style::margin_above_controls(
+            margin,
+            distance,
+            if fullscreen_controls_visible { FULLSCREEN_CONTROL_BAR_H } else { 0.0 },
+        );
         let mut col = div()
             .absolute()
             .left(px(left + width * 0.05))
             .w(px(width * 0.9))
-            .bottom(px(margin.max(4.0)))
+            .bottom(px(margin))
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(font * subtitle_style::LINE_GAP_FACTOR))
+            .gap(px(line_gap))
             .text_size(px(font))
             .line_height(px(subtitle_style::line_height(font)))
             .font_family(font_family.to_owned())
@@ -850,9 +879,9 @@ impl PlayerView {
                     // Keep stroke and fill in GPUI, so both use the exact same
                     // resolved font face and weight (including fallback rules).
                     let offset = (font / 16.0).max(1.2);
-                    let line_h = subtitle_style::line_height(font);
-                    let row_pad = row_pad.max(offset + 1.0);
-                    let mut d = div().relative().w_full().h(px(line_h + 2.0 * row_pad)).text_center();
+                    // Unlike Box, Outline has no extra per-row vertical
+                    // padding. Natural line height keeps consecutive lines compact.
+                    let mut d = div().relative().w_full().h(px(line_height)).text_center();
                     for (dx, dy) in [
                         (-offset, 0.0),
                         (offset, 0.0),
@@ -867,14 +896,13 @@ impl PlayerView {
                             div()
                                 .absolute()
                                 .left(px(dx))
-                                .top(px(row_pad + dy))
+                                .top(px(dy))
                                 .w_full()
                                 .text_color(rgba(0x000000e6))
                                 .child(line.clone()),
                         );
                     }
-                    d.child(div().absolute().top(px(row_pad)).w_full().text_color(gpui::white()).child(line))
-                        .into_any_element()
+                    d.child(div().absolute().top_0().w_full().text_color(gpui::white()).child(line)).into_any_element()
                 }
             };
             col = col.child(el);
