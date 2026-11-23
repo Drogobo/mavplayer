@@ -6,6 +6,10 @@ use crate::engine::{
     Upscaler,
 };
 use serde::{Deserialize, Serialize};
+
+/// Default text subtitle font (also the fallback family).
+pub const DEFAULT_SUB_FONT_FAMILY: &str = "Noto Sans";
+pub const DEFAULT_SUB_FONT_WEIGHT: u16 = 400;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -219,6 +223,10 @@ pub struct Settings {
     pub sub_scale: f32,
     pub sub_margin: f32,
     pub sub_style: SubStyle,
+    /// Font family used by text subtitles.
+    pub sub_font_family: String,
+    /// Font weight (100..=900, 400 = Regular).
+    pub sub_font_weight: u16,
     pub sub_charset: String,
     // Network & discs
     pub network_cache_secs: f64,
@@ -296,6 +304,8 @@ impl Default for Settings {
             sub_scale: 1.0,
             sub_margin: 0.05,
             sub_style: SubStyle::Outline,
+            sub_font_family: DEFAULT_SUB_FONT_FAMILY.into(),
+            sub_font_weight: DEFAULT_SUB_FONT_WEIGHT,
             sub_charset: String::new(),
             network_cache_secs: 10.0,
             dvd_region: 0,

@@ -10,7 +10,10 @@ use crate::engine::{
 };
 use crate::icons::Icon;
 use crate::playlist;
-use crate::settings::{BarControl, IconTheme, OpenMode, RunningMode, ScrollAction, SeekDragMode, SubStyle, ThemeMode};
+use crate::settings::{
+    BarControl, DEFAULT_SUB_FONT_FAMILY, IconTheme, OpenMode, RunningMode, ScrollAction, SeekDragMode, SubStyle,
+    ThemeMode,
+};
 use gpui::{
     AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, Resource, SharedString, Window, deferred,
     div, img, prelude::*, px, relative,
@@ -25,6 +28,7 @@ pub enum Dialog {
     OpenDisc,
     JumpTo,
     About,
+    SubtitleFontLicense,
     Integrate,
 }
 
@@ -77,6 +81,8 @@ impl PlayerView {
                     ("audio_langs", self.settings.audio_langs.clone(), "e.g. en, ja"),
                     ("sub_langs", self.settings.sub_langs.clone(), "e.g. en, fr"),
                     ("sub_charset", self.settings.sub_charset.clone(), "auto (e.g. CP1251, Shift_JIS)"),
+                    ("sub_font_family", self.settings.sub_font_family.clone(), DEFAULT_SUB_FONT_FAMILY),
+                    ("sub_font_weight", self.settings.sub_font_weight.to_string(), "100–900"),
                 ] {
                     let i = self.input(k, ph, window, cx);
                     i.update(cx, |i, cx| i.set_text(v, cx));
@@ -176,6 +182,12 @@ impl PlayerView {
                 None => self.osd("Couldn't understand that time", cx),
             },
             "volume" => self.finish_volume_edit(true, window, cx),
+            // Enter in a subtitle font field commits it without closing Preferences.
+            "sub_font_family" => {
+                // Valid values were already applied by on_input_changed.
+                cx.notify();
+            }
+            "sub_font_weight" => self.apply_settings(cx),
             "shortcut_search" => {}
             _ => self.close_dialog(window, cx),
         }
@@ -192,6 +204,32 @@ impl PlayerView {
             "audio_langs" => self.settings.audio_langs = text,
             "sub_langs" => self.settings.sub_langs = text,
             "sub_charset" => self.settings.sub_charset = text,
+            "sub_font_family" => {
+                // An incomplete name is only a draft: don't replace the active font
+                // or write settings.json on every keystroke.
+                let family = text.trim();
+                // An empty field explicitly selects the default subtitle font.
+                // Only complete installed family names (or empty input) are saved.
+                if (family.is_empty() || super::render::installed_subtitle_font(family, cx))
+                    && self.settings.sub_font_family != family
+                {
+                    self.settings.sub_font_family = family.to_owned();
+                    self.apply_settings(cx);
+                } else {
+                    // Refresh the inline validation message without saving.
+                    cx.notify();
+                }
+                return;
+            }
+            "sub_font_weight" => {
+                if let Ok(weight) = text.trim().parse::<u16>()
+                    && (100..=900).contains(&weight)
+                {
+                    self.settings.sub_font_weight = weight;
+                    self.apply_settings(cx);
+                }
+                return;
+            }
             _ => return,
         }
         self.player.set_config(self.engine_config());
@@ -643,10 +681,14 @@ impl PlayerView {
     }
 
     fn input_box(&self, key: &'static str) -> AnyElement {
+        self.input_box_width(key, 220.)
+    }
+
+    fn input_box_width(&self, key: &'static str, width: f32) -> AnyElement {
         let t = self.theme;
         let Some(e) = self.inputs.get(key).cloned() else { return div().into_any_element() };
         div()
-            .w(px(220.))
+            .w(px(width))
             .h(px(30.))
             .px_2()
             .flex()
@@ -801,6 +843,30 @@ impl PlayerView {
                     )
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .text_size(px(12.))
+                            .text_color(t.text_dim)
+                            .child(format!(
+                                "Subtitle font: {} · © 2022 The Noto Project Authors ·",
+                                DEFAULT_SUB_FONT_FAMILY
+                            ))
+                            .child(
+                                div()
+                                    .id("subtitle-font-license")
+                                    .text_color(t.accent)
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(t.text))
+                                    .child("SIL OFL 1.1")
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.show_dialog(Dialog::SubtitleFontLicense, w, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
                             .mt_2()
                             .text_size(px(12.))
                             .text_color(t.text_dim)
@@ -808,6 +874,28 @@ impl PlayerView {
                     )
                     .into_any_element();
                 self.modal("About MavPlayer", 520., body, None, cx)
+            }
+            Dialog::SubtitleFontLicense => {
+                let mut body = div().p_4().flex().flex_col().gap_1();
+                for line in include_str!("../../assets/fonts/OFL.txt").lines() {
+                    body = body.child(div().text_size(px(12.)).child(line.to_owned()));
+                }
+                let back = self
+                    .text_button(
+                        "font-license-back",
+                        "Back to About",
+                        false,
+                        |this, _, w, cx| this.show_dialog(Dialog::About, w, cx),
+                        cx,
+                    )
+                    .into_any_element();
+                self.modal(
+                    &format!("{DEFAULT_SUB_FONT_FAMILY} — SIL Open Font License 1.1"),
+                    650.,
+                    body.into_any_element(),
+                    Some(back),
+                    cx,
+                )
             }
             Dialog::Integrate => {
                 let body = div()
@@ -1589,6 +1677,73 @@ impl PlayerView {
                         self.input_box("sub_charset"),
                     ))
                     .child(self.section("Appearance"))
+                    .child(self.row(
+                        "Font family",
+                        Some("Leave empty for the default font; unknown names are not saved"),
+                        {
+                            let entered =
+                                self.inputs.get("sub_font_family").map(|i| i.read(cx).text()).unwrap_or_default();
+                            let candidate = entered.trim();
+                            let valid = super::render::installed_subtitle_font(candidate, cx);
+                            let message = if candidate.is_empty() {
+                                "Default subtitle font (Noto Sans)"
+                            } else if valid {
+                                "Font available"
+                            } else {
+                                "Font not available"
+                            };
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(self.input_box("sub_font_family"))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(if candidate.is_empty() || valid {
+                                            self.theme.text_dim
+                                        } else {
+                                            self.theme.danger
+                                        })
+                                        .child(message),
+                                )
+                                .into_any_element()
+                        },
+                    ))
+                    .child(
+                        self.row(
+                            "Font weight",
+                            Some("100–900; choose a preset or enter a number"),
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(self.input_box_width("sub_font_weight", 80.))
+                                .child(self.choice(
+                                    "subweight",
+                                    vec![
+                                        ("Thin (100)".into(), 100_u16),
+                                        ("Extra Light (200)".into(), 200),
+                                        ("Light (300)".into(), 300),
+                                        ("Regular (400)".into(), 400),
+                                        ("Medium (500)".into(), 500),
+                                        ("Semibold (600)".into(), 600),
+                                        ("Bold (700)".into(), 700),
+                                        ("Extra Bold (800)".into(), 800),
+                                        ("Black (900)".into(), 900),
+                                    ],
+                                    s.sub_font_weight,
+                                    |this, weight, cx| {
+                                        this.settings.sub_font_weight = weight;
+                                        if let Some(input) = this.inputs.get("sub_font_weight").cloned() {
+                                            input.update(cx, |i, cx| i.set_text(weight.to_string(), cx));
+                                        }
+                                    },
+                                    cx,
+                                ))
+                                .into_any_element(),
+                        ),
+                    )
                     .child(self.row(
                         "Size",
                         None,

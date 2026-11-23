@@ -1,5 +1,10 @@
 //! Rendering of the main window.
 
+#[path = "subtitle_fonts.rs"]
+mod subtitle_fonts;
+#[path = "subtitle_style.rs"]
+mod subtitle_style;
+
 use super::actions::*;
 use super::keymap;
 use super::menu::MenuItem as M;
@@ -92,6 +97,12 @@ fn frac_in(bounds: Bounds<Pixels>, p: Point<Pixels>, vertical: bool) -> f32 {
         let w = f32::from(bounds.size.width).max(1.0);
         ((f32::from(p.x) - f32::from(bounds.origin.x)) / w).clamp(0.0, 1.0)
     }
+}
+
+/// Check GPUI's actual font selection, not its implicit fallback.
+/// This does not register fonts or write configuration.
+pub(super) fn installed_subtitle_font(family: &str, cx: &mut Context<PlayerView>) -> bool {
+    subtitle_fonts::has_family(family, cx)
 }
 
 impl PlayerView {
@@ -640,7 +651,7 @@ impl PlayerView {
 
         // Text subtitles.
         if !texts.is_empty() {
-            root = root.child(self.text_subtitles(&texts, sub_rect, area));
+            root = root.child(self.text_subtitles(&texts, sub_rect, area, cx));
         }
 
         // Idle / audio-only / loading screens.
@@ -762,9 +773,15 @@ impl PlayerView {
         root.into_any_element()
     }
 
-    fn text_subtitles(&self, texts: &[String], rect: Bounds<Pixels>, area: Bounds<Pixels>) -> AnyElement {
+    fn text_subtitles(
+        &mut self,
+        texts: &[String],
+        rect: Bounds<Pixels>,
+        area: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let h = f32::from(rect.size.height).max(100.0);
-        let font = (h * 0.052 * self.settings.sub_scale).clamp(12.0, 96.0);
+        let font = subtitle_style::font_size(h, self.settings.sub_scale);
         let margin = f32::from(area.size.height)
             - (f32::from(rect.origin.y - area.origin.y) + f32::from(rect.size.height))
             + h * self.settings.sub_margin;
@@ -776,7 +793,11 @@ impl PlayerView {
             .filter(|l| !l.trim().is_empty())
             .collect();
         let style = self.settings.sub_style;
-        let o = (font / 16.0).max(1.2);
+        let font_weight = self.settings.sub_font_weight.clamp(100, 900);
+        let gpui_weight = gpui::FontWeight(f32::from(font_weight));
+        // Lazy embedded fallback registration, only when a text subtitle needs it.
+        let font_family = subtitle_fonts::resolve_family(&self.settings.sub_font_family, cx);
+        let row_pad = font * subtitle_style::BOX_VERTICAL_PADDING_FACTOR;
         let mut col = div()
             .absolute()
             .left(px(left + width * 0.05))
@@ -785,35 +806,54 @@ impl PlayerView {
             .flex()
             .flex_col()
             .items_center()
+            .gap(px(font * subtitle_style::LINE_GAP_FACTOR))
             .text_size(px(font))
-            .line_height(px(font * 1.22))
-            .font_weight(gpui::FontWeight::SEMIBOLD);
+            .line_height(px(subtitle_style::line_height(font)))
+            .font_family(font_family.to_owned())
+            .font_weight(gpui_weight);
         for line in lines {
             let line: SharedString = line.into();
             let el: AnyElement = match style {
                 SubStyle::Box => div()
-                    .px(px(font * 0.35))
+                    .px(px(font * subtitle_style::BOX_HORIZONTAL_PADDING_FACTOR))
+                    .py(px(font * subtitle_style::BOX_VERTICAL_PADDING_FACTOR))
                     .bg(rgba(0x000000b0))
                     .rounded(px(4.))
+                    .font_family(font_family.to_owned())
+                    .font_weight(gpui_weight)
                     .text_color(gpui::white())
                     .text_center()
                     .child(line)
                     .into_any_element(),
                 SubStyle::Outline => {
-                    let mut d = div().relative().text_center();
-                    for (dx, dy) in [(-o, 0.0), (o, 0.0), (0.0, -o), (0.0, o), (-o, -o), (o, o), (-o, o), (o, -o)] {
+                    // Keep stroke and fill in GPUI, so both use the exact same
+                    // resolved font face and weight (including fallback rules).
+                    let offset = (font / 16.0).max(1.2);
+                    let line_h = subtitle_style::line_height(font);
+                    let row_pad = row_pad.max(offset + 1.0);
+                    let mut d = div().relative().w_full().h(px(line_h + 2.0 * row_pad)).text_center();
+                    for (dx, dy) in [
+                        (-offset, 0.0),
+                        (offset, 0.0),
+                        (0.0, -offset),
+                        (0.0, offset),
+                        (-offset, -offset),
+                        (offset, offset),
+                        (-offset, offset),
+                        (offset, -offset),
+                    ] {
                         d = d.child(
                             div()
                                 .absolute()
                                 .left(px(dx))
-                                .top(px(dy))
+                                .top(px(row_pad + dy))
                                 .w_full()
-                                .text_center()
                                 .text_color(rgba(0x000000e6))
                                 .child(line.clone()),
                         );
                     }
-                    d.child(div().relative().text_color(gpui::white()).child(line)).into_any_element()
+                    d.child(div().absolute().top(px(row_pad)).w_full().text_color(gpui::white()).child(line))
+                        .into_any_element()
                 }
             };
             col = col.child(el);
