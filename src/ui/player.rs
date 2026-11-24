@@ -128,6 +128,8 @@ pub struct PlayerView {
     /// frame) alive after GPUI has uploaded and let go of them.
     retired: VecDeque<(ImageId, u8)>,
     pub sub_images: HashMap<u64, (Arc<RenderImage>, u32)>,
+    /// Experimental Cosmic Text subtitle textures, width, height and age.
+    pub outlined_sub_images: HashMap<u64, (Arc<RenderImage>, u32, u32, u32)>,
     pub subs: Vec<SubEvent>,
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
     /// The menu bar row, left uncovered by an open menu-bar menu's backdrop
@@ -434,6 +436,7 @@ impl PlayerView {
             frame_size: (0, 0),
             retired: VecDeque::new(),
             sub_images: HashMap::new(),
+            outlined_sub_images: HashMap::new(),
             subs: Vec::new(),
             video_bounds,
             menubar_bounds: Default::default(),
@@ -846,6 +849,19 @@ impl PlayerView {
             .collect();
         for id in stale {
             if let Some((img, _)) = self.sub_images.remove(&id) {
+                self.retired.push_back((img.id, RETIRE_AFTER));
+            }
+        }
+        let stale_outlined: Vec<u64> = self
+            .outlined_sub_images
+            .iter_mut()
+            .filter_map(|(key, (_, _, _, age))| {
+                *age += 1;
+                (*age > 30).then_some(*key)
+            })
+            .collect();
+        for key in stale_outlined {
+            if let Some((img, _, _, _)) = self.outlined_sub_images.remove(&key) {
                 self.retired.push_back((img.id, RETIRE_AFTER));
             }
         }
