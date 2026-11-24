@@ -132,6 +132,8 @@ pub struct PlayerView {
     pub outlined_sub_images: HashMap<u64, (Arc<RenderImage>, u32, u32, u32)>,
     pub subs: Vec<SubEvent>,
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Last measured video-area geometry, including display scale.
+    last_subtitle_geometry: Option<(f32, f32, f32, f32, f32)>,
     /// The menu bar row, left uncovered by an open menu-bar menu's backdrop
     /// so hovering another title switches menus.
     pub menubar_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -439,6 +441,7 @@ impl PlayerView {
             outlined_sub_images: HashMap::new(),
             subs: Vec::new(),
             video_bounds,
+            last_subtitle_geometry: None,
             menubar_bounds: Default::default(),
             picture,
             chrome: None,
@@ -713,6 +716,22 @@ impl PlayerView {
 
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
+        // `video_bounds` is updated during GPUI layout, after subtitle elements
+        // have been built. A fullscreen/resize frame may therefore use the
+        // *previous* video size. Request one more render when the measured
+        // layout differs, including the final compositor-assigned size.
+        let bounds = self.video_bounds.get();
+        let geometry = (
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            window.scale_factor(),
+        );
+        if self.last_subtitle_geometry != Some(geometry) {
+            self.last_subtitle_geometry = Some(geometry);
+            changed = true;
+        }
         self.save_volume_soon();
         if self.scrub.is_none() {
             self.player.set_hushed(false);
