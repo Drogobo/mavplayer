@@ -1,5 +1,12 @@
 //! Rendering of the main window.
 
+#[path = "subtitle_bitmap.rs"]
+mod subtitle_bitmap;
+#[path = "subtitle_fonts.rs"]
+mod subtitle_fonts;
+#[path = "subtitle_style.rs"]
+mod subtitle_style;
+
 use super::actions::*;
 use super::keymap;
 use super::menu::MenuItem as M;
@@ -23,6 +30,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const TITLEBAR_H: f32 = 34.0;
+/// Fullscreen control bar height: seek row (18) + gap (4) + buttons row (38)
+/// + vertical padding (6 + 8). The extra 40 px above it is only a gradient.
+const FULLSCREEN_CONTROL_BAR_H: f32 = 74.0;
 const RESIZE_EDGE: f32 = 6.0;
 /// Playlist row height and the list's vertical padding (`py_1`).
 const ROW_H: f32 = 34.0;
@@ -92,6 +102,33 @@ fn frac_in(bounds: Bounds<Pixels>, p: Point<Pixels>, vertical: bool) -> f32 {
         let w = f32::from(bounds.size.width).max(1.0);
         ((f32::from(p.x) - f32::from(bounds.origin.x)) / w).clamp(0.0, 1.0)
     }
+}
+
+/// Check GPUI's actual font selection, not its implicit fallback.
+/// This does not register fonts or write configuration.
+pub(super) fn installed_subtitle_font(family: &str, cx: &mut Context<PlayerView>) -> bool {
+    subtitle_fonts::has_family(family, cx)
+}
+
+/// Reports the source selected for the default subtitle font.
+pub(super) use subtitle_fonts::DefaultFontSource;
+
+pub(super) fn default_subtitle_font_source(cx: &mut Context<PlayerView>) -> DefaultFontSource {
+    subtitle_fonts::default_font_source(cx)
+}
+
+/// Font metadata for Preferences, independent of subtitle rendering.
+pub(super) fn subtitle_available_weights(family: &str) -> Vec<u16> {
+    subtitle_fonts::available_weights(family)
+}
+
+pub(super) fn subtitle_weight_supported(family: &str, weight: u16) -> u16 {
+    subtitle_fonts::supported_weight(family, weight)
+}
+
+/// Available installed font families for the Preferences picker.
+pub(super) fn subtitle_font_families() -> &'static [String] {
+    subtitle_fonts::installed_families()
 }
 
 impl PlayerView {
@@ -512,11 +549,6 @@ impl PlayerView {
         .absolute()
         .size_full();
 
-        let area = self.video_bounds.get();
-        let rect = video_rect(area, self.frame_size, aspect, zoom);
-        let local = |p: Point<Pixels>| point(p.x - area.origin.x, p.y - area.origin.y);
-        let sub_rect = if self.frame.is_some() { rect } else { area };
-
         let mut root = div()
             .id("video-area")
             .flex_1()
@@ -638,9 +670,44 @@ impl PlayerView {
                 }
             }));
 
-        // Text subtitles.
+        // Text subtitles need the current layout, not the previous video_bounds.
         if !texts.is_empty() {
-            root = root.child(self.text_subtitles(&texts, sub_rect, area));
+            let player = cx.entity().downgrade();
+            let has_frame = self.frame.is_some();
+            root = root.child(
+                canvas(
+                    move |area, window, cx| {
+                        if area.size.width <= px(0.) || area.size.height <= px(0.) {
+                            return None;
+                        }
+                        let dpi = window.scale_factor();
+                        let rect = if has_frame { picture_rect(area, fsize, aspect, zoom, dpi) } else { area };
+                        let subtitles = player
+                            .update(cx, |this, cx| {
+                                this.text_subtitles(&texts, rect, area, fullscreen && show_controls, dpi, cx)
+                            })
+                            .ok()?;
+                        let mut overlay = div().relative().size_full().child(subtitles).into_any_element();
+                        overlay.prepaint_as_root(
+                            area.origin,
+                            size(
+                                gpui::AvailableSpace::Definite(area.size.width),
+                                gpui::AvailableSpace::Definite(area.size.height),
+                            ),
+                            window,
+                            cx,
+                        );
+                        Some(overlay)
+                    },
+                    |_, overlay, window, cx| {
+                        if let Some(mut overlay) = overlay {
+                            overlay.paint(window, cx);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
         }
 
         // Idle / audio-only / loading screens.
@@ -758,16 +825,23 @@ impl PlayerView {
                     .child("Drop to play"),
             );
         }
-        let _ = local;
         root.into_any_element()
     }
 
-    fn text_subtitles(&self, texts: &[String], rect: Bounds<Pixels>, area: Bounds<Pixels>) -> AnyElement {
+    fn text_subtitles(
+        &mut self,
+        texts: &[String],
+        rect: Bounds<Pixels>,
+        area: Bounds<Pixels>,
+        fullscreen_controls_visible: bool,
+        dpi: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let h = f32::from(rect.size.height).max(100.0);
-        let font = (h * 0.052 * self.settings.sub_scale).clamp(12.0, 96.0);
-        let margin = f32::from(area.size.height)
-            - (f32::from(rect.origin.y - area.origin.y) + f32::from(rect.size.height))
-            + h * self.settings.sub_margin;
+        let font = subtitle_style::font_size(h, self.settings.sub_scale);
+        let picture_bottom = f32::from(rect.origin.y - area.origin.y) + f32::from(rect.size.height);
+        let area_height = f32::from(area.size.height);
+        let distance = h * self.settings.sub_margin;
         let left = f32::from(rect.origin.x - area.origin.x);
         let width = f32::from(rect.size.width);
         let lines: Vec<String> = texts
@@ -776,44 +850,154 @@ impl PlayerView {
             .filter(|l| !l.trim().is_empty())
             .collect();
         let style = self.settings.sub_style;
-        let o = (font / 16.0).max(1.2);
+        let font_weight = self.settings.sub_font_weight.clamp(100, 900);
+        let gpui_weight = gpui::FontWeight(f32::from(font_weight));
+        // Lazy embedded fallback registration, only when a text subtitle needs it.
+        let font_family = subtitle_fonts::resolve_family(&self.settings.sub_font_family, cx);
+        let line_height = subtitle_style::line_height(font);
+        let row_pad = font * subtitle_style::BOX_VERTICAL_PADDING_FACTOR;
+        let line_gap = font
+            * if style == SubStyle::Outline {
+                subtitle_style::OUTLINE_LINE_GAP_FACTOR
+            } else {
+                subtitle_style::LINE_GAP_FACTOR
+            };
+        // Render Outline rows before positioning: soft wrapping inside Cosmic Text
+        // can turn one source line into multiple visual lines.
+        let outline_scale = (dpi * subtitle_bitmap::supersampling()).clamp(0.5, 8.0);
+        let outline_pad = subtitle_bitmap::padding(font, outline_scale) as f32 / outline_scale;
+        let mut outline_bitmaps = Vec::new();
+        let mut block_height = 0.0;
+        for line in &lines {
+            if style == SubStyle::Outline {
+                let key = subtitle_bitmap::cache_key(line, &font_family, font_weight, font, width * 0.9, outline_scale);
+                let bitmap = if let Some((image, image_w, image_h, age)) = self.outlined_sub_images.get_mut(&key) {
+                    *age = 0;
+                    Some((image.clone(), *image_w, *image_h))
+                } else {
+                    subtitle_bitmap::render_line(line, &font_family, font_weight, font, width * 0.9, outline_scale).map(
+                        |(image, image_w, image_h)| {
+                            self.outlined_sub_images.insert(key, (image.clone(), image_w, image_h, 0));
+                            (image, image_w, image_h)
+                        },
+                    )
+                };
+                // Bitmap includes top/bottom stroke padding. The layout row does not:
+                // the painted image starts one padding amount above its row.
+                let row_height = bitmap.as_ref().map_or(line_height, |(_, _, image_h)| {
+                    (*image_h as f32 / outline_scale - 2.0 * outline_pad).max(line_height)
+                });
+                block_height += row_height;
+                outline_bitmaps.push((bitmap, row_height));
+            } else {
+                block_height += line_height + 2.0 * row_pad;
+            }
+        }
+        block_height += line_gap * lines.len().saturating_sub(1) as f32;
+        let margin = subtitle_style::bottom_margin(
+            self.settings.sub_position,
+            picture_bottom,
+            area_height,
+            distance,
+            block_height,
+        );
+        // Fullscreen controls overlay the video. Keep the entire subtitle block
+        // at least `distance` above the control bar, regardless of position mode.
+        // Windowed controls are outside the video area and need no adjustment.
+        let margin = subtitle_style::margin_above_controls(
+            margin,
+            distance,
+            if fullscreen_controls_visible { FULLSCREEN_CONTROL_BAR_H } else { 0.0 },
+        );
+        // The outline texture extends below the layout row by its stroke padding.
+        // Reserve that space too, especially above fullscreen controls.
+        let margin = margin + if style == SubStyle::Outline { outline_pad } else { 0.0 };
         let mut col = div()
             .absolute()
             .left(px(left + width * 0.05))
             .w(px(width * 0.9))
-            .bottom(px(margin.max(4.0)))
+            .bottom(px(margin))
             .flex()
             .flex_col()
             .items_center()
+            .gap(px(line_gap))
             .text_size(px(font))
-            .line_height(px(font * 1.22))
-            .font_weight(gpui::FontWeight::SEMIBOLD);
-        for line in lines {
+            .line_height(px(subtitle_style::line_height(font)))
+            .font_family(font_family.to_owned())
+            .font_weight(gpui_weight);
+        for (index, line) in lines.into_iter().enumerate() {
             let line: SharedString = line.into();
             let el: AnyElement = match style {
                 SubStyle::Box => div()
-                    .px(px(font * 0.35))
+                    .px(px(font * subtitle_style::BOX_HORIZONTAL_PADDING_FACTOR))
+                    .py(px(font * subtitle_style::BOX_VERTICAL_PADDING_FACTOR))
                     .bg(rgba(0x000000b0))
                     .rounded(px(4.))
+                    .font_family(font_family.to_owned())
+                    .font_weight(gpui_weight)
                     .text_color(gpui::white())
                     .text_center()
                     .child(line)
                     .into_any_element(),
                 SubStyle::Outline => {
-                    let mut d = div().relative().text_center();
-                    for (dx, dy) in [(-o, 0.0), (o, 0.0), (0.0, -o), (0.0, o), (-o, -o), (o, o), (-o, o), (o, -o)] {
-                        d = d.child(
-                            div()
+                    // EXPERIMENT: both white fill and black stroke come from one
+                    // Cosmic Text alpha mask, avoiding GPUI/Cosmic glyph mismatch.
+                    let scale = outline_scale;
+                    let (bitmap, row_height) = &outline_bitmaps[index];
+                    if let Some((image, image_w, image_h)) = bitmap {
+                        let logical_w = *image_w as f32 / scale;
+                        let logical_h = *image_h as f32 / scale;
+                        let pad = outline_pad;
+                        let image = image.clone();
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(*row_height))
+                            .child(
+                                canvas(
+                                    |bounds, _, _| bounds,
+                                    move |bounds, _, window, _| {
+                                        let x = bounds.origin.x + px((f32::from(bounds.size.width) - logical_w) * 0.5);
+                                        let y = bounds.origin.y - px(pad);
+                                        let target = Bounds::new(point(x, y), size(px(logical_w), px(logical_h)));
+                                        let _ = window.paint_image(target, Corners::default(), image.clone(), 0, false);
+                                    },
+                                )
                                 .absolute()
-                                .left(px(dx))
-                                .top(px(dy))
-                                .w_full()
-                                .text_center()
-                                .text_color(rgba(0x000000e6))
-                                .child(line.clone()),
-                        );
+                                .size_full(),
+                            )
+                            .into_any_element()
+                    } else {
+                        // Retain native rendering as a fallback if bitmap creation fails.
+                        // Keep stroke and fill in GPUI, so both use the exact same
+                        // resolved font face and weight (including fallback rules).
+                        let offset = (font / 16.0).max(1.2);
+                        // Unlike Box, Outline has no extra per-row vertical
+                        // padding. Natural line height keeps consecutive lines compact.
+                        let mut d = div().relative().w_full().h(px(line_height)).text_center();
+                        for (dx, dy) in [
+                            (-offset, 0.0),
+                            (offset, 0.0),
+                            (0.0, -offset),
+                            (0.0, offset),
+                            (-offset, -offset),
+                            (offset, offset),
+                            (-offset, offset),
+                            (offset, -offset),
+                        ] {
+                            d = d.child(
+                                div()
+                                    .absolute()
+                                    .left(px(dx))
+                                    .top(px(dy))
+                                    .w_full()
+                                    .text_color(rgba(0x000000e6))
+                                    .child(line.clone()),
+                            );
+                        }
+                        d.child(div().absolute().top_0().w_full().text_color(gpui::white()).child(line))
+                            .into_any_element()
                     }
-                    d.child(div().relative().text_color(gpui::white()).child(line)).into_any_element()
                 }
             };
             col = col.child(el);

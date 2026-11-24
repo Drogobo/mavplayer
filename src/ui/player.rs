@@ -103,6 +103,14 @@ pub struct Drag {
     pub last: f32,
 }
 
+/// Snapshot used while dragging a modal by its title bar.
+#[derive(Clone, Copy)]
+pub struct ModalDragOrigin {
+    pub start: Point<Pixels>,
+    pub initial: (f32, f32),
+    pub limits: (f32, f32, f32, f32),
+}
+
 pub struct PlayerView {
     pub player: Player,
     pub settings: Settings,
@@ -120,8 +128,12 @@ pub struct PlayerView {
     /// frame) alive after GPUI has uploaded and let go of them.
     retired: VecDeque<(ImageId, u8)>,
     pub sub_images: HashMap<u64, (Arc<RenderImage>, u32)>,
+    /// Experimental Cosmic Text subtitle textures, width, height and age.
+    pub outlined_sub_images: HashMap<u64, (Arc<RenderImage>, u32, u32, u32)>,
     pub subs: Vec<SubEvent>,
     pub video_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Last measured video-area geometry, including display scale.
+    last_subtitle_geometry: Option<(f32, f32, f32, f32, f32)>,
     /// The menu bar row, left uncovered by an open menu-bar menu's backdrop
     /// so hovering another title switches menus.
     pub menubar_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -154,6 +166,12 @@ pub struct PlayerView {
     pub menu: Option<OpenMenu>,
     pub media_keys: Option<super::media_keys::MediaKeys>,
     pub dialog: Option<Dialog>,
+    /// Offset from the centered position of the current modal (logical pixels).
+    pub modal_offset: (f32, f32),
+    /// Pointer position and modal offset when title-bar dragging began.
+    pub modal_drag_origin: Option<ModalDragOrigin>,
+    /// Actual bounds of the modal, updated after layout.
+    pub modal_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub drag: Option<Drag>,
     pub seek_hover: Option<f32>,
     pub scrub: Option<Scrub>,
@@ -427,8 +445,10 @@ impl PlayerView {
             frame_size: (0, 0),
             retired: VecDeque::new(),
             sub_images: HashMap::new(),
+            outlined_sub_images: HashMap::new(),
             subs: Vec::new(),
             video_bounds,
+            last_subtitle_geometry: None,
             menubar_bounds: Default::default(),
             picture,
             chrome: None,
@@ -445,6 +465,9 @@ impl PlayerView {
             menu: None,
             media_keys,
             dialog: None,
+            modal_offset: (0.0, 0.0),
+            modal_drag_origin: None,
+            modal_bounds: Rc::new(Cell::new(Bounds::default())),
             drag: None,
             seek_hover: None,
             scrub: None,
@@ -701,6 +724,22 @@ impl PlayerView {
 
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
+        // `video_bounds` is updated during GPUI layout, after subtitle elements
+        // have been built. A fullscreen/resize frame may therefore use the
+        // *previous* video size. Request one more render when the measured
+        // layout differs, including the final compositor-assigned size.
+        let bounds = self.video_bounds.get();
+        let geometry = (
+            f32::from(bounds.origin.x),
+            f32::from(bounds.origin.y),
+            f32::from(bounds.size.width),
+            f32::from(bounds.size.height),
+            window.scale_factor(),
+        );
+        if self.last_subtitle_geometry != Some(geometry) {
+            self.last_subtitle_geometry = Some(geometry);
+            changed = true;
+        }
         self.save_volume_soon();
         if self.scrub.is_none() {
             self.player.set_hushed(false);
@@ -837,6 +876,19 @@ impl PlayerView {
             .collect();
         for id in stale {
             if let Some((img, _)) = self.sub_images.remove(&id) {
+                self.retired.push_back((img.id, RETIRE_AFTER));
+            }
+        }
+        let stale_outlined: Vec<u64> = self
+            .outlined_sub_images
+            .iter_mut()
+            .filter_map(|(key, (_, _, _, age))| {
+                *age += 1;
+                (*age > 30).then_some(*key)
+            })
+            .collect();
+        for key in stale_outlined {
+            if let Some((img, _, _, _)) = self.outlined_sub_images.remove(&key) {
                 self.retired.push_back((img.id, RETIRE_AFTER));
             }
         }
@@ -1488,6 +1540,9 @@ impl PlayerView {
     }
 
     pub fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.modal_drag_origin = None;
+        self.close_menu(cx);
+
         if let Some(Dialog::Integrate) = self.dialog {
             let _ = std::fs::create_dir_all(crate::settings::config_dir());
             let _ = std::fs::write(crate::integration::prompt_marker(), b"asked");

@@ -2,7 +2,7 @@
 
 use super::keymap::{self, Command};
 use super::menu::MenuItem as M;
-use super::player::PlayerView;
+use super::player::{ModalDragOrigin, PlayerView};
 use super::widgets::{SCROLLBAR_W, format_size, format_time, icon, parse_time, scrollbar};
 use crate::engine::{
     self, Anime4KMode, Anime4KQuality, AudioFx, ChannelMode, Deinterlace, EQ_BANDS, HwDecode, ScaleQuality, TrackKind,
@@ -10,10 +10,13 @@ use crate::engine::{
 };
 use crate::icons::Icon;
 use crate::playlist;
-use crate::settings::{BarControl, IconTheme, OpenMode, RunningMode, ScrollAction, SeekDragMode, SubStyle, ThemeMode};
+use crate::settings::{
+    BUNDLED_SUB_FONT_FAMILY, BarControl, DEFAULT_SUB_FONT_FAMILY, IconTheme, OpenMode, RunningMode, ScrollAction,
+    SeekDragMode, SubPosition, SubStyle, ThemeMode,
+};
 use gpui::{
-    AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, Resource, SharedString, Window, deferred,
-    div, img, prelude::*, px, relative,
+    AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Resource,
+    SharedString, Window, canvas, deferred, div, img, prelude::*, px, relative,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -25,6 +28,7 @@ pub enum Dialog {
     OpenDisc,
     JumpTo,
     About,
+    SubtitleFontLicense,
     Integrate,
 }
 
@@ -53,6 +57,11 @@ pub const EQ_PRESETS: &[(&str, [f32; 10])] = &[
 
 impl PlayerView {
     pub fn show_dialog(&mut self, d: Dialog, window: &mut Window, cx: &mut Context<Self>) {
+        // Preserve the position when switching Preferences tabs.
+        if self.dialog.is_none() {
+            self.modal_offset = (0.0, 0.0);
+        }
+        self.modal_drag_origin = None;
         self.menu = None;
         self.dialog = Some(d);
         // Every dialog (and settings tab) opens scrolled to the top.
@@ -77,6 +86,7 @@ impl PlayerView {
                     ("audio_langs", self.settings.audio_langs.clone(), "e.g. en, ja"),
                     ("sub_langs", self.settings.sub_langs.clone(), "e.g. en, fr"),
                     ("sub_charset", self.settings.sub_charset.clone(), "auto (e.g. CP1251, Shift_JIS)"),
+                    ("sub_font_family", self.settings.sub_font_family.clone(), DEFAULT_SUB_FONT_FAMILY),
                 ] {
                     let i = self.input(k, ph, window, cx);
                     i.update(cx, |i, cx| i.set_text(v, cx));
@@ -176,6 +186,11 @@ impl PlayerView {
                 None => self.osd("Couldn't understand that time", cx),
             },
             "volume" => self.finish_volume_edit(true, window, cx),
+            // Enter in a subtitle font field commits it without closing Preferences.
+            "sub_font_family" => {
+                // Valid values were already applied by on_input_changed.
+                cx.notify();
+            }
             "shortcut_search" => {}
             _ => self.close_dialog(window, cx),
         }
@@ -192,6 +207,25 @@ impl PlayerView {
             "audio_langs" => self.settings.audio_langs = text,
             "sub_langs" => self.settings.sub_langs = text,
             "sub_charset" => self.settings.sub_charset = text,
+            "sub_font_family" => {
+                // An incomplete name is only a draft: don't replace the active font
+                // or write settings.json on every keystroke.
+                let family = text.trim();
+                // An empty field explicitly selects the default subtitle font.
+                // Only complete installed family names (or empty input) are saved.
+                if (family.is_empty() || super::render::installed_subtitle_font(family, cx))
+                    && self.settings.sub_font_family != family
+                {
+                    self.settings.sub_font_family = family.to_owned();
+                    self.settings.sub_font_weight =
+                        super::render::subtitle_weight_supported(family, self.settings.sub_font_weight);
+                    self.apply_settings(cx);
+                } else {
+                    // Refresh the inline validation message without saving.
+                    cx.notify();
+                }
+                return;
+            }
             _ => return,
         }
         self.player.set_config(self.engine_config());
@@ -275,6 +309,8 @@ impl PlayerView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
+        let (offset_x, offset_y) = self.modal_offset;
+        let bounds_cell = self.modal_bounds.clone();
         deferred(
             div()
                 .id("modal-backdrop")
@@ -288,10 +324,37 @@ impl PlayerView {
                 // tooltips, right-click menus or wheel.
                 .occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, w, cx| this.close_dialog(w, cx)))
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                    let Some(ModalDragOrigin { start, initial, limits: (min_x, max_x, min_y, max_y) }) =
+                        this.modal_drag_origin
+                    else {
+                        return;
+                    };
+                    if ev.pressed_button != Some(MouseButton::Left) {
+                        this.modal_drag_origin = None;
+                        return;
+                    }
+                    // The bounds are snapshotted at mouse-down. Using the live,
+                    // moved bounds here creates a feedback loop near the edges.
+                    let dx = f32::from(ev.position.x - start.x);
+                    let dy = f32::from(ev.position.y - start.y);
+                    this.modal_offset = ((initial.0 + dx).clamp(min_x, max_x), (initial.1 + dy).clamp(min_y, max_y));
+                    cx.notify();
+                    cx.stop_propagation();
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, _| {
+                        this.modal_drag_origin = None;
+                    }),
+                )
                 .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .child(
                     div()
                         .id("modal")
+                        .relative()
+                        .left(px(offset_x))
+                        .top(px(offset_y))
                         .w(px(width))
                         .max_w(relative(0.95))
                         .max_h(relative(0.9))
@@ -306,10 +369,48 @@ impl PlayerView {
                         .overflow_hidden()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
+                            canvas(
+                                move |bounds, _, _| {
+                                    bounds_cell.set(bounds);
+                                    bounds
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .child(
                             div()
+                                .id("modal-titlebar")
                                 .flex()
                                 .items_center()
                                 .h(px(46.))
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                                        let bounds = this.modal_bounds.get();
+                                        let viewport = window.viewport_size();
+                                        let center_x = f32::from(bounds.origin.x) - this.modal_offset.0;
+                                        let center_y = f32::from(bounds.origin.y) - this.modal_offset.1;
+                                        let limit_x =
+                                            f32::from(viewport.width) - center_x - f32::from(bounds.size.width);
+                                        let limit_y =
+                                            f32::from(viewport.height) - center_y - f32::from(bounds.size.height);
+                                        let limits = (
+                                            (-center_x).min(limit_x),
+                                            (-center_x).max(limit_x),
+                                            (-center_y).min(limit_y),
+                                            (-center_y).max(limit_y),
+                                        );
+                                        this.modal_drag_origin = Some(ModalDragOrigin {
+                                            start: ev.position,
+                                            initial: this.modal_offset,
+                                            limits,
+                                        });
+                                        cx.stop_propagation();
+                                    }),
+                                )
                                 .px_4()
                                 .border_b_1()
                                 .border_color(t.border)
@@ -642,11 +743,86 @@ impl PlayerView {
             .into_any_element()
     }
 
+    /// Editable font family field with a menu sourced from the cached fontdb catalog.
+    /// The arrow shows all fonts when the field holds the selected family.
+    /// A partially typed family filters the menu on the next arrow click.
+    fn font_family_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let field = self.input_box("sub_font_family");
+        let arrow = div()
+            .id("subtitle-font-family-menu")
+            .size(px(30.))
+            .flex_none()
+            .rounded(px(7.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_alt)
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_center()
+            .hover(|d| d.bg(theme.hover))
+            .child(icon(Icon::DropDown, px(13.), theme.text_dim))
+            .on_click(cx.listener(|this, ev: &ClickEvent, _, cx| {
+                let entered = this.inputs.get("sub_font_family").map(|input| input.read(cx).text()).unwrap_or_default();
+                // The input initially contains the selected font, not a search
+                // query. On the first click show *all* families. Once the user
+                // edits it to an incomplete name, treat that draft as a filter.
+                let query = entered.trim();
+                let filter = if query.eq_ignore_ascii_case(this.settings.sub_font_family.trim()) { "" } else { query };
+                let mut items = vec![
+                    M::action(format!("Default ({DEFAULT_SUB_FONT_FAMILY})"), |this, _, cx| {
+                        this.select_subtitle_font("", cx)
+                    })
+                    .selected(this.settings.sub_font_family.is_empty()),
+                ];
+
+                // The existing GPUI menu already has a scrolling viewport,
+                // so truncating to 80 families made the rest inaccessible.
+                let matches = super::render::subtitle_font_families()
+                    .iter()
+                    .filter(|family| filter.is_empty() || family.to_lowercase().contains(&filter.to_lowercase()));
+                for family in matches {
+                    let chosen = family.clone();
+                    let selected = this.settings.sub_font_family.eq_ignore_ascii_case(family);
+                    items.push(
+                        M::action(family.clone(), move |this, _, cx| {
+                            this.select_subtitle_font(&chosen, cx);
+                        })
+                        .selected(selected),
+                    );
+                }
+                let pos = ev.position();
+                this.open_menu(items, gpui::point(pos.x - px(210.), pos.y + px(12.)), None, cx);
+                cx.stop_propagation();
+            }));
+        div().flex().items_center().gap_1().child(field).child(arrow).into_any_element()
+    }
+
+    fn select_subtitle_font(&mut self, family: &str, cx: &mut Context<Self>) {
+        if let Some(input) = self.inputs.get("sub_font_family").cloned() {
+            // Update the visible field even when the value is unchanged.
+            input.update(cx, |input, cx| input.set_text(family.to_owned(), cx));
+        }
+        if self.settings.sub_font_family != family {
+            self.settings.sub_font_family = family.to_owned();
+            self.settings.sub_font_weight =
+                super::render::subtitle_weight_supported(family, self.settings.sub_font_weight);
+            self.apply_settings(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
     fn input_box(&self, key: &'static str) -> AnyElement {
+        self.input_box_width(key, 220.)
+    }
+
+    fn input_box_width(&self, key: &'static str, width: f32) -> AnyElement {
         let t = self.theme;
         let Some(e) = self.inputs.get(key).cloned() else { return div().into_any_element() };
         div()
-            .w(px(220.))
+            .w(px(width))
             .h(px(30.))
             .px_2()
             .flex()
@@ -801,6 +977,30 @@ impl PlayerView {
                     )
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_1()
+                            .text_size(px(12.))
+                            .text_color(t.text_dim)
+                            .child(format!(
+                                "Bundled subtitle font: {} · © 2020 The Open Sans Project Authors ·",
+                                BUNDLED_SUB_FONT_FAMILY
+                            ))
+                            .child(
+                                div()
+                                    .id("subtitle-font-license")
+                                    .text_color(t.accent)
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(t.text))
+                                    .child("SIL OFL 1.1")
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.show_dialog(Dialog::SubtitleFontLicense, w, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
                             .mt_2()
                             .text_size(px(12.))
                             .text_color(t.text_dim)
@@ -808,6 +1008,28 @@ impl PlayerView {
                     )
                     .into_any_element();
                 self.modal("About MavPlayer", 520., body, None, cx)
+            }
+            Dialog::SubtitleFontLicense => {
+                let mut body = div().p_4().flex().flex_col().gap_1();
+                for line in include_str!("../../assets/fonts/OFL.txt").lines() {
+                    body = body.child(div().text_size(px(12.)).child(line.to_owned()));
+                }
+                let back = self
+                    .text_button(
+                        "font-license-back",
+                        "Back to About",
+                        false,
+                        |this, _, w, cx| this.show_dialog(Dialog::About, w, cx),
+                        cx,
+                    )
+                    .into_any_element();
+                self.modal(
+                    &format!("{BUNDLED_SUB_FONT_FAMILY} — SIL Open Font License 1.1"),
+                    650.,
+                    body.into_any_element(),
+                    Some(back),
+                    cx,
+                )
             }
             Dialog::Integrate => {
                 let body = div()
@@ -1590,26 +1812,6 @@ impl PlayerView {
                     ))
                     .child(self.section("Appearance"))
                     .child(self.row(
-                        "Size",
-                        None,
-                        self.stepper(
-                            "subsize",
-                            format!("{:.0} %", s.sub_scale * 100.0),
-                            |t, d, _| t.settings.sub_scale = (t.settings.sub_scale + d as f32 * 0.1).clamp(0.3, 3.0),
-                            cx,
-                        ),
-                    ))
-                    .child(self.row(
-                        "Distance from bottom",
-                        None,
-                        self.stepper(
-                            "submargin",
-                            format!("{:.0} %", s.sub_margin * 100.0),
-                            |t, d, _| t.settings.sub_margin = (t.settings.sub_margin + d as f32 * 0.01).clamp(0.0, 0.4),
-                            cx,
-                        ),
-                    ))
-                    .child(self.row(
                         "Style",
                         None,
                         self.choice(
@@ -1620,6 +1822,133 @@ impl PlayerView {
                             ],
                             s.sub_style,
                             |t, v, _| t.settings.sub_style = v,
+                            cx,
+                        ),
+                    ))
+                    .child(self.row(
+                        "Font family",
+                        Some("Leave empty for the default font; unknown names are not saved"),
+                        {
+                            let entered =
+                                self.inputs.get("sub_font_family").map(|i| i.read(cx).text()).unwrap_or_default();
+                            let candidate = entered.trim();
+                            let status = if candidate.is_empty() {
+                                let source = super::render::default_subtitle_font_source(cx);
+                                Some((
+                                    match source {
+                                        super::render::DefaultFontSource::System => {
+                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY}")
+                                        }
+                                        super::render::DefaultFontSource::Bundled => {
+                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY} (using bundled {BUNDLED_SUB_FONT_FAMILY})")
+                                        }
+                                        super::render::DefaultFontSource::Unavailable => {
+                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY} (font unavailable)")
+                                        }
+                                    },
+                                    source != super::render::DefaultFontSource::System,
+                                ))
+                            } else if super::render::subtitle_available_weights(candidate).is_empty() {
+                                let replacement = if super::render::subtitle_available_weights("").is_empty() {
+                                    format!("bundled {BUNDLED_SUB_FONT_FAMILY}")
+                                } else {
+                                    DEFAULT_SUB_FONT_FAMILY.to_owned()
+                                };
+                                Some((format!("Font not available (using {replacement})"), true))
+                            } else {
+                                None
+                            };
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(self.font_family_picker(cx))
+                                .when_some(status, |d, (message, warning)| {
+                                    d.child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(if warning { self.theme.danger } else { self.theme.text_dim })
+                                            .child(message),
+                                    )
+                                })
+                                .into_any_element()
+                        },
+                    ))
+                    .child(
+                        self.row(
+                            "Font weight",
+                            Some("Only the weights supported by the selected font are offered"),
+                            self.choice(
+                                "subweight",
+                                {
+                                    let weights = super::render::subtitle_available_weights(&s.sub_font_family);
+                                    // A variable font may expose hundreds of valid numeric
+                                    // weights. Offer standard steps and the current
+                                    // value so the menu remains manageable.
+                                    if weights.len() > 40 {
+                                        weights
+                                            .into_iter()
+                                            .filter(|w| w % 100 == 0 || *w == s.sub_font_weight)
+                                            .collect::<Vec<_>>()
+                                    } else {
+                                        weights
+                                    }
+                                }
+                                .into_iter()
+                                .map(|weight| {
+                                    let name = match weight {
+                                        100 => "Thin",
+                                        200 => "Extra Light",
+                                        300 => "Light",
+                                        400 => "Regular",
+                                        500 => "Medium",
+                                        600 => "Semibold",
+                                        700 => "Bold",
+                                        800 => "Extra Bold",
+                                        900 => "Black",
+                                        _ => "Weight",
+                                    };
+                                    (format!("{name} ({weight})"), weight)
+                                })
+                                .collect(),
+                                s.sub_font_weight,
+                                |this, weight, _| this.settings.sub_font_weight = weight,
+                                cx,
+                            ),
+                        ),
+                    )
+                    .child(self.row(
+                        "Size",
+                        None,
+                        self.stepper(
+                            "subsize",
+                            format!("{:.0} %", s.sub_scale * 100.0),
+                            |t, d, _| t.settings.sub_scale = (t.settings.sub_scale + d as f32 * 0.1).clamp(0.3, 3.0),
+                            cx,
+                        ),
+                    ))
+                    .child(self.row(
+                        "Subtitle position",
+                        Some("Automatic uses the black bar when possible"),
+                        self.choice(
+                            "subposition",
+                            vec![
+                                ("Automatic".into(), SubPosition::Automatic),
+                                ("Video picture".into(), SubPosition::VideoPicture),
+                                ("Player window".into(), SubPosition::PlayerWindow),
+                            ],
+                            s.sub_position,
+                            |t, v, _| t.settings.sub_position = v,
+                            cx,
+                        ),
+                    ))
+                    .child(self.row(
+                        "Distance from bottom",
+                        Some("Percentage of video picture height"),
+                        self.stepper(
+                            "submargin",
+                            format!("{:.0} %", s.sub_margin * 100.0),
+                            |t, d, _| t.settings.sub_margin = (t.settings.sub_margin + d as f32 * 0.01).clamp(0.0, 0.4),
                             cx,
                         ),
                     ));

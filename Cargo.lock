@@ -3401,6 +3401,7 @@ name = "mavplayer"
 version = "0.3.3"
 dependencies = [
  "anyhow",
+ "cosmic-text",
  "cpal",
  "crossbeam-channel",
  "dirs 6.0.0",
@@ -3423,6 +3424,7 @@ dependencies = [
  "souvlaki",
  "sys-locale",
  "tray-icon",
+ "ttf-parser 0.20.0",
  "unicode-segmentation",
  "winresource",
 ]

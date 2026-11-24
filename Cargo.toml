@@ -20,6 +20,9 @@ default = []
 static-ffmpeg = ["ffmpeg-sys-next/static"]
 
 [dependencies]
+cosmic-text = "=0.14.2"
+fontdb = { version = "0.16", default-features = false, features = ["std", "fs"] }
+ttf-parser = "0.20" # Read variable font wght axes (already a transitive dependency)
 gpui = "0.2.2"
 ffmpeg-sys-next = { version = "9.1", default-features = false, features = ["avcodec", "avformat", "avfilter", "swscale", "swresample"] }
 cpal = "0.18"
@@ -45,7 +48,6 @@ pipewire = { version = "0.10", features = ["v0_3_44"] }
 # Startup font prefetch (font_prefetch.rs). These are the same fontdb and
 # fontconfig-parser versions cosmic-text (GPUI's Linux text system) uses, so
 # the prefetch parses fonts exactly as GPUI's own scan does.
-fontdb = { version = "0.16", default-features = false, features = ["std", "fs"] }
 fontconfig-parser = "0.5"
 memmap2 = "0.9"
 # System tray icon (StatusNotifierItem over D-Bus; KDE, and GNOME with the
