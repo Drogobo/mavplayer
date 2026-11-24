@@ -2,7 +2,7 @@
 
 use super::keymap::{self, Command};
 use super::menu::MenuItem as M;
-use super::player::PlayerView;
+use super::player::{ModalDragOrigin, PlayerView};
 use super::widgets::{SCROLLBAR_W, format_size, format_time, icon, parse_time, scrollbar};
 use crate::engine::{
     self, Anime4KMode, Anime4KQuality, AudioFx, ChannelMode, Deinterlace, EQ_BANDS, HwDecode, ScaleQuality, TrackKind,
@@ -325,7 +325,11 @@ impl PlayerView {
                 .occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, w, cx| this.close_dialog(w, cx)))
                 .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                    let Some((start, initial, (min_x, max_x, min_y, max_y))) = this.modal_drag_origin else { return };
+                    let Some(ModalDragOrigin { start, initial, limits: (min_x, max_x, min_y, max_y) }) =
+                        this.modal_drag_origin
+                    else {
+                        return;
+                    };
                     if ev.pressed_button != Some(MouseButton::Left) {
                         this.modal_drag_origin = None;
                         return;
@@ -399,7 +403,11 @@ impl PlayerView {
                                             (-center_y).min(limit_y),
                                             (-center_y).max(limit_y),
                                         );
-                                        this.modal_drag_origin = Some((ev.position, this.modal_offset, limits));
+                                        this.modal_drag_origin = Some(ModalDragOrigin {
+                                            start: ev.position,
+                                            initial: this.modal_offset,
+                                            limits,
+                                        });
                                         cx.stop_propagation();
                                     }),
                                 )

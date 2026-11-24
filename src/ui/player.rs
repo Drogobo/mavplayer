@@ -103,6 +103,14 @@ pub struct Drag {
     pub last: f32,
 }
 
+/// Snapshot used while dragging a modal by its title bar.
+#[derive(Clone, Copy)]
+pub struct ModalDragOrigin {
+    pub start: Point<Pixels>,
+    pub initial: (f32, f32),
+    pub limits: (f32, f32, f32, f32),
+}
+
 pub struct PlayerView {
     pub player: Player,
     pub settings: Settings,
@@ -157,7 +165,7 @@ pub struct PlayerView {
     /// Offset from the centered position of the current modal (logical pixels).
     pub modal_offset: (f32, f32),
     /// Pointer position and modal offset when title-bar dragging began.
-    pub modal_drag_origin: Option<(Point<Pixels>, (f32, f32), (f32, f32, f32, f32))>,
+    pub modal_drag_origin: Option<ModalDragOrigin>,
     /// Actual bounds of the modal, updated after layout.
     pub modal_bounds: Rc<Cell<Bounds<Pixels>>>,
     pub drag: Option<Drag>,
