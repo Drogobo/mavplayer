@@ -549,11 +549,6 @@ impl PlayerView {
         .absolute()
         .size_full();
 
-        let area = self.video_bounds.get();
-        let rect = video_rect(area, self.frame_size, aspect, zoom);
-        let local = |p: Point<Pixels>| point(p.x - area.origin.x, p.y - area.origin.y);
-        let sub_rect = if self.frame.is_some() { rect } else { area };
-
         let mut root = div()
             .id("video-area")
             .flex_1()
@@ -675,16 +670,44 @@ impl PlayerView {
                 }
             }));
 
-        // Text subtitles.
+        // Text subtitles need the current layout, not the previous video_bounds.
         if !texts.is_empty() {
-            root = root.child(self.text_subtitles(
-                &texts,
-                sub_rect,
-                area,
-                fullscreen && show_controls,
-                window.scale_factor(),
-                cx,
-            ));
+            let player = cx.entity().downgrade();
+            let has_frame = self.frame.is_some();
+            root = root.child(
+                canvas(
+                    move |area, window, cx| {
+                        if area.size.width <= px(0.) || area.size.height <= px(0.) {
+                            return None;
+                        }
+                        let dpi = window.scale_factor();
+                        let rect = if has_frame { picture_rect(area, fsize, aspect, zoom, dpi) } else { area };
+                        let subtitles = player
+                            .update(cx, |this, cx| {
+                                this.text_subtitles(&texts, rect, area, fullscreen && show_controls, dpi, cx)
+                            })
+                            .ok()?;
+                        let mut overlay = div().relative().size_full().child(subtitles).into_any_element();
+                        overlay.prepaint_as_root(
+                            area.origin,
+                            size(
+                                gpui::AvailableSpace::Definite(area.size.width),
+                                gpui::AvailableSpace::Definite(area.size.height),
+                            ),
+                            window,
+                            cx,
+                        );
+                        Some(overlay)
+                    },
+                    |_, overlay, window, cx| {
+                        if let Some(mut overlay) = overlay {
+                            overlay.paint(window, cx);
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
         }
 
         // Idle / audio-only / loading screens.
@@ -802,7 +825,6 @@ impl PlayerView {
                     .child("Drop to play"),
             );
         }
-        let _ = local;
         root.into_any_element()
     }
 
