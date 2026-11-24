@@ -1,5 +1,7 @@
 //! Rendering of the main window.
 
+#[path = "subtitle_bitmap.rs"]
+mod subtitle_bitmap;
 #[path = "subtitle_fonts.rs"]
 mod subtitle_fonts;
 #[path = "subtitle_style.rs"]
@@ -675,7 +677,14 @@ impl PlayerView {
 
         // Text subtitles.
         if !texts.is_empty() {
-            root = root.child(self.text_subtitles(&texts, sub_rect, area, fullscreen && show_controls, cx));
+            root = root.child(self.text_subtitles(
+                &texts,
+                sub_rect,
+                area,
+                fullscreen && show_controls,
+                window.scale_factor(),
+                cx,
+            ));
         }
 
         // Idle / audio-only / loading screens.
@@ -803,6 +812,7 @@ impl PlayerView {
         rect: Bounds<Pixels>,
         area: Bounds<Pixels>,
         fullscreen_controls_visible: bool,
+        dpi: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let h = f32::from(rect.size.height).max(100.0);
@@ -830,9 +840,38 @@ impl PlayerView {
             } else {
                 subtitle_style::LINE_GAP_FACTOR
             };
-        let line_count = lines.len();
-        let row_height = line_height + if style == SubStyle::Box { 2.0 * row_pad } else { 0.0 };
-        let block_height = row_height * line_count as f32 + line_gap * line_count.saturating_sub(1) as f32;
+        // Render Outline rows before positioning: soft wrapping inside Cosmic Text
+        // can turn one source line into multiple visual lines.
+        let outline_scale = (dpi * subtitle_bitmap::supersampling()).clamp(0.5, 8.0);
+        let outline_pad = subtitle_bitmap::padding(font, outline_scale) as f32 / outline_scale;
+        let mut outline_bitmaps = Vec::new();
+        let mut block_height = 0.0;
+        for line in &lines {
+            if style == SubStyle::Outline {
+                let key = subtitle_bitmap::cache_key(line, &font_family, font_weight, font, width * 0.9, outline_scale);
+                let bitmap = if let Some((image, image_w, image_h, age)) = self.outlined_sub_images.get_mut(&key) {
+                    *age = 0;
+                    Some((image.clone(), *image_w, *image_h))
+                } else {
+                    subtitle_bitmap::render_line(line, &font_family, font_weight, font, width * 0.9, outline_scale).map(
+                        |(image, image_w, image_h)| {
+                            self.outlined_sub_images.insert(key, (image.clone(), image_w, image_h, 0));
+                            (image, image_w, image_h)
+                        },
+                    )
+                };
+                // Bitmap includes top/bottom stroke padding. The layout row does not:
+                // the painted image starts one padding amount above its row.
+                let row_height = bitmap.as_ref().map_or(line_height, |(_, _, image_h)| {
+                    (*image_h as f32 / outline_scale - 2.0 * outline_pad).max(line_height)
+                });
+                block_height += row_height;
+                outline_bitmaps.push((bitmap, row_height));
+            } else {
+                block_height += line_height + 2.0 * row_pad;
+            }
+        }
+        block_height += line_gap * lines.len().saturating_sub(1) as f32;
         let margin = subtitle_style::bottom_margin(
             self.settings.sub_position,
             picture_bottom,
@@ -848,6 +887,9 @@ impl PlayerView {
             distance,
             if fullscreen_controls_visible { FULLSCREEN_CONTROL_BAR_H } else { 0.0 },
         );
+        // The outline texture extends below the layout row by its stroke padding.
+        // Reserve that space too, especially above fullscreen controls.
+        let margin = margin + if style == SubStyle::Outline { outline_pad } else { 0.0 };
         let mut col = div()
             .absolute()
             .left(px(left + width * 0.05))
@@ -861,7 +903,7 @@ impl PlayerView {
             .line_height(px(subtitle_style::line_height(font)))
             .font_family(font_family.to_owned())
             .font_weight(gpui_weight);
-        for line in lines {
+        for (index, line) in lines.into_iter().enumerate() {
             let line: SharedString = line.into();
             let el: AnyElement = match style {
                 SubStyle::Box => div()
@@ -876,33 +918,64 @@ impl PlayerView {
                     .child(line)
                     .into_any_element(),
                 SubStyle::Outline => {
-                    // Keep stroke and fill in GPUI, so both use the exact same
-                    // resolved font face and weight (including fallback rules).
-                    let offset = (font / 16.0).max(1.2);
-                    // Unlike Box, Outline has no extra per-row vertical
-                    // padding. Natural line height keeps consecutive lines compact.
-                    let mut d = div().relative().w_full().h(px(line_height)).text_center();
-                    for (dx, dy) in [
-                        (-offset, 0.0),
-                        (offset, 0.0),
-                        (0.0, -offset),
-                        (0.0, offset),
-                        (-offset, -offset),
-                        (offset, offset),
-                        (-offset, offset),
-                        (offset, -offset),
-                    ] {
-                        d = d.child(
-                            div()
+                    // EXPERIMENT: both white fill and black stroke come from one
+                    // Cosmic Text alpha mask, avoiding GPUI/Cosmic glyph mismatch.
+                    let scale = outline_scale;
+                    let (bitmap, row_height) = &outline_bitmaps[index];
+                    if let Some((image, image_w, image_h)) = bitmap {
+                        let logical_w = *image_w as f32 / scale;
+                        let logical_h = *image_h as f32 / scale;
+                        let pad = outline_pad;
+                        let image = image.clone();
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(*row_height))
+                            .child(
+                                canvas(
+                                    |bounds, _, _| bounds,
+                                    move |bounds, _, window, _| {
+                                        let x = bounds.origin.x + px((f32::from(bounds.size.width) - logical_w) * 0.5);
+                                        let y = bounds.origin.y - px(pad);
+                                        let target = Bounds::new(point(x, y), size(px(logical_w), px(logical_h)));
+                                        let _ = window.paint_image(target, Corners::default(), image.clone(), 0, false);
+                                    },
+                                )
                                 .absolute()
-                                .left(px(dx))
-                                .top(px(dy))
-                                .w_full()
-                                .text_color(rgba(0x000000e6))
-                                .child(line.clone()),
-                        );
+                                .size_full(),
+                            )
+                            .into_any_element()
+                    } else {
+                        // Retain native rendering as a fallback if bitmap creation fails.
+                        // Keep stroke and fill in GPUI, so both use the exact same
+                        // resolved font face and weight (including fallback rules).
+                        let offset = (font / 16.0).max(1.2);
+                        // Unlike Box, Outline has no extra per-row vertical
+                        // padding. Natural line height keeps consecutive lines compact.
+                        let mut d = div().relative().w_full().h(px(line_height)).text_center();
+                        for (dx, dy) in [
+                            (-offset, 0.0),
+                            (offset, 0.0),
+                            (0.0, -offset),
+                            (0.0, offset),
+                            (-offset, -offset),
+                            (offset, offset),
+                            (-offset, offset),
+                            (offset, -offset),
+                        ] {
+                            d = d.child(
+                                div()
+                                    .absolute()
+                                    .left(px(dx))
+                                    .top(px(dy))
+                                    .w_full()
+                                    .text_color(rgba(0x000000e6))
+                                    .child(line.clone()),
+                            );
+                        }
+                        d.child(div().absolute().top_0().w_full().text_color(gpui::white()).child(line))
+                            .into_any_element()
                     }
-                    d.child(div().absolute().top_0().w_full().text_color(gpui::white()).child(line)).into_any_element()
                 }
             };
             col = col.child(el);

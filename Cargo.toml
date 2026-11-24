@@ -20,6 +20,7 @@ default = []
 static-ffmpeg = ["ffmpeg-sys-next/static"]
 
 [dependencies]
+cosmic-text = "=0.14.2"
 fontdb = { version = "0.16", default-features = false, features = ["std", "fs"] }
 ttf-parser = "0.20" # Read variable font wght axes (already a transitive dependency)
 gpui = "0.2.2"
