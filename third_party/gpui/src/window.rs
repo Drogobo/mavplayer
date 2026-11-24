@@ -4125,6 +4125,15 @@ impl Window {
         self.platform_window.set_visible(visible);
     }
 
+    /// MavPlayer patch: like `activate_window`, with an XDG activation token
+    /// from another client (a tray host passes one with a click). Wayland
+    /// compositors refuse to focus a window on a request of its own when
+    /// the user's click was elsewhere. A window being shown again is
+    /// activated once it is mapped.
+    pub fn activate_window_with_token(&self, token: &str) {
+        self.platform_window.activate_with_token(token);
+    }
+
     /// Toggle full screen status on the current window at the platform level.
     pub fn toggle_fullscreen(&self) {
         self.platform_window.toggle_fullscreen();

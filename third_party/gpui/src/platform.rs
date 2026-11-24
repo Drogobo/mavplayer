@@ -487,6 +487,12 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// MavPlayer patch: hides the window from the desktop (it goes on
     /// existing, without a taskbar entry) or shows it again.
     fn set_visible(&self, _visible: bool) {}
+    /// MavPlayer patch: brings the window to the front with an activation
+    /// token another client (a tray host) handed us. Wayland only; elsewhere
+    /// it is `activate`.
+    fn activate_with_token(&self, _token: &str) {
+        self.activate()
+    }
     fn zoom(&self);
     fn toggle_fullscreen(&self);
     fn is_fullscreen(&self) -> bool;

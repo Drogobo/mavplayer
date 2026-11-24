@@ -314,6 +314,9 @@ struct State {
     expect_hop: bool,
     data_since_hop: bool,
     seg_title: Option<i32>,
+    /// Playing just this title (`dvd://N`): leaving it ends playback,
+    /// rather than following the disc's program to its menus.
+    only_title: Option<i32>,
     title: i32,
     part: i32,
     /// The streams the disc's program selected (physical numbers; for
@@ -342,6 +345,8 @@ pub struct Nav {
     pub overlay: Arc<Overlay>,
     disc_title: Option<String>,
     titles: u32,
+    /// See [`State::only_title`].
+    pub only: Option<u32>,
 }
 
 fn err(dvd: *mut sys::dvdnav_t) -> String {
@@ -368,7 +373,7 @@ fn lang_code(v: u16) -> Option<String> {
 }
 
 impl Nav {
-    pub fn open(path: &str, cfg: &EngineConfig) -> anyhow::Result<Nav> {
+    pub fn open(path: &str, cfg: &EngineConfig, only: Option<u32>) -> anyhow::Result<Nav> {
         let mut dvd: *mut sys::dvdnav_t = ptr::null_mut();
         let c = av::cstr(path);
         if unsafe { sys::dvdnav_open(&mut dvd, c.as_ptr()) } != sys::OK || dvd.is_null() {
@@ -417,6 +422,7 @@ impl Nav {
                 expect_hop: false,
                 data_since_hop: false,
                 seg_title: None,
+                only_title: only.map(|t| t as i32),
                 title: 0,
                 part: 0,
                 vm_audio: -1,
@@ -430,6 +436,7 @@ impl Nav {
             overlay: Arc::new(Overlay::default()),
             disc_title,
             titles: n.max(0) as u32,
+            only,
         })
     }
 
@@ -619,12 +626,20 @@ impl State {
                 if std::mem::take(&mut self.expect_hop) || self.priming {
                     return None;
                 }
+                if self.left_title() {
+                    // The title's end (its post commands jumped elsewhere):
+                    // what is buffered still plays.
+                    return Some(Pending::Stop);
+                }
                 self.data_since_hop = false;
                 Some(Pending::Hop)
             }
             sys::VTS_CHANGE => {
                 if self.priming {
                     return None;
+                }
+                if self.left_title() {
+                    return Some(Pending::Stop);
                 }
                 Some(Pending::SegmentEnd { immediate: !self.data_since_hop })
             }
@@ -635,6 +650,9 @@ impl State {
                 self.title = t;
                 self.part = p;
                 self.nav_changed = true;
+                if !self.priming && self.left_title() {
+                    return Some(Pending::Stop);
+                }
                 if in_title && !self.priming {
                     match self.seg_title {
                         Some(st) if st != t => {
@@ -670,6 +688,17 @@ impl State {
             }
             sys::STOP => Some(Pending::Stop),
             _ => None,
+        }
+    }
+
+    /// Playing a single title, and the navigator has gone somewhere else.
+    fn left_title(&self) -> bool {
+        let Some(only) = self.only_title else { return false };
+        let (mut t, mut p) = (0, 0);
+        unsafe {
+            sys::dvdnav_is_domain_vts(self.dvd) == 0
+                || sys::dvdnav_current_title_info(self.dvd, &mut t, &mut p) != sys::OK
+                || t != only
         }
     }
 
@@ -791,10 +820,24 @@ impl Nav {
 
     fn restart(&self) {
         let mut g = self.st.lock();
-        unsafe { sys::dvdnav_reset(g.dvd) };
+        match g.only_title {
+            Some(t) => unsafe {
+                sys::dvdnav_title_play(g.dvd, t);
+            },
+            None => unsafe {
+                sys::dvdnav_reset(g.dvd);
+            },
+        }
         g.stash.clear();
         g.pending = None;
         g.rebase = true;
+    }
+
+    fn set_angle(&self, angle: u32) {
+        let g = self.st.lock();
+        if unsafe { sys::dvdnav_angle_change(g.dvd, angle as i32) } != sys::OK {
+            log::debug!("DVD: can't switch to angle {angle}: {}", err(g.dvd));
+        }
     }
 
     /// Reads up to the first picture data of a new segment and describes it.
@@ -1078,7 +1121,7 @@ fn open_segment(ctx: &Arc<SessionCtx>, nav: &Arc<Nav>, source: &MediaSource) -> 
 
         let mut info = demux::build_media_info(&outer, source);
         info.format_name = "dvdnav".into();
-        info.format_long_name = "DVD-Video with menus".into();
+        info.format_long_name = if nav.only.is_some() { "DVD-Video" } else { "DVD-Video with menus" }.into();
         info.duration = vm.duration;
         info.start_time = 0.0;
         info.seekable = vm.domain == DvdDomain::Title && vm.duration > 0.0;
@@ -1117,10 +1160,19 @@ enum Phase {
     Still(Option<Instant>),
 }
 
-/// Plays a DVD with its menus: the demux thread of such a session.
+/// Plays a DVD with its menus, or one of its titles (`dvd://N`): the demux
+/// thread of such a session.
 pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, path: String, opts: &LoadOptions) {
     let cfg = ctx.controls.config.lock().clone();
-    let nav = match Nav::open(&path, &cfg) {
+    let (only, angle) = match &source {
+        MediaSource::Dvd { title, angle, .. } => ((*title > 0).then_some(*title), *angle),
+        _ => (None, 0),
+    };
+    let opened = Nav::open(&path, &cfg, only).and_then(|n| match only {
+        Some(t) if !n.play_title(t) => Err(anyhow::anyhow!("Could not play title {t} of the DVD")),
+        _ => Ok(n),
+    });
+    let nav = match opened {
         Ok(n) => Arc::new(n),
         Err(e) => {
             if ctx.alive() {
@@ -1133,9 +1185,15 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, path: String, opts: &LoadO
     };
     *ctx.nav.lock() = Some(nav.clone());
     *ctx.spu_overlay.lock() = Some(nav.overlay.clone());
+    if only.is_some() && angle > 1 {
+        nav.set_angle(angle);
+    }
     // A reload (hardware decoding toggled, …) goes back to the same title
     // and time rather than through the first-play program and the menus.
-    let mut resume = opts.dvd_title.filter(|t| *t > 0 && nav.play_title(*t)).map(|t| (t, opts.start_at));
+    let mut resume = match only {
+        Some(t) => Some((t, opts.start_at)),
+        None => opts.dvd_title.filter(|t| *t > 0 && nav.play_title(*t)).map(|t| (t, opts.start_at)),
+    };
     let mut first = true;
     while ctx.alive() {
         let seg = match open_segment(&ctx, &nav, &source) {
@@ -1153,17 +1211,31 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, path: String, opts: &LoadO
             .take()
             .filter(|(t, _)| seg.vm.domain == DvdDomain::Title && seg.vm.title == *t)
             .and_then(|(_, at)| at);
-        match play_segment(&ctx, &nav, seg, &cfg, first, start_at) {
+        // A single title whose own program went elsewhere before it began.
+        let outcome = if only.is_some_and(|t| seg.vm.domain != DvdDomain::Title || seg.vm.title != t) {
+            Outcome::Ended
+        } else {
+            play_segment(&ctx, &nav, seg, &cfg, first, start_at)
+        };
+        match outcome {
             Outcome::Next => first = false,
             Outcome::Aborted => break,
             Outcome::Ended => {
-                ctx.update_state(|st| st.status = Status::Ended);
-                ctx.emit(PlayerEvent::EndOfFile);
-                // Play (a seek to the start) or a menu/title command starts again.
+                // A single title in a playlist hands over to the next item
+                // (unless the audio output already did).
+                let advanced = only.is_some() && (!ctx.is_current() || super::advance(&ctx));
+                if !advanced {
+                    ctx.update_state(|st| st.status = Status::Ended);
+                    ctx.emit(PlayerEvent::EndOfFile);
+                }
+                // Play (a seek to the start) or a menu/title command starts
+                // again (a single title from its start).
                 while ctx.alive() {
-                    if ctx.seek_req.lock().take().is_some() {
+                    if let Some(req) = ctx.seek_req.lock().take() {
                         ctx.seeking.store(false, Ordering::Release);
                         nav.restart();
+                        // A single title goes to the time asked for.
+                        resume = only.map(|t| (t, Some(req.target)));
                         break;
                     }
                     if nav.poked.swap(false, Ordering::AcqRel) {
@@ -1386,7 +1458,8 @@ fn play_segment(
         st.media = Some(info.clone());
         st.selected = selected.clone();
         st.status = if paused { Status::Paused } else { Status::Playing };
-        st.dvd = Some(dvd_state.clone());
+        // A single title is played like a file: no menu controls.
+        st.dvd = nav.only.is_none().then(|| dvd_state.clone());
     });
     if first {
         log::debug!("startup: DVD navigation ready at {:.0} ms", crate::ms_since_start());
@@ -1400,6 +1473,7 @@ fn play_segment(
     let pkt = Packet::new();
     // Latest timestamps queued (video, audio), for the read-ahead limit.
     let mut queued_to = [f64::NAN; 2];
+    let mut held = HeldAudio::default();
     let mut read_errors = 0;
     loop {
         if !ctx.alive() {
@@ -1514,7 +1588,7 @@ fn play_segment(
                 ctx.wake();
             }
             let s = nav.dvd_state(domain);
-            if s != dvd_state {
+            if s != dvd_state && nav.only.is_none() {
                 dvd_state = s.clone();
                 ctx.update_state(|st| st.dvd = Some(s));
                 ctx.wake();
@@ -1532,7 +1606,7 @@ fn play_segment(
                 let r = unsafe { ff::av_read_frame(seg.inner.0, pkt.0) };
                 if r >= 0 {
                     read_errors = 0;
-                    route_packet(ctx, nav, &seg, &comps, &pkt, &mut queued_to);
+                    route_packet(ctx, nav, &seg, &comps, &pkt, &mut queued_to, &mut held);
                     update_buffering(ctx, comps.audio.is_some());
                     continue;
                 }
@@ -1573,11 +1647,15 @@ fn play_segment(
                         After::End
                     }
                 };
+                held.release(ctx, &comps, None);
                 comps.drain(ctx);
                 phase = Phase::Draining(after, Instant::now());
             }
             Phase::Draining(after, since) => {
                 update_buffering(ctx, comps.audio.is_some());
+                if nav.only.is_some() && matches!(after, After::End) {
+                    super::preload_next(ctx);
+                }
                 let poked_still = matches!(after, After::Still(_)) && nav.poked.swap(false, Ordering::AcqRel);
                 // Paused or stuck decoders: don't wait forever.
                 let since = if ctx.paused() { Instant::now() } else { since };
@@ -1635,6 +1713,49 @@ fn play_segment(
     }
 }
 
+/// The latest audio packet, queued only once the next one shows its
+/// timestamp is right. FFmpeg's parsers give a frame that ends exactly where
+/// its PES packet does the next packet's timestamp, the same as the frame
+/// after it (a 192 kbit/s AC-3 track does that every 21 frames). Taken as it
+/// is, the audio clock runs a frame ahead there, and FFmpeg's `dvdvideo`
+/// demuxer even drops such frames as duplicates, so the sound skipped and
+/// the pictures were dropped to keep up.
+#[derive(Default)]
+struct HeldAudio {
+    /// The packet, its stream and the audio queue's serial when it was read
+    /// (a flush since then makes it stale).
+    pkt: Option<(Packet, usize, i32)>,
+}
+
+impl HeldAudio {
+    /// Queues the held packet (if still current), its timestamps first
+    /// corrected from those of `next`, the packet that follows it.
+    fn release(&mut self, ctx: &SessionCtx, comps: &Components, next: Option<&Packet>) {
+        let Some((mut pkt, stream, serial)) = self.pkt.take() else { return };
+        if serial != ctx.aq.serial() || comps.audio.as_ref().map(|c| c.stream) != Some(stream) {
+            return;
+        }
+        if let Some(next) = next {
+            unsafe { fix_audio_timestamps(pkt.0, next.0) };
+        }
+        ctx.aq.put(pkt.take());
+    }
+}
+
+/// `p` doesn't start before `next`, which follows it: it really starts its
+/// own duration earlier.
+unsafe fn fix_audio_timestamps(p: *mut ff::AVPacket, next: *const ff::AVPacket) {
+    unsafe {
+        let (pts, npts, dur) = ((*p).pts, (*next).pts, (*p).duration);
+        if pts != av::NOPTS && npts != av::NOPTS && dur > 0 && pts >= npts {
+            (*p).pts = npts - dur;
+            if (*p).dts != av::NOPTS {
+                (*p).dts = (*p).pts;
+            }
+        }
+    }
+}
+
 /// Queues a demuxed packet for its decoder, on the segment's timeline.
 fn route_packet(
     ctx: &SessionCtx,
@@ -1643,6 +1764,7 @@ fn route_packet(
     comps: &Components,
     pkt: &Packet,
     queued_to: &mut [f64; 2],
+    held: &mut HeldAudio,
 ) {
     unsafe {
         let p = pkt.0;
@@ -1676,7 +1798,8 @@ fn route_packet(
             if t.is_finite() {
                 queued_to[1] = t;
             }
-            ctx.aq.put(pkt.take());
+            held.release(ctx, comps, Some(&pkt));
+            held.pkt = Some((pkt, oi, ctx.aq.serial()));
         } else if comps.sub.as_ref().is_some_and(|c| c.stream == oi) {
             ctx.sq.put(pkt.take());
         }
@@ -1718,5 +1841,29 @@ mod tests {
         assert_eq!(iso639_1("French").as_deref(), Some("fr"));
         assert_eq!(lang_code(u16::from_be_bytes(*b"FR")).as_deref(), Some("fr"));
         assert_eq!(lang_code(0xffff), None);
+    }
+
+    #[test]
+    fn audio_frame_with_the_next_ones_timestamp_is_moved_back() {
+        let ts = |p: &Packet| unsafe { ((*p.0).pts, (*p.0).dts) };
+        let make = |pts: i64, dur: i64| {
+            let p = Packet::new();
+            unsafe {
+                ((*p.0).pts, (*p.0).dts, (*p.0).duration) = (pts, pts, dur);
+            }
+            p
+        };
+        // As FFmpeg's parser stamps them: 12375 got 15255, the next frame's.
+        let (a, b) = (make(15255, 2880), make(15255, 2880));
+        unsafe { fix_audio_timestamps(a.0, b.0) };
+        assert_eq!(ts(&a), (12375, 12375));
+        // In order: left alone.
+        let (a, b) = (make(9495, 2880), make(12375, 2880));
+        unsafe { fix_audio_timestamps(a.0, b.0) };
+        assert_eq!(ts(&a), (9495, 9495));
+        // Nothing to go by.
+        let (a, b) = (make(15255, 0), make(15255, 2880));
+        unsafe { fix_audio_timestamps(a.0, b.0) };
+        assert_eq!(ts(&a), (15255, 15255));
     }
 }

@@ -65,6 +65,23 @@ impl TrayState {
 
 type Handler = Arc<dyn Fn(TrayEvent) + Send + Sync>;
 
+/// The XDG activation token the tray host sent with the latest click, and
+/// when. Wayland compositors only bring a window to the front for a token
+/// from the client the user clicked (the panel), not for one the window asks
+/// for itself.
+static ACTIVATION_TOKEN: parking_lot::Mutex<Option<(String, std::time::Instant)>> = parking_lot::Mutex::new(None);
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn note_activation_token(token: Option<String>) {
+    *ACTIVATION_TOKEN.lock() = token.map(|t| (t, std::time::Instant::now()));
+}
+
+/// The token of the click being handled (see `ACTIVATION_TOKEN`), if it
+/// came with one and isn't stale. Each token works once.
+pub fn take_activation_token() -> Option<String> {
+    ACTIVATION_TOKEN.lock().take().filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(5)).map(|(t, _)| t)
+}
+
 /// Removes the icon when dropped.
 pub struct Tray {
     inner: imp::Tray,
@@ -138,6 +155,7 @@ mod imp {
         }
 
         fn activate(&mut self, _x: i32, _y: i32) {
+            super::note_activation_token(ksni::current_xdg_activation_token());
             (self.on_event)(TrayEvent::Activate);
         }
 
@@ -148,7 +166,10 @@ mod imp {
                     label: label.into(),
                     icon_name: icon.into(),
                     enabled,
-                    activate: Box::new(move |t: &mut Item| (t.on_event)(ev)),
+                    activate: Box::new(move |t: &mut Item| {
+                        super::note_activation_token(ksni::current_xdg_activation_token());
+                        (t.on_event)(ev)
+                    }),
                     ..Default::default()
                 }
                 .into()

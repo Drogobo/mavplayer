@@ -421,8 +421,10 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
         MediaSource::Dvd { path, .. } => super::disc::hold(path),
         _ => None,
     };
+    // With libdvdnav, single titles go through the navigator too: FFmpeg's
+    // `dvdvideo` demuxer drops audio frames (see `nav::HeldAudio`).
     #[cfg(has_dvdnav)]
-    if let MediaSource::Dvd { path, title: 0, .. } = &source {
+    if let MediaSource::Dvd { path, .. } = &source {
         let path = path.clone();
         return super::nav::run(ctx, source, path, &opts);
     }

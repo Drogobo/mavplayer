@@ -22,6 +22,15 @@ must stay open, only unshown.
 - Windows: `ShowWindowAsync` with `SW_HIDE` / `SW_SHOW`.
 - macOS: `orderOut:` / `makeKeyAndOrderFront:`.
 
+It also adds `Window::activate_window_with_token(&str)`
+(`PlatformWindow::activate_with_token`, `activate` by default). A tray host
+hands its item an XDG activation token with each click; GPUI's own
+`activate_window` asks for one with the window's last input serial, which
+KWin refuses when the click was on the panel, so a window shown from the tray
+could come up behind others. On Wayland the token is used with
+`xdg_activation_v1.activate`; a window that is hidden or not yet configured
+keeps it and is activated right after its first frame once mapped.
+
 Besides that, two float literals in `src/taffy.rs` are typed `f32` (a
 future-incompatibility warning that path dependencies show). Nothing else is
 changed.

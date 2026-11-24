@@ -119,6 +119,8 @@ pub struct WaylandWindowState {
     title: Option<String>,
     min_size: Option<Size<Pixels>>,
     hidden: bool,
+    /// An activation token to use once the window is mapped again.
+    activation_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -197,6 +199,7 @@ impl WaylandWindowState {
             title: None,
             min_size: options.window_min_size,
             hidden: false,
+            activation_token: None,
         })
     }
 
@@ -448,6 +451,16 @@ impl WaylandWindowStatePtr {
                 state.acknowledged_first_configure = true;
                 drop(state);
                 self.frame();
+                // MavPlayer patch: mapped again (`set_visible`); now it can
+                // be activated with the token it was given meanwhile.
+                let state = self.state.borrow_mut();
+                if let (Some(token), Some(activation)) =
+                    (state.activation_token.clone(), state.globals.activation.as_ref())
+                {
+                    activation.activate(token, &state.surface);
+                }
+                drop(state);
+                self.state.borrow_mut().activation_token = None;
             }
         }
     }
@@ -938,6 +951,17 @@ impl PlatformWindow for WaylandWindow {
             token.set_serial(serial, &state.globals.seat);
             token.set_surface(&state.surface);
             token.commit();
+        }
+    }
+
+    fn activate_with_token(&self, token: &str) {
+        let mut state = self.borrow_mut();
+        if state.hidden || !state.acknowledged_first_configure {
+            state.activation_token = Some(token.to_owned());
+            return;
+        }
+        if let Some(activation) = &state.globals.activation {
+            activation.activate(token.to_owned(), &state.surface);
         }
     }
 

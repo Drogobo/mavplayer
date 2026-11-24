@@ -220,6 +220,8 @@ pub struct PlayerView {
     video_hidden: bool,
     /// The window is hidden in the tray ("Play in the background").
     pub hidden_to_tray: bool,
+    /// When the window last lost the focus (see `in_front`).
+    deactivated_at: Option<Instant>,
     _subs: Vec<Subscription>,
 }
 
@@ -360,6 +362,11 @@ impl PlayerView {
             let ks = ev.keystroke.clone();
             me.update(cx, |v, cx| v.capture_keystroke(&ks, cx));
         }));
+        subs.push(cx.observe_window_activation(window, |v, window, _| {
+            if !window.is_window_active() {
+                v.deactivated_at = Some(Instant::now());
+            }
+        }));
         subs.push(cx.observe_window_appearance(window, |v, window, cx| {
             v.theme = Theme::resolve(v.settings.theme, window);
             cx.notify();
@@ -476,6 +483,7 @@ impl PlayerView {
             last_render: Instant::now(),
             video_hidden: false,
             hidden_to_tray: false,
+            deactivated_at: None,
             settings,
             _subs: subs,
         };
@@ -1955,6 +1963,13 @@ impl PlayerView {
 
     /// Brings the window back from the tray (if hidden) and to the front.
     pub fn show_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_window_with(None, window, cx);
+    }
+
+    /// `show_window`, with the activation token of the click that asked for
+    /// it (from the tray host), without which a Wayland compositor may leave
+    /// the window behind the one in front.
+    fn show_window_with(&mut self, token: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         if self.hidden_to_tray {
             self.hidden_to_tray = false;
             window.set_window_visible(true);
@@ -1964,18 +1979,31 @@ impl PlayerView {
             self.fit_window_if_needed(window, cx);
             cx.notify();
         }
-        window.activate_window();
+        match token {
+            Some(t) => window.activate_window_with_token(&t),
+            None => window.activate_window(),
+        }
+    }
+
+    /// The window is the one in front, as far as a click on the tray icon
+    /// goes. A panel may take the keyboard focus as the icon is pressed
+    /// (Plasma on Wayland does), before the click reaches us: a window that
+    /// had it a moment ago counts too.
+    fn in_front(&self, window: &Window) -> bool {
+        window.is_window_active() || self.deactivated_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1))
     }
 
     /// A click on the tray icon or its menu.
     pub fn on_tray(&mut self, ev: TrayEvent, window: &mut Window, cx: &mut Context<Self>) {
         use souvlaki::MediaControlEvent as Event;
+        // Taken whatever the click does: a token works only once, and soon.
+        let token = super::tray::take_activation_token();
         match ev {
             // The icon toggles a window that is in front.
-            TrayEvent::Activate if !self.hidden_to_tray && window.is_window_active() && self.can_hide_to_tray(cx) => {
+            TrayEvent::Activate if !self.hidden_to_tray && self.in_front(window) && self.can_hide_to_tray(cx) => {
                 self.hide_to_tray(window, cx)
             }
-            TrayEvent::Activate | TrayEvent::Show => self.show_window(window, cx),
+            TrayEvent::Activate | TrayEvent::Show => self.show_window_with(token, window, cx),
             TrayEvent::Hide => self.hide_to_tray(window, cx),
             TrayEvent::PlayPause => self.on_media_event(Event::Toggle, window, cx),
             TrayEvent::Previous => self.on_media_event(Event::Previous, window, cx),
