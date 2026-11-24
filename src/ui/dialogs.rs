@@ -11,8 +11,8 @@ use crate::engine::{
 use crate::icons::Icon;
 use crate::playlist;
 use crate::settings::{
-    BarControl, DEFAULT_SUB_FONT_FAMILY, IconTheme, OpenMode, RunningMode, ScrollAction, SeekDragMode, SubPosition,
-    SubStyle, ThemeMode,
+    BUNDLED_SUB_FONT_FAMILY, BarControl, DEFAULT_SUB_FONT_FAMILY, IconTheme, OpenMode, RunningMode, ScrollAction,
+    SeekDragMode, SubPosition, SubStyle, ThemeMode,
 };
 use gpui::{
     AnyElement, ClickEvent, Context, Focusable, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, Resource,
@@ -976,8 +976,8 @@ impl PlayerView {
                             .text_size(px(12.))
                             .text_color(t.text_dim)
                             .child(format!(
-                                "Subtitle font: {} · © 2022 The Noto Project Authors ·",
-                                DEFAULT_SUB_FONT_FAMILY
+                                "Bundled subtitle font: {} · © 2020 The Open Sans Project Authors ·",
+                                BUNDLED_SUB_FONT_FAMILY
                             ))
                             .child(
                                 div()
@@ -1016,7 +1016,7 @@ impl PlayerView {
                     )
                     .into_any_element();
                 self.modal(
-                    &format!("{DEFAULT_SUB_FONT_FAMILY} — SIL Open Font License 1.1"),
+                    &format!("{BUNDLED_SUB_FONT_FAMILY} — SIL Open Font License 1.1"),
                     650.,
                     body.into_any_element(),
                     Some(back),
@@ -1829,21 +1829,26 @@ impl PlayerView {
                                 Some((
                                     match source {
                                         super::render::DefaultFontSource::System => {
-                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY} (system font)")
+                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY}")
                                         }
                                         super::render::DefaultFontSource::Bundled => {
-                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY} (bundled font)")
+                                            format!("Default: {DEFAULT_SUB_FONT_FAMILY} (using bundled {BUNDLED_SUB_FONT_FAMILY})")
                                         }
                                         super::render::DefaultFontSource::Unavailable => {
                                             format!("Default: {DEFAULT_SUB_FONT_FAMILY} (font unavailable)")
                                         }
                                     },
-                                    source == super::render::DefaultFontSource::Unavailable,
+                                    source != super::render::DefaultFontSource::System,
                                 ))
-                            } else if super::render::installed_subtitle_font(candidate, cx) {
-                                None
+                            } else if super::render::subtitle_available_weights(candidate).is_empty() {
+                                let replacement = if super::render::subtitle_available_weights("").is_empty() {
+                                    format!("bundled {BUNDLED_SUB_FONT_FAMILY}")
+                                } else {
+                                    DEFAULT_SUB_FONT_FAMILY.to_owned()
+                                };
+                                Some((format!("Font not available (using {replacement})"), true))
                             } else {
-                                Some(("Font not available".to_owned(), true))
+                                None
                             };
                             div()
                                 .flex()
@@ -1916,7 +1921,7 @@ impl PlayerView {
                     ))
                     .child(self.row(
                         "Subtitle position",
-                        Some("Automatic uses the black bar when possible; distance is always a percentage of video height"),
+                        Some("Automatic uses the black bar when possible"),
                         self.choice(
                             "subposition",
                             vec![

@@ -7,8 +7,16 @@ use crate::engine::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Default text subtitle font (also the fallback family).
+/// Platform-specific first choice for subtitles (not bundled).
+#[cfg(target_os = "windows")]
+pub const DEFAULT_SUB_FONT_FAMILY: &str = "Calibri";
+#[cfg(target_os = "macos")]
+pub const DEFAULT_SUB_FONT_FAMILY: &str = "Helvetica Neue";
+#[cfg(target_os = "linux")]
 pub const DEFAULT_SUB_FONT_FAMILY: &str = "Noto Sans";
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+pub const DEFAULT_SUB_FONT_FAMILY: &str = "Open Sans";
+pub const BUNDLED_SUB_FONT_FAMILY: &str = "Open Sans";
 pub const DEFAULT_SUB_FONT_WEIGHT: u16 = 400;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -318,7 +326,7 @@ impl Default for Settings {
             sub_margin: 0.05,
             sub_position: SubPosition::Automatic,
             sub_style: SubStyle::Outline,
-            sub_font_family: DEFAULT_SUB_FONT_FAMILY.into(),
+            sub_font_family: String::new(),
             sub_font_weight: DEFAULT_SUB_FONT_WEIGHT,
             sub_charset: String::new(),
             network_cache_secs: 10.0,
