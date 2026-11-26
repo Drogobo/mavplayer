@@ -47,6 +47,14 @@
     <control>keyboard</control>
   </supports>
   <releases>
+    <release version="0.4.0" date="2026-11-26">
+      <description>
+        <p>Timeline visualizations: a filmstrip of thumbnails, the audio waveform, colour barcodes and other views of the video along the seek bar, set separately for the window and fullscreen, with a preview above the cursor while hovering.</p>
+        <p>Playlist thumbnails and waveforms with scrubbing previews, filtering, multi-selection, dragging several items at once and chapter thumbnails. Thumbnails and waveforms are cached on disk, with a size and age limit.</p>
+        <p>Subtitle font choice, and outlined subtitles drawn with proper word wrapping.</p>
+        <p>Lower CPU use: thumbnails are generated about three times faster, and an idle window wakes the CPU about 30 times a second instead of about 270. Opening a small video no longer shrinks the window.</p>
+      </description>
+    </release>
     <release version="0.3.3" date="2026-11-22">
       <description>
         <p>Play in the background: closing the window while a file is open hides it in the tray and playback goes on, with Play/Pause, Previous and Next in the tray icon's menu.</p>

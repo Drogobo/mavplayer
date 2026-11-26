@@ -2,7 +2,7 @@
 
 use super::player::PlayerView;
 use super::theme::Theme;
-use super::widgets::{icon, scrollbar, scrollbar_dragging};
+use super::widgets::{icon, scrollbar_dragging, scrollbar_with_tolerance};
 use crate::icons::Icon;
 use gpui::{
     AnyElement, Bounds, Context, Corner, MouseButton, Pixels, Point, ScrollHandle, SharedString, Window, anchored,
@@ -23,6 +23,7 @@ pub enum MenuItem {
         enabled: bool,
         icon: Option<Icon>,
         run: MenuFn,
+        thumbnail: Option<(std::sync::Arc<gpui::RenderImage>, u32, u32)>,
     },
     Submenu {
         label: SharedString,
@@ -47,7 +48,14 @@ impl MenuItem {
             enabled: true,
             icon: None,
             run: Rc::new(run),
+            thumbnail: None,
         }
+    }
+    pub(super) fn thumbnail(mut self, preview: &super::thumbnails::Preview) -> Self {
+        if let MenuItem::Action { thumbnail, .. } = &mut self {
+            *thumbnail = Some((preview.image.clone(), preview.width, preview.height));
+        }
+        self
     }
     pub fn submenu(label: impl Into<SharedString>, items: Vec<MenuItem>) -> Self {
         let enabled = !items.is_empty();
@@ -91,6 +99,7 @@ impl MenuItem {
 }
 
 pub struct OpenMenu {
+    pub(super) timeline_settings: bool,
     pub items: Vec<MenuItem>,
     pub pos: Point<Pixels>,
     /// Which submenu is open at each nesting level.
@@ -107,7 +116,7 @@ pub struct OpenMenu {
 }
 
 impl OpenMenu {
-    fn scroll(&self, level: usize) -> ScrollHandle {
+    pub(super) fn scroll(&self, level: usize) -> ScrollHandle {
         let path: Vec<usize> = self.open_path.iter().take(level).copied().collect();
         let mut s = self.scrolls.borrow_mut();
         if s.len() <= level {
@@ -132,6 +141,7 @@ impl PlayerView {
         cx: &mut Context<Self>,
     ) {
         self.menu = Some(OpenMenu {
+            timeline_settings: false,
             items,
             pos,
             open_path: vec![],
@@ -144,7 +154,13 @@ impl PlayerView {
     }
 
     pub fn close_menu(&mut self, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
+        if let Some(menu) = self.menu.take() {
+            if menu.timeline_settings {
+                self.settings.save();
+                self.drag = None;
+            }
+            self.playlist_previews.resume_hover();
+            self.note_activity(cx);
             cx.notify();
         }
     }
@@ -154,7 +170,7 @@ impl PlayerView {
         let theme = self.theme;
         let win_w = window.viewport_size().width;
         // Taller menus scroll rather than run off a short window.
-        let max_h = (window.viewport_size().height - px(16.)).clamp(px(120.), px(560.));
+        let max_h = (window.viewport_size().height - px(16.)).clamp(px(120.), px(563.));
         let open_left = menu.pos.x + px(MENU_W * 2.0) > win_w;
         // The backdrop takes every click and hover outside the menu, so
         // nothing behind it reacts. A menu-bar menu leaves the menu bar
@@ -168,29 +184,52 @@ impl PlayerView {
                 .occlude()
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                        this.playlist_previews.pointer = Some(ev.position);
                         this.close_menu(cx);
                         cx.stop_propagation();
                     }),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, _, _, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                        this.playlist_previews.pointer = Some(ev.position);
                         this.close_menu(cx);
                         cx.stop_propagation();
                     }),
                 )
                 .on_mouse_down(
                     MouseButton::Middle,
-                    cx.listener(|this, _, _, cx| {
+                    cx.listener(|this, ev: &gpui::MouseDownEvent, _, cx| {
+                        this.playlist_previews.pointer = Some(ev.position);
                         this.close_menu(cx);
                         cx.stop_propagation();
                     }),
                 )
                 .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                .when(menu.timeline_settings, |d| {
+                    d.on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                        if this.handle_drag_move(ev, window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.drag.is_some() {
+                                this.end_drag(window, cx);
+                                cx.stop_propagation();
+                            }
+                        }),
+                    )
+                })
         };
         let bar = self.menubar_bounds.get();
-        let mut layer = div().absolute().top_0().left_0().size_full();
+        let mut layer = div().absolute().top_0().left_0().size_full().on_mouse_move(cx.listener(
+            |this, ev: &gpui::MouseMoveEvent, _, _| {
+                this.playlist_previews.pointer = Some(ev.position);
+            },
+        ));
         layer = if menu.menubar_index.is_some() && bar.size.height > px(0.) {
             layer
                 .child(backdrop("menu-backdrop-top").top_0().h(bar.top()))
@@ -198,6 +237,25 @@ impl PlayerView {
         } else {
             layer.child(backdrop("menu-backdrop").top_0().bottom_0())
         };
+        if menu.timeline_settings {
+            layer = layer
+                .on_mouse_move(cx.listener(|this, ev: &gpui::MouseMoveEvent, window, cx| {
+                    if this.handle_drag_move(ev, window, cx) {
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        if this.drag.is_some() {
+                            this.end_drag(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }),
+                )
+                .child(self.timeline_settings_panel(menu, window, cx));
+            return Some(deferred(layer).with_priority(10).into_any_element());
+        }
         layer = layer.child(anchored().position(menu.pos).snap_to_window_with_margin(px(4.)).child(self.menu_panel(
             &menu.items,
             0,
@@ -291,13 +349,13 @@ impl PlayerView {
                     .text_color(theme.text_dim)
                     .child(t.clone())
                     .into_any_element(),
-                MenuItem::Action { label, shortcut, checked, radio, enabled, icon: ic, run } => {
+                MenuItem::Action { label, shortcut, checked, radio, enabled, icon: ic, run, thumbnail } => {
                     let run = run.clone();
                     let enabled = *enabled;
                     let color = if enabled { theme.text } else { theme.text_disabled };
                     let lead: AnyElement = match (checked, ic) {
                         (Some(true), _) if *radio => div()
-                            .size(px(16.))
+                            .size(px(14.))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -310,7 +368,7 @@ impl PlayerView {
                     let pp = path_prefix.clone();
                     div()
                         .id(SharedString::from(format!("mi-{level}-{i}")))
-                        .h(px(ITEM_H))
+                        .h(px(if thumbnail.is_some() { 56.0 } else { ITEM_H }))
                         .flex_none()
                         .mx_1()
                         .px_2()
@@ -320,7 +378,14 @@ impl PlayerView {
                         .rounded(px(5.))
                         .text_color(color)
                         .when(enabled, |d| d.hover(|s| s.bg(theme.accent).text_color(theme.on_accent)))
-                        .when(has_checks, |d| d.child(lead))
+                        // Every lead (radio dot, check, icon or blank) takes the same
+                        // fixed slot, so the labels line up.
+                        .when(has_checks, |d| {
+                            d.child(div().size(px(14.)).flex_none().flex().items_center().justify_center().child(lead))
+                        })
+                        .when_some(thumbnail.clone(), |d, (image, width, height)| {
+                            d.child(super::thumbnails::Preview { time: 0.0, image, width, height }.element(88., 50.))
+                        })
                         .child(div().flex_1().truncate().child(label.clone()))
                         .when_some(shortcut.clone(), |d, sc| d.child(div().text_size(px(11.)).opacity(0.65).child(sc)))
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -334,9 +399,11 @@ impl PlayerView {
                             }
                         }))
                         .when(enabled, |d| {
-                            d.on_click(cx.listener(move |this, _, window, cx| {
-                                this.menu = None;
+                            d.on_click(cx.listener(move |this, ev: &gpui::ClickEvent, window, cx| {
+                                this.playlist_previews.pointer = Some(ev.position());
+                                this.close_menu(cx);
                                 run(this, window, cx);
+                                this.note_activity(cx);
                                 cx.notify();
                             }))
                         })
@@ -417,7 +484,12 @@ impl PlayerView {
             };
             panel = panel.child(el);
         }
-        frame.child(panel).child(scrollbar(format!("menu-bar-{level}"), &scroll, theme)).into_any_element()
+        // Fractional display scaling can leave a tiny apparent overflow even
+        // when the menu content fits. Keep the normal tolerance in other UI.
+        frame
+            .child(panel)
+            .child(scrollbar_with_tolerance(format!("menu-bar-{level}"), &scroll, theme, px(3.)))
+            .into_any_element()
     }
 }
 

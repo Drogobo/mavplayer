@@ -63,15 +63,22 @@ impl PlayerView {
             M::Separator,
         ];
         if menubar {
+            let start = v.len();
             if let Some(d) = disc {
                 v.push(M::submenu("Disc", d).icon(Icon::Disc));
             }
+            // Only offer a track submenu that holds a choice: two audio
+            // tracks, or one subtitle track (against Off).
+            if playing && self.track_count(TrackKind::Audio) > 1 {
+                v.push(M::submenu("Audio Track", self.track_items(TrackKind::Audio, false)).icon(Icon::Audio));
+            }
+            if playing && self.track_count(TrackKind::Subtitle) > 0 {
+                v.push(M::submenu("Subtitles", self.track_items(TrackKind::Subtitle, true)).icon(Icon::Subtitles));
+            }
+            if v.len() > start {
+                v.push(M::Separator);
+            }
             v.extend([
-                M::submenu("Audio Track", self.track_items(TrackKind::Audio, false)).icon(Icon::Audio).enabled(playing),
-                M::submenu("Subtitles", self.track_items(TrackKind::Subtitle, true))
-                    .icon(Icon::Subtitles)
-                    .enabled(playing),
-                M::Separator,
                 act("Fullscreen", ToggleFullscreen).icon(Icon::Fullscreen),
                 act("Media Information", ShowMediaInfo).icon(Icon::Info).enabled(playing),
             ]);
@@ -191,10 +198,15 @@ impl PlayerView {
                     .map(|c| {
                         let start = c.start;
                         let cur = pos >= c.start && pos < c.end;
-                        M::action(format!("{}  ({})", c.title, format_time(c.start)), move |this, _, _| {
+                        let item = M::action(format!("{}  ({})", c.title, format_time(c.start)), move |this, _, _| {
                             this.player.seek(start, false, true)
                         })
-                        .selected(cur)
+                        .selected(cur);
+                        if let Some(preview) = self.thumbnails.for_chapter(&st, &self.settings, c.start, c.end) {
+                            item.thumbnail(preview)
+                        } else {
+                            item
+                        }
                     })
                     .collect()
             })
@@ -260,6 +272,13 @@ impl PlayerView {
             act("Previous Frame", FrameBackStep).enabled(active),
         ]);
         v
+    }
+
+    /// How many tracks of `kind` the current media has, cover art aside.
+    fn track_count(&self, kind: TrackKind) -> usize {
+        self.player
+            .with_state(|s| s.media.as_ref().map(|m| m.tracks_of(kind).filter(|t| !t.is_cover_art).count()))
+            .unwrap_or(0)
     }
 
     fn track_items(&self, kind: TrackKind, with_off: bool) -> Vec<M> {
@@ -474,7 +493,7 @@ impl PlayerView {
             }
         }
         items.push(M::Separator);
-        items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(2), w, cx)));
+        items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(3), w, cx)));
         items
     }
 

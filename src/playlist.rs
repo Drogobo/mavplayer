@@ -1,6 +1,8 @@
 //! The play queue: ordering, shuffle/repeat, folder expansion and
 //! M3U / PLS import & export.
 
+pub(crate) mod session;
+
 use crate::engine::MediaSource;
 use crate::engine::disc;
 use crate::settings::RepeatMode;
@@ -32,6 +34,9 @@ pub struct PlaylistItem {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub duration: Option<f64>,
+    pub video_stream: Option<usize>,
+    pub audio_stream: Option<usize>,
+    pub has_subtitles: bool,
     pub probed: bool,
     pub failed: bool,
 }
@@ -42,6 +47,97 @@ impl PlaylistItem {
             (Some(t), Some(a)) => format!("{a} – {t}"),
             (Some(t), None) => t.clone(),
             _ => self.source.display_name(),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Selection {
+    ids: HashSet<u64>,
+    anchor: Option<u64>,
+    lead: Option<u64>,
+}
+
+impl Selection {
+    pub fn clear(&mut self) {
+        self.ids.clear();
+        self.anchor = None;
+        self.lead = None;
+    }
+    pub fn lead(&self) -> Option<u64> {
+        self.lead
+    }
+    pub fn contains(&self, id: u64) -> bool {
+        self.ids.contains(&id)
+    }
+    pub fn ids(&self, items: &[PlaylistItem]) -> Vec<u64> {
+        items.iter().filter(|it| self.contains(it.id)).map(|it| it.id).collect()
+    }
+    pub fn single(&mut self, id: u64) {
+        self.ids.clear();
+        self.ids.insert(id);
+        self.anchor = Some(id);
+        self.lead = Some(id);
+    }
+    pub fn select_if_empty(&mut self, items: &[PlaylistItem], index: usize) {
+        if !items.iter().any(|it| self.contains(it.id))
+            && let Some(it) = items.get(index)
+        {
+            self.single(it.id);
+        }
+    }
+    pub fn click(&mut self, items: &[PlaylistItem], index: usize, control: bool, shift: bool) {
+        let Some(item) = items.get(index) else {
+            return;
+        };
+        if shift {
+            let anchor = self.anchor.and_then(|id| items.iter().position(|it| it.id == id)).unwrap_or(index);
+            if !control {
+                self.ids.clear();
+            }
+            self.ids.extend(items[anchor.min(index)..=anchor.max(index)].iter().map(|it| it.id));
+            self.anchor = Some(items[anchor].id);
+        } else if control {
+            if !self.ids.remove(&item.id) {
+                self.ids.insert(item.id);
+            }
+            self.anchor = Some(item.id);
+        } else {
+            self.single(item.id);
+        }
+        self.lead = Some(item.id);
+    }
+    /// A range in a filtered playlist includes only the displayed rows.
+    pub fn click_visible(
+        &mut self,
+        items: &[PlaylistItem],
+        visible: &[usize],
+        index: usize,
+        control: bool,
+        shift: bool,
+    ) {
+        if !shift || visible.len() == items.len() {
+            self.click(items, index, control, shift);
+            return;
+        }
+        let Some(end) = visible.iter().position(|&i| i == index) else {
+            return;
+        };
+        let start = self.anchor.and_then(|id| visible.iter().position(|&i| items[i].id == id)).unwrap_or(end);
+        if !control {
+            self.ids.clear();
+        }
+        self.ids.extend(visible[start.min(end)..=start.max(end)].iter().map(|&i| items[i].id));
+        self.anchor = Some(items[visible[start]].id);
+        self.lead = Some(items[index].id);
+    }
+    pub fn remove(&mut self, ids: &HashSet<u64>) {
+        self.ids.retain(|id| !ids.contains(id));
+        if self.anchor.is_some_and(|id| ids.contains(&id)) {
+            self.anchor = None;
+        }
+        if self.lead.is_some_and(|id| ids.contains(&id)) {
+            self.lead = None;
         }
     }
 }
@@ -113,7 +209,18 @@ impl Playlist {
             .map(|s| {
                 let id = self.next_id;
                 self.next_id += 1;
-                PlaylistItem { id, source: s, title: None, artist: None, duration: None, probed: false, failed: false }
+                PlaylistItem {
+                    id,
+                    source: s,
+                    title: None,
+                    artist: None,
+                    duration: None,
+                    video_stream: None,
+                    audio_stream: None,
+                    has_subtitles: false,
+                    probed: false,
+                    failed: false,
+                }
             })
             .collect();
         let n = new.len();
@@ -163,6 +270,136 @@ impl Playlist {
         }
     }
 
+    /// Removes every item whose id is in `ids` in one pass (removing them one
+    /// by one is quadratic on long playlists). Same rules as `remove`.
+    pub fn remove_ids(&mut self, ids: &HashSet<u64>) {
+        let mut next = 0;
+        let map: Vec<Option<usize>> = self
+            .items
+            .iter()
+            .map(|it| {
+                if ids.contains(&it.id) {
+                    None
+                } else {
+                    next += 1;
+                    Some(next - 1)
+                }
+            })
+            .collect();
+        if next == self.items.len() {
+            return;
+        }
+        self.items.retain(|it| !ids.contains(&it.id));
+        self.current = self.current.and_then(|c| map.get(c).copied().flatten());
+        self.order = self.order.iter().filter_map(|&x| map.get(x).copied().flatten()).collect();
+    }
+
+    /// Puts the items in the order of `ids`, which must hold every item's id
+    /// once, keeping `current` and the shuffle order on the same items.
+    fn reorder(&mut self, ids: &[u64]) {
+        let n = self.items.len();
+        if ids.len() != n {
+            return;
+        }
+        let from: std::collections::HashMap<u64, usize> =
+            self.items.iter().enumerate().map(|(i, it)| (it.id, i)).collect();
+        let mut map = vec![usize::MAX; n];
+        for (to, id) in ids.iter().enumerate() {
+            match from.get(id) {
+                Some(&i) if map[i] == usize::MAX => map[i] = to,
+                _ => return,
+            }
+        }
+        let mut old: Vec<Option<PlaylistItem>> = std::mem::take(&mut self.items).into_iter().map(Some).collect();
+        self.items = ids.iter().filter_map(|id| old[from[id]].take()).collect();
+        self.current = self.current.map(|c| map[c]);
+        if self.shuffle {
+            for x in &mut self.order {
+                *x = map[*x];
+            }
+        } else {
+            self.order = (0..n).collect();
+        }
+    }
+
+    /// Translate the complete selection without compressing gaps between rows.
+    pub fn can_move_selected(&self, ids: &[u64], up: bool) -> bool {
+        let ids: HashSet<u64> = ids.iter().copied().collect();
+        if up {
+            self.items.iter().position(|it| ids.contains(&it.id)).is_some_and(|i| i > 0)
+        } else {
+            self.items.iter().rposition(|it| ids.contains(&it.id)).is_some_and(|i| i + 1 < self.items.len())
+        }
+    }
+
+    pub fn move_selected(&mut self, ids: &[u64], up: bool) {
+        self.translate_selected(ids, if up { -1 } else { 1 });
+    }
+
+    fn translate_selected(&mut self, ids: &[u64], delta: isize) {
+        let ids: HashSet<u64> = ids.iter().copied().collect();
+        let Some(first) = self.items.iter().position(|it| ids.contains(&it.id)) else {
+            return;
+        };
+        let last = self.items.iter().rposition(|it| ids.contains(&it.id)).unwrap();
+        let delta = delta.clamp(-(first as isize), (self.items.len() - 1 - last) as isize);
+        if delta == 0 {
+            return;
+        }
+        let mut order = vec![None; self.items.len()];
+        for (i, item) in self.items.iter().enumerate() {
+            if ids.contains(&item.id) {
+                order[(i as isize + delta) as usize] = Some(item.id);
+            }
+        }
+        let mut others = self.items.iter().filter(|it| !ids.contains(&it.id)).map(|it| it.id);
+        let order: Vec<_> = order.into_iter().map(|id| id.unwrap_or_else(|| others.next().unwrap())).collect();
+        self.reorder(&order);
+    }
+
+    /// Drop a selected group at an insertion point in the original list.
+    /// Translate the grabbed row's displacement to the leading edge of the group.
+    pub fn group_drop_gap(&self, ids: &[u64], anchor: u64, target_row: usize) -> Option<usize> {
+        let ids: HashSet<u64> = ids.iter().copied().collect();
+        let from = self.items.iter().position(|it| it.id == anchor)?;
+        let first = self.items.iter().position(|it| ids.contains(&it.id))?;
+        let last = self.items.iter().rposition(|it| ids.contains(&it.id))?;
+        let target_row = target_row.min(self.items.len().saturating_sub(1));
+        match target_row.cmp(&from) {
+            std::cmp::Ordering::Less if first > 0 => Some(first.saturating_sub(from - target_row)),
+            std::cmp::Ordering::Greater if last + 1 < self.items.len() => {
+                Some((last + 1).saturating_add(target_row - from).min(self.items.len()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn drop_selected(&mut self, ids: &[u64], at: usize) {
+        let ids_slice = ids;
+        let ids: HashSet<u64> = ids.iter().copied().collect();
+        if ids.len() > 1 {
+            let Some(first) = self.items.iter().position(|it| ids.contains(&it.id)) else {
+                return;
+            };
+            let last = self.items.iter().rposition(|it| ids.contains(&it.id)).unwrap();
+            let delta = if at < first {
+                at as isize - first as isize
+            } else if at > last + 1 {
+                (at - last - 1) as isize
+            } else {
+                0
+            };
+            self.translate_selected(ids_slice, delta);
+            return;
+        }
+        let at = at.min(self.items.len());
+        let before = self.items[..at].iter().filter(|it| !ids.contains(&it.id)).count();
+        let mut order: Vec<_> = self.items.iter().filter(|it| !ids.contains(&it.id)).map(|it| it.id).collect();
+        order.splice(before..before, self.items.iter().filter(|it| ids.contains(&it.id)).map(|it| it.id));
+        self.reorder(&order);
+    }
+
+    #[cfg(test)]
     pub fn move_item(&mut self, from: usize, to: usize) {
         if from >= self.items.len() || to >= self.items.len() || from == to {
             return;
@@ -442,6 +679,20 @@ pub fn expand_paths(paths: &[PathBuf]) -> Vec<MediaSource> {
     out
 }
 
+/// Playlist additions accept media, folders and playlist files, but not subtitles
+/// or unrelated documents. Opening a subtitle on the video remains separate.
+pub fn expand_playlist_paths(paths: &[PathBuf]) -> Vec<MediaSource> {
+    expand_paths(paths)
+        .into_iter()
+        .filter(|source| match source {
+            MediaSource::File(path) => {
+                is_media_path(path) || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("m3u8"))
+            }
+            _ => true,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +705,126 @@ mod tests {
 
     fn names(p: &Playlist) -> Vec<String> {
         p.items.iter().map(|i| i.source.display_name()).collect()
+    }
+
+    #[test]
+    fn playlist_filtered_range_tracks_lead_without_selecting_hidden_rows() {
+        let p = pl(&["a", "b", "c", "d", "e"]);
+        let visible = [0, 2, 4];
+        let mut selection = Selection::default();
+        selection.click_visible(&p.items, &visible, 0, false, false);
+        selection.click_visible(&p.items, &visible, 4, false, true);
+        assert_eq!(selection.ids(&p.items), vec![p.items[0].id, p.items[2].id, p.items[4].id]);
+        assert_eq!(selection.lead(), Some(p.items[4].id));
+        selection.click_visible(&p.items, &visible, 2, false, true);
+        assert_eq!(selection.ids(&p.items), vec![p.items[0].id, p.items[2].id]);
+        assert_eq!(selection.lead(), Some(p.items[2].id));
+        selection.remove(&HashSet::from([p.items[2].id]));
+        assert_eq!(selection.lead(), None);
+    }
+
+    #[test]
+    fn playlist_multi_selection_survives_group_move() {
+        let mut p = pl(&["a", "b", "c", "d", "e"]);
+        let mut selection = Selection::default();
+        selection.click(&p.items, 1, false, false);
+        selection.click(&p.items, 2, false, true);
+        selection.click(&p.items, 4, true, false);
+        let ids = selection.ids(&p.items);
+        assert_eq!(ids, vec![p.items[1].id, p.items[2].id, p.items[4].id]);
+        p.current = Some(2);
+        p.move_selected(&ids, true);
+        assert_eq!(names(&p), ["b", "c", "a", "e", "d"]);
+        assert_eq!(p.current, Some(1));
+        assert_eq!(selection.ids(&p.items), ids);
+        p.move_selected(&ids, false);
+        assert_eq!(names(&p), ["a", "b", "c", "d", "e"]);
+        assert_eq!(p.current, Some(2));
+        selection.click(&p.items, 1, true, false);
+        assert!(!selection.contains(p.items[1].id));
+    }
+
+    #[test]
+    fn playlist_group_drag_moves_relative_to_grabbed_row() {
+        for grabbed in 4..8 {
+            let mut p = pl(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+            p.current = Some(7);
+            let ids: Vec<_> = p.items[4..].iter().map(|it| it.id).collect();
+            let anchor = p.items[grabbed].id;
+            assert_eq!(p.group_drop_gap(&ids, anchor, grabbed), None);
+            let at = p.group_drop_gap(&ids, anchor, grabbed - 1).unwrap();
+            p.drop_selected(&ids, at);
+            assert_eq!(names(&p), ["a", "b", "c", "e", "f", "g", "h", "d"]);
+            assert_eq!(p.current, Some(6));
+            let at = p.group_drop_gap(&ids, anchor, grabbed).unwrap();
+            p.drop_selected(&ids, at);
+            assert_eq!(names(&p), ["a", "b", "c", "d", "e", "f", "g", "h"]);
+            assert_eq!(p.current, Some(7));
+        }
+    }
+
+    #[test]
+    fn removing_many_ids_matches_removing_one_by_one() {
+        for shuffle in [false, true] {
+            for current in [None, Some(0), Some(3), Some(5)] {
+                let mut a = pl(&["a", "b", "c", "d", "e", "f", "g"]);
+                a.set_shuffle(shuffle);
+                a.current = current;
+                let mut b = Playlist {
+                    items: a.items.clone(),
+                    current: a.current,
+                    repeat: a.repeat,
+                    shuffle,
+                    order: a.order.clone(),
+                    next_id: a.next_id,
+                    rng: a.rng,
+                };
+                let gone: HashSet<u64> = [1, 3, 5].iter().map(|&i| a.items[i].id).collect();
+                a.remove_ids(&gone);
+                for i in (0..b.items.len()).rev() {
+                    if gone.contains(&b.items[i].id) {
+                        b.remove(i);
+                    }
+                }
+                assert_eq!(names(&a), names(&b));
+                assert_eq!(a.current, b.current);
+                assert_eq!(a.order, b.order);
+            }
+        }
+    }
+
+    #[test]
+    fn playlist_noncontiguous_selection_preserves_gaps() {
+        let mut p = pl(&["a", "b", "c", "d", "e"]);
+        let ids = [p.items[0].id, p.items[2].id, p.items[3].id];
+        p.current = Some(3);
+        let at = p.group_drop_gap(&ids, ids[2], 4).unwrap();
+        p.drop_selected(&ids, at);
+        assert_eq!(names(&p), ["b", "a", "e", "c", "d"]);
+        assert_eq!(p.current, Some(4));
+        p.move_selected(&ids, true);
+        assert_eq!(names(&p), ["a", "b", "c", "d", "e"]);
+        assert_eq!(p.current, Some(3));
+    }
+
+    #[test]
+    fn playlist_group_drop_keeps_relative_order_and_current() {
+        let mut p = pl(&["a", "b", "c", "d", "e"]);
+        p.set_shuffle(true);
+        p.current = Some(3);
+        let ids = [p.items[1].id, p.items[3].id];
+        let play_order: Vec<_> = p.order.iter().map(|&i| p.items[i].id).collect();
+        p.drop_selected(&ids, 5);
+        assert_eq!(names(&p), ["a", "c", "b", "e", "d"]);
+        assert_eq!(p.current, Some(4));
+        assert_eq!(p.order.iter().map(|&i| p.items[i].id).collect::<Vec<_>>(), play_order);
+    }
+
+    #[test]
+    fn playlist_additions_reject_subtitle_and_document_files() {
+        let paths = ["movie.mp4", "subtitle.SRT", "notes.txt", "audio.flac", "subtitle.ass"].map(PathBuf::from);
+        let sources = expand_playlist_paths(&paths);
+        assert_eq!(sources, vec![MediaSource::File("movie.mp4".into()), MediaSource::File("audio.flac".into())]);
     }
 
     #[test]

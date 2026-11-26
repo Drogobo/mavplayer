@@ -254,7 +254,7 @@ fn pick_by_lang<'a>(tracks: impl Iterator<Item = &'a Track>, langs: &[String]) -
     None
 }
 
-fn choose_tracks(ic: &FormatCtx, info: &MediaInfo, cfg: &EngineConfig) -> Selected {
+pub(super) fn choose_tracks(ic: &FormatCtx, info: &MediaInfo, cfg: &EngineConfig) -> Selected {
     let best = |ty: ff::AVMediaType, related: c_int| unsafe {
         let r = ff::av_find_best_stream(ic.0, ty, -1, related, ptr::null_mut(), 0);
         if r >= 0 { Some(r as usize) } else { None }
@@ -595,7 +595,9 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
         }
 
         // Seeks.
-        if let Some(req) = ctx.seek_req.lock().take() {
+        // Release the request lock before performing potentially slow seeks.
+        let request = ctx.seek_req.lock().take();
+        if let Some(req) = request {
             let start = ctx.start_time.get();
             let dur = ctx.duration.get();
             let mut target = req.target.max(0.0);
@@ -675,7 +677,7 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
             || (enough(&ctx.vq, video_c.is_some() && ctx.video_active.load(Ordering::Acquire))
                 && enough(&ctx.aq, audio_c.is_some())
                 && cached > ahead.max(1.0));
-        update_cache_state(&ctx, cached, audio_c.is_some());
+        update_cache_state(&ctx, cached, read_until(&ctx, &ic, &audio_c, &video_c), audio_c.is_some());
         if full || (ctx.eof.load(Ordering::Acquire) && ctx.seek_req.lock().is_none()) {
             if ctx.eof.load(Ordering::Acquire) {
                 super::preload_next(&ctx);
@@ -693,7 +695,12 @@ pub fn run(ctx: Arc<SessionCtx>, source: MediaSource, opts: LoadOptions) {
                 }
             }
             let mut g = ctx.demux_lock.lock();
-            ctx.demux_cv.wait_for(&mut g, Duration::from_millis(10));
+            // Once the end is reported, nothing changes until a seek, a track
+            // switch, a pause or a stop, which all wake this thread: no need to
+            // poll 100 times a second. (A seek asked for just before the lock
+            // was taken would not wake it, hence the check.)
+            let ended = eof_reported && ctx.seek_req.lock().is_none() && ctx.switch_req.lock().is_empty();
+            ctx.demux_cv.wait_for(&mut g, Duration::from_millis(if ended { 100 } else { 10 }));
             continue;
         }
 
@@ -813,11 +820,36 @@ fn cache_ahead(ctx: &SessionCtx, ic: &FormatCtx, a: &Option<Component>, v: &Opti
     if m.is_finite() { m } else { 0.0 }
 }
 
-fn update_cache_state(ctx: &SessionCtx, cached: f64, has_audio: bool) {
+/// How far the demuxer has read, for the seek bar: where the packets read
+/// last end (the stream furthest behind counts), or the whole duration once
+/// it reached the end. Unlike `cache_ahead`, this doesn't drop each time a
+/// decoder takes packets off a queue.
+fn read_until(ctx: &SessionCtx, ic: &FormatCtx, a: &Option<Component>, v: &Option<Component>) -> f64 {
+    if ctx.eof.load(Ordering::Acquire) {
+        return ctx.duration.get();
+    }
+    let end = |q: &super::sync::PacketQueue, c: &Option<Component>| -> Option<f64> {
+        let c = c.as_ref()?;
+        let tb = unsafe { (*ic.stream(c.stream)).time_base };
+        Some(q.end_ts().map_or(f64::NAN, |e| e as f64 * av::q2d(tb)))
+    };
+    let video = if ctx.video_active.load(Ordering::Acquire) { end(&ctx.vq, v) } else { None };
+    // NaN (a stream with nothing read yet) wins, so the bar waits for both.
+    let furthest = match (end(&ctx.aq, a), video) {
+        (Some(x), Some(y)) if x.is_nan() || y.is_nan() => f64::NAN,
+        (Some(x), Some(y)) => x.min(y),
+        (Some(x), None) | (None, Some(x)) => x,
+        (None, None) => f64::NAN,
+    };
+    furthest - ctx.start_time.get()
+}
+
+fn update_cache_state(ctx: &SessionCtx, cached: f64, read_until: f64, has_audio: bool) {
     if ctx.is_current()
         && let Some(mut st) = ctx.shared.state.try_lock()
     {
         st.cache_secs = cached;
+        st.cache_end = read_until;
         let empty = (has_audio && ctx.aq.len() == 0 && ctx.abuf.is_empty()) && !ctx.eof.load(Ordering::Acquire);
         st.buffering = empty && !ctx.paused();
         st.seeking = ctx.seeking.load(Ordering::Acquire);

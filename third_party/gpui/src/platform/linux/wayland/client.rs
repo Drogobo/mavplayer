@@ -706,6 +706,7 @@ impl LinuxClient for WaylandClient {
             state.common.appearance,
             parent,
         )?;
+        window.0.set_loop_handle(state.loop_handle.clone());
         state.windows.insert(surface_id, window.0.clone());
 
         Ok(Box::new(window))

@@ -1,5 +1,5 @@
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     ffi::c_void,
     ptr::NonNull,
     rc::Rc,
@@ -127,6 +127,28 @@ pub struct WaylandWindowState {
 pub struct WaylandWindowStatePtr {
     state: Rc<RefCell<WaylandWindowState>>,
     callbacks: Rc<RefCell<Callbacks>>,
+    frame_loop: Rc<FrameLoop>,
+}
+
+/// MavPlayer patch: upstream asks for a frame callback and commits on every
+/// frame, drawn or not, so an idle window still wakes at the display's refresh
+/// rate. Here a frame that draws nothing asks for no next one, and the loop
+/// stops; `wake` (GPUI calls it when the window needs drawing) starts it again.
+/// Kept outside `WaylandWindowState` so waking never needs that borrow.
+#[derive(Default)]
+struct FrameLoop {
+    /// A frame callback is requested and not yet done.
+    pending: Cell<bool>,
+    /// The current frame drew (and will present) a scene.
+    drew: Cell<bool>,
+    /// A frame is already scheduled to start the loop again.
+    wake_scheduled: Cell<bool>,
+    /// A frame is running (`run_frame`).
+    in_frame: Cell<bool>,
+    /// Something asked for a frame while one was running: keep the loop going
+    /// at the compositor's pace even if this one draws nothing.
+    wanted: Cell<bool>,
+    loop_handle: RefCell<Option<calloop::LoopHandle<'static, WaylandClientStatePtr>>>,
 }
 
 impl WaylandWindowState {
@@ -338,6 +360,7 @@ impl WaylandWindow {
                 params,
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
+            frame_loop: Rc::default(),
         });
 
         // Kick things off
@@ -364,21 +387,63 @@ impl WaylandWindowStatePtr {
         Rc::ptr_eq(&self.state, &other.state)
     }
 
+    /// A frame callback is done (or the first configure arrived).
     pub fn frame(&self) {
+        self.frame_loop.pending.set(false);
+        self.run_frame();
+    }
+
+    fn run_frame(&self) {
         let mut state = self.state.borrow_mut();
         // MavPlayer patch: a hidden window draws nothing (a buffer attached
         // now would map it without a configure). Showing it starts again.
         if state.hidden {
             return;
         }
-        state.surface.frame(&state.globals.qh, state.surface.id());
+        // MavPlayer patch: the next frame callback is asked for in
+        // `completed_frame`, and only if this frame draws (see `FrameLoop`).
         state.resize_throttle = false;
         drop(state);
+        self.frame_loop.drew.set(false);
+        self.frame_loop.wanted.set(false);
+        self.frame_loop.in_frame.set(true);
 
         let mut cb = self.callbacks.borrow_mut();
         if let Some(fun) = cb.request_frame.as_mut() {
             fun(Default::default());
         }
+        self.frame_loop.in_frame.set(false);
+    }
+
+    /// MavPlayer patch: starts the frame loop again if it stopped. Runs the
+    /// frame from the event loop, never from inside the caller (GPUI calls
+    /// this while updating views).
+    pub fn wake_frame_loop(&self) {
+        let frame_loop = &self.frame_loop;
+        if frame_loop.in_frame.get() {
+            // Paced by a frame callback, not run straight away: a next-frame
+            // callback that asks for another without drawing must not spin.
+            frame_loop.wanted.set(true);
+            return;
+        }
+        if frame_loop.pending.get() || frame_loop.wake_scheduled.get() {
+            return;
+        }
+        let Some(handle) = frame_loop.loop_handle.borrow().clone() else {
+            return;
+        };
+        frame_loop.wake_scheduled.set(true);
+        let this = self.clone();
+        handle.insert_idle(move |_| {
+            this.frame_loop.wake_scheduled.set(false);
+            if !this.frame_loop.pending.get() {
+                this.run_frame();
+            }
+        });
+    }
+
+    pub fn set_loop_handle(&self, handle: calloop::LoopHandle<'static, WaylandClientStatePtr>) {
+        *self.frame_loop.loop_handle.borrow_mut() = Some(handle);
     }
 
     pub fn handle_xdg_surface_event(&self, event: xdg_surface::Event) {
@@ -989,6 +1054,9 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
         state.hidden = !visible;
+        // MavPlayer patch: a callback asked for before hiding may never come;
+        // showing must be able to start the frame loop again.
+        self.0.frame_loop.pending.set(false);
         if !visible {
             state.surface.attach(None, 0, 0);
             state.surface.commit();
@@ -1090,11 +1158,26 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         state.renderer.draw(scene);
+        self.0.frame_loop.drew.set(true);
     }
 
     fn completed_frame(&self) {
+        // MavPlayer patch: a frame that drew nothing commits nothing and asks
+        // for no next frame, so an idle window stops waking up (`FrameLoop`).
+        let frame_loop = &self.0.frame_loop;
+        if !frame_loop.drew.replace(false) && !frame_loop.wanted.replace(false) {
+            return;
+        }
         let state = self.borrow();
+        if !frame_loop.pending.replace(true) {
+            state.surface.frame(&state.globals.qh, state.surface.id());
+        }
         state.surface.commit();
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let this = self.0.clone();
+        Some(Rc::new(move || this.wake_frame_loop()))
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

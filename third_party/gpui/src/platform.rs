@@ -508,6 +508,13 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
+    /// MavPlayer patch: a function that starts the window's frame loop again
+    /// after it stopped for want of anything to draw. Wayland only: there,
+    /// frames are paced by frame callbacks, which an idle window no longer
+    /// asks for. Platforms that poll for frames return `None`.
+    fn frame_waker(&self) -> Option<std::rc::Rc<dyn Fn()>> {
+        None
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
 
     // macOS specific methods

@@ -25,6 +25,9 @@ pub enum Dialog {
     Effects(usize),
     MediaInfo,
     OpenUrl,
+    NamePlaylist(bool),
+    DuplicatePlaylist,
+    DeletePlaylist,
     OpenDisc,
     JumpTo,
     About,
@@ -32,10 +35,19 @@ pub enum Dialog {
     Integrate,
 }
 
-const SETTINGS_TABS: &[&str] =
-    &["Interface", "Playback", "Video", "Audio", "Subtitles", "Keyboard Shortcuts", "Network & Discs", "Advanced"];
+const SETTINGS_TABS: &[&str] = &[
+    "Interface",
+    "Thumbnails",
+    "Playback",
+    "Video",
+    "Audio",
+    "Subtitles",
+    "Keyboard Shortcuts",
+    "Network & Discs",
+    "Advanced",
+];
 /// The Preferences category that lists (and edits) every keyboard shortcut.
-pub const SHORTCUTS_TAB: usize = 5;
+pub const SHORTCUTS_TAB: usize = 6;
 const EFFECT_TABS: &[&str] = &["Equalizer", "Audio Effects", "Picture", "Synchronization"];
 
 pub const EQ_PRESETS: &[(&str, [f32; 10])] = &[
@@ -73,6 +85,22 @@ impl PlayerView {
                 let clip =
                     cx.read_from_clipboard().and_then(|c| c.text()).filter(|t| t.contains("://") && !t.contains('\n'));
                 input.update(cx, |i, cx| i.set_text(clip.unwrap_or_default(), cx));
+                window.focus(&input.focus_handle(cx));
+            }
+            Dialog::NamePlaylist(rename) => {
+                let input = self.input("playlist_name", "Playlist name", window, cx);
+                let name = if rename {
+                    self.playlist_library.name().to_owned()
+                } else {
+                    self.playlist_library.suggested_name("Playlist")
+                };
+                input.update(cx, |i, cx| i.set_text(name, cx));
+                window.focus(&input.focus_handle(cx));
+            }
+            Dialog::DuplicatePlaylist => {
+                let input = self.input("playlist_name", "Playlist name", window, cx);
+                let name = self.playlist_library.suggested_name(&format!("{} copy", self.playlist_library.name()));
+                input.update(cx, |i, cx| i.set_text(name, cx));
                 window.focus(&input.focus_handle(cx));
             }
             Dialog::JumpTo => {
@@ -178,6 +206,13 @@ impl PlayerView {
                     self.open_sources(vec![playlist::source_for_arg(&t)], window, cx);
                 }
             }
+            "playlist_name" => {
+                if let Some(Dialog::NamePlaylist(rename)) = self.dialog {
+                    self.name_playlist_workspace(text.trim().to_owned(), rename, window, cx);
+                } else if self.dialog == Some(Dialog::DuplicatePlaylist) {
+                    self.duplicate_playlist_workspace(text.trim().to_owned(), window, cx);
+                }
+            }
             "jump" => match parse_time(&text) {
                 Some(secs) => {
                     self.close_dialog(window, cx);
@@ -191,6 +226,7 @@ impl PlayerView {
                 // Valid values were already applied by on_input_changed.
                 cx.notify();
             }
+            "playlist_filter" => self.playlist_focus_list(window, cx),
             "shortcut_search" => {}
             _ => self.close_dialog(window, cx),
         }
@@ -199,6 +235,13 @@ impl PlayerView {
     pub fn on_input_changed(&mut self, key: &'static str, cx: &mut Context<Self>) {
         let text = self.inputs.get(key).map(|i| i.read(cx).text()).unwrap_or_default();
         match key {
+            "playlist_filter" => {
+                self.pl_scroll.0.borrow().base_handle.set_offset(gpui::Point::default());
+                self.playlist_previews.hover = None;
+                self.refresh_playlist_hover(cx);
+                cx.notify();
+                return;
+            }
             "shortcut_search" => {
                 self.modal_scroll.set_offset(gpui::Point::default());
                 cx.notify();
@@ -324,7 +367,11 @@ impl PlayerView {
                 // tooltips, right-click menus or wheel.
                 .occlude()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, w, cx| this.close_dialog(w, cx)))
-                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                    if this.handle_drag_move(ev, window, cx) {
+                        cx.stop_propagation();
+                        return;
+                    }
                     let Some(ModalDragOrigin { start, initial, limits: (min_x, max_x, min_y, max_y) }) =
                         this.modal_drag_origin
                     else {
@@ -344,7 +391,11 @@ impl PlayerView {
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, _, _, _| {
+                    cx.listener(|this, _, window, cx| {
+                        if this.drag.is_some() {
+                            this.end_drag(window, cx);
+                            cx.stop_propagation();
+                        }
                         this.modal_drag_origin = None;
                     }),
                 )
@@ -482,12 +533,34 @@ impl PlayerView {
     }
 
     fn row(&self, label: &str, desc: Option<&str>, control: AnyElement) -> AnyElement {
+        self.aligned_row(label, desc, control, false)
+    }
+
+    fn aligned_row(&self, label: &str, desc: Option<&str>, control: AnyElement, top: bool) -> AnyElement {
+        self.option_row(label, desc, control, top, true, false)
+    }
+
+    /// A settings row. A disabled row keeps its layout and is only dimmed;
+    /// a nested row is indented under the option it depends on.
+    fn option_row(
+        &self,
+        label: &str,
+        desc: Option<&str>,
+        control: AnyElement,
+        top: bool,
+        enabled: bool,
+        nested: bool,
+    ) -> AnyElement {
         let t = self.theme;
+        // No explicit width: a percentage width turns off the column's stretch,
+        // and inside the scroll area it can resolve to the content width.
         div()
             .flex()
-            .items_center()
+            .when(top, |d| d.items_start())
+            .when(!top, |d| d.items_center())
             .gap_4()
             .py_2()
+            .when(nested, |d| d.pl_5())
             .border_b_1()
             .border_color(t.border.opacity(0.5))
             .child(
@@ -496,12 +569,13 @@ impl PlayerView {
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    .when(!enabled, |d| d.opacity(0.45))
                     .child(div().text_size(px(13.)).child(label.to_string()))
                     .when_some(desc, |d, s| {
                         d.child(div().text_size(px(11.)).text_color(t.text_dim).child(s.to_string()))
                     }),
             )
-            .child(div().flex_none().child(control))
+            .child(div().flex_none().when(!enabled, |d| d.opacity(0.45)).child(control))
             .into_any_element()
     }
 
@@ -541,6 +615,202 @@ impl PlayerView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.row(label, desc, self.toggle(format!("tg-{id}"), on, f, cx))
+    }
+
+    /// A switch that can be disabled (it then shows the stored value but
+    /// doesn't react) and nested under the option it depends on.
+    #[allow(clippy::too_many_arguments)]
+    fn option_toggle(
+        &self,
+        id: &str,
+        label: &str,
+        desc: &str,
+        on: bool,
+        enabled: bool,
+        nested: bool,
+        f: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let control = if enabled {
+            self.toggle(format!("tg-{id}"), on, f, cx)
+        } else {
+            let t = self.theme;
+            div()
+                .w(px(40.))
+                .h(px(22.))
+                .rounded_full()
+                .p(px(3.))
+                .flex()
+                .bg(if on { t.accent } else { t.track })
+                .when(on, |d| d.justify_end())
+                .child(div().size(px(16.)).rounded_full().bg(gpui::white()).shadow_sm())
+                .into_any_element()
+        };
+        self.option_row(label, Some(desc), control, false, enabled, nested)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn option_choice<T: Clone + PartialEq + 'static>(
+        &self,
+        id: &str,
+        label: &str,
+        desc: &str,
+        options: Vec<(String, T)>,
+        current: T,
+        enabled: bool,
+        f: impl Fn(&mut Self, T, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let control = if enabled {
+            self.choice(id, options, current, f, cx)
+        } else {
+            let text = options.iter().find(|(_, v)| *v == current).map(|(l, _)| l.clone()).unwrap_or_default();
+            div().text_size(px(13.)).child(text).into_any_element()
+        };
+        self.option_row(label, Some(desc), control, false, enabled, false)
+    }
+
+    fn timeline_visualization_row(&self, fullscreen: bool, cx: &mut Context<Self>) -> AnyElement {
+        use super::timeline_settings::{BARCODES, MAIN};
+        let s = &self.settings;
+        let mut cards = div().w(px(300.)).flex().flex_col().gap_2();
+        if fullscreen {
+            cards = cards.child(self.toggle_row(
+                "thumb-fs-mode-inherit",
+                "Same as in a window",
+                None,
+                s.timeline_fullscreen_visualization.is_none(),
+                |t, _| {
+                    t.settings.timeline_fullscreen_visualization =
+                        if t.settings.timeline_fullscreen_visualization.is_none() {
+                            Some(t.settings.timeline_visualization(false))
+                        } else {
+                            None
+                        }
+                },
+                cx,
+            ));
+        }
+        let control = cards
+            .child(self.timeline_cards(&MAIN, fullscreen, cx))
+            .child(div().text_size(px(11.)).text_color(self.theme.text_dim).child("VIDEO BARCODES"))
+            .child(self.timeline_cards(&BARCODES, fullscreen, cx))
+            .into_any_element();
+        self.aligned_row(
+            "Visualization type",
+            Some("Choose the visual representation of the media above the seekbar."),
+            control,
+            true,
+        )
+    }
+
+    fn visualization_number_row(&self, fullscreen: bool, height: bool, cx: &mut Context<Self>) -> AnyElement {
+        let s = &self.settings;
+        let current = if height { s.visualization_height(fullscreen) } else { s.visualization_opacity(fullscreen) };
+        let (min, max) = if height { (12, 96) } else { (50, 100) };
+        let id = if height {
+            "thumb-fs-height"
+        } else if fullscreen {
+            "thumb-fs-opacity"
+        } else {
+            "thumb-opacity"
+        };
+        let label = if height { "Visualization height" } else { "Visualization opacity" };
+        let desc = if height {
+            "Height of the visualization in logical pixels."
+        } else {
+            "Transparency of the visualization (100% is opaque)."
+        };
+        let mut control = div().flex().flex_col().w(px(190.)).gap_1();
+        if fullscreen {
+            let inherited =
+                if height { s.timeline_fullscreen_height.is_none() } else { s.timeline_fullscreen_opacity.is_none() };
+            control = control.child(
+                div().flex().items_center().justify_between().text_size(px(11.)).child("Same as in a window").child(
+                    self.toggle(
+                        format!("{id}-inherit"),
+                        inherited,
+                        move |t, _| {
+                            if height {
+                                t.settings.timeline_fullscreen_height =
+                                    if inherited { Some(t.settings.visualization_height(false)) } else { None };
+                            } else {
+                                t.settings.timeline_fullscreen_opacity =
+                                    if inherited { Some(t.settings.visualization_opacity(false)) } else { None };
+                            }
+                        },
+                        cx,
+                    ),
+                ),
+            );
+        }
+        control = control.child(div().text_size(px(12.)).child(if height {
+            format!("{current} px")
+        } else {
+            format!("{current}%")
+        }));
+        if s.visualization_enabled(fullscreen) {
+            control = control.child(self.slider(
+                id,
+                (current - min) as f32 / (max - min) as f32,
+                false,
+                self.theme,
+                move |t, f, _, _| {
+                    let n = min + (f * (max - min) as f32).round() as u32;
+                    match (fullscreen, height) {
+                        (true, true) => t.settings.timeline_fullscreen_height = Some(n),
+                        (true, false) => t.settings.timeline_fullscreen_opacity = Some(n),
+                        (false, false) => t.settings.timeline_opacity = n,
+                        (false, true) => {}
+                    }
+                },
+                cx,
+            ));
+        }
+        self.option_row(
+            label,
+            Some(desc),
+            control.into_any_element(),
+            false,
+            s.visualization_enabled(fullscreen),
+            false,
+        )
+    }
+
+    fn thumbnail_height_row(&self, minimum: bool, cx: &mut Context<Self>) -> AnyElement {
+        let s = &self.settings;
+        let max = s.timeline_filmstrip_height.clamp(12, 96);
+        let min = s.timeline_filmstrip_min_height.clamp(12, max);
+        let (label, current, limit, enabled) = if minimum {
+            ("Minimum visualization height", min, max, s.visualization_enabled(false) && s.timeline_adaptive)
+        } else {
+            ("Visualization height", max, 96, s.visualization_enabled(false))
+        };
+        let mut control = div().w(px(190.)).child(div().text_size(px(12.)).child(format!("{current} px")));
+        if enabled && limit > 12 {
+            control = control.child(self.slider(
+                if minimum { "thumb-min-height" } else { "thumb-height" },
+                (current - 12) as f32 / (limit - 12) as f32,
+                false,
+                self.theme,
+                move |t, f, _, _| {
+                    let n = 12 + (f * (limit - 12) as f32).round() as u32;
+                    if minimum {
+                        t.settings.timeline_filmstrip_min_height = n;
+                    } else {
+                        t.settings.timeline_filmstrip_height = n;
+                        t.settings.timeline_filmstrip_min_height = t.settings.timeline_filmstrip_min_height.min(n);
+                    }
+                },
+                cx,
+            ));
+        }
+        let desc = if minimum {
+            "Smallest height the visualization shrinks to in narrow windows."
+        } else {
+            "Height of the visualization in logical pixels."
+        };
+        self.option_row(label, Some(desc), control.into_any_element(), false, enabled, minimum)
     }
 
     /// Settings rows for enlarging video: the upscaler, and the options of
@@ -923,6 +1193,60 @@ impl PlayerView {
                     ))
                     .into_any_element();
                 self.modal("Open URL", 560., body, Some(footer), cx)
+            }
+            Dialog::NamePlaylist(rename) => {
+                let body = div().p_4().child(self.input_box("playlist_name")).into_any_element();
+                let footer = self
+                    .text_button(
+                        "playlist-name-confirm",
+                        if rename { "Rename" } else { "Create" },
+                        true,
+                        |this, _, w, cx| this.on_input_submit("playlist_name", w, cx),
+                        cx,
+                    )
+                    .into_any_element();
+                self.modal(if rename { "Rename playlist" } else { "New playlist" }, 380., body, Some(footer), cx)
+            }
+            Dialog::DuplicatePlaylist => {
+                let body = div().p_4().child(self.input_box("playlist_name")).into_any_element();
+                let footer = self
+                    .text_button(
+                        "playlist-duplicate-confirm",
+                        "Duplicate",
+                        true,
+                        |this, _, w, cx| this.on_input_submit("playlist_name", w, cx),
+                        cx,
+                    )
+                    .into_any_element();
+                self.modal("Duplicate playlist as…", 380., body, Some(footer), cx)
+            }
+            Dialog::DeletePlaylist => {
+                let body = div()
+                    .p_4()
+                    .child(format!(
+                        "Delete the saved playlist ‘{}’? This does not delete any media files.",
+                        self.playlist_library.name()
+                    ))
+                    .into_any_element();
+                let footer = div()
+                    .flex()
+                    .gap_2()
+                    .child(self.text_button(
+                        "playlist-delete-cancel",
+                        "Cancel",
+                        false,
+                        |this, _, w, cx| this.close_dialog(w, cx),
+                        cx,
+                    ))
+                    .child(self.text_button(
+                        "playlist-delete-confirm",
+                        "Delete",
+                        true,
+                        |this, _, w, cx| this.delete_playlist_workspace(w, cx),
+                        cx,
+                    ))
+                    .into_any_element();
+                self.modal("Delete playlist", 420., body, Some(footer), cx)
             }
             Dialog::JumpTo => {
                 let dur = self.player.duration();
@@ -1423,7 +1747,7 @@ impl PlayerView {
                     .child(self.toggle_row(
                         "fit",
                         "Resize window to fit video",
-                        None,
+                        Some("Grows the window for larger videos; never shrinks it"),
                         s.fit_window_to_video,
                         |t, _| t.settings.fit_window_to_video = !t.settings.fit_window_to_video,
                         cx,
@@ -1442,6 +1766,17 @@ impl PlayerView {
                         Some("Fullscreen starts without it (it can still be opened there); the window keeps its own"),
                         s.hide_playlist_in_fullscreen,
                         |t, _| t.settings.hide_playlist_in_fullscreen = !t.settings.hide_playlist_in_fullscreen,
+                        cx,
+                    ))
+                    .child(self.toggle_row(
+                        "playlist-autohide",
+                        "Automatically hide playlist",
+                        Some("Reveal an enabled playlist at the right edge without resizing the video."),
+                        s.playlist_autohide,
+                        |t, _| {
+                            t.settings.playlist_autohide = !t.settings.playlist_autohide;
+                            t.playlist_autohide_open = false;
+                        },
                         cx,
                     ))
                     .child(self.section("Mouse"))
@@ -1470,14 +1805,6 @@ impl PlayerView {
                         None,
                         s.double_click_fullscreen,
                         |t, _| t.settings.double_click_fullscreen = !t.settings.double_click_fullscreen,
-                        cx,
-                    ))
-                    .child(self.toggle_row(
-                        "pldblclick",
-                        "Double-click to play playlist entries",
-                        Some("A single click then only selects them"),
-                        s.playlist_double_click,
-                        |t, _| t.settings.playlist_double_click = !t.settings.playlist_double_click,
                         cx,
                     ))
                     .child(self.row(
@@ -1531,6 +1858,161 @@ impl PlayerView {
                 c = c.child(self.bar_controls_section(cx));
             }
             1 => {
+                use crate::settings::PlaylistThumbnails;
+                let video = s.timeline_thumbnails;
+                let audio = s.timeline_waveform;
+                let filmstrips_auto = video && s.filmstrip_auto_video;
+                let inline = s.playlist_thumbnails.inline();
+                let shown = s.visualization_enabled(false) || s.visualization_enabled(true);
+                let playlist_desc = match s.playlist_thumbnails {
+                    PlaylistThumbnails::None => "Show only an icon for each item.",
+                    PlaylistThumbnails::StaticInline => "Show one picture from each video next to its title.",
+                    PlaylistThumbnails::Inline => {
+                        "Show a picture next to each title. Moving the pointer across a row scrubs through its video thumbnails."
+                    }
+                    PlaylistThumbnails::InlineSide => {
+                        "Show a picture next to each title, and a larger preview beside the playlist while scrubbing across a row."
+                    }
+                    PlaylistThumbnails::Hover => {
+                        "Show a large preview beside the playlist while scrubbing across a row."
+                    }
+                };
+                let playlist_desc = if s.playlist_thumbnails.scrubbing() && !video {
+                    format!("{playlist_desc} Scrubbing needs video thumbnails, which are turned off.")
+                } else if s.playlist_thumbnails.scrubbing() {
+                    format!("{playlist_desc} Scrubbing works on videos that have video thumbnails.")
+                } else {
+                    playlist_desc.to_string()
+                };
+                let representative_desc = if !inline {
+                    "Only used when the playlist shows a picture next to each title."
+                } else if filmstrips_auto {
+                    "Already covered: video thumbnails are created automatically and include this picture."
+                } else {
+                    "Create one picture for each video added to the playlist, unless one is already cached."
+                };
+                c = c.w_full()
+                    .child(self.section("Video thumbnails"))
+                    .child(self.option_toggle(
+                        "thumb-enabled", "Video thumbnails",
+                        "Frames sampled from a video, used for the timeline preview, filmstrip and video barcodes, chapter pictures and playlist scrubbing.",
+                        video, true, false, |t, _| t.settings.timeline_thumbnails = !t.settings.timeline_thumbnails, cx,
+                    ))
+                    .child(self.option_toggle(
+                        "filmstrip-auto-video", "Create automatically",
+                        "Sample a video when it plays or is added to the playlist. When off, only videos you create them for from the playlist's right-click menu get them.",
+                        s.filmstrip_auto_video, video, true, |t, _| t.settings.filmstrip_auto_video = !t.settings.filmstrip_auto_video, cx,
+                    ))
+                    .child(self.option_toggle(
+                        "chapter-thumbnails", "Show in the chapter list", "Show a picture from each chapter next to its title, once the video has video thumbnails.",
+                        s.chapter_thumbnails, video, true, |t, _| t.settings.chapter_thumbnails = !t.settings.chapter_thumbnails, cx,
+                    ))
+                    .child(self.section("Audio waveforms"))
+                    .child(self.option_toggle(
+                        "waveform-enabled", "Audio waveforms",
+                        "Analyze how loud the audio is over time, for the waveform visualizations and the waveforms in the playlist.",
+                        audio, true, false, |t, _| t.settings.timeline_waveform = !t.settings.timeline_waveform, cx,
+                    ))
+                    .child(self.option_toggle(
+                        "waveform-auto-audio", "Analyze audio files automatically",
+                        "Analyze music and other files without video when they play or are added to the playlist. Their timeline shows the waveform in place of a video visualization.",
+                        s.waveform_auto_audio, audio, true, |t, _| t.settings.waveform_auto_audio = !t.settings.waveform_auto_audio, cx,
+                    ))
+                    .child(self.option_toggle(
+                        "waveform-auto-video", "Analyze videos automatically",
+                        "Analyze the soundtrack of videos when they play or are added to the playlist. A waveform visualization analyzes the video playing either way.",
+                        s.waveform_auto_video, audio, true, |t, _| t.settings.waveform_auto_video = !t.settings.waveform_auto_video, cx,
+                    ))
+                    .child(self.section("Timeline"))
+                    .child(self.option_toggle(
+                        "timeline-hover-playhead", "Mark the previewed time",
+                        "While hovering over the timeline, draw a line on the visualization where the previewed frame is.",
+                        s.timeline_hover_playhead, shown, false, |t, _| t.settings.timeline_hover_playhead = !t.settings.timeline_hover_playhead, cx,
+                    ))
+                    .child(self.section("Timeline in a window"))
+                    .child(self.option_toggle(
+                        "thumb-hover", "Preview on hover", "Show the nearest video thumbnail above the timeline while hovering over it.",
+                        s.timeline_hover_enabled(false), video, false,
+                        |t, _| t.settings.set_timeline_hover(false, !t.settings.timeline_hover_enabled(false)), cx,
+                    ))
+                    .child(self.timeline_visualization_row(false, cx))
+                    .child(self.visualization_number_row(false, false, cx))
+                    .child(self.thumbnail_height_row(false, cx))
+                    .child(self.option_toggle(
+                        "thumb-adaptive", "Adapt height to window width", "Make the visualization lower in narrow windows.",
+                        s.timeline_adaptive, s.visualization_enabled(false), false,
+                        |t, _| t.settings.timeline_adaptive = !t.settings.timeline_adaptive, cx,
+                    ))
+                    .child(self.thumbnail_height_row(true, cx))
+                    .child(self.section("Timeline in fullscreen"))
+                    .child(self.option_choice("thumb-fullscreen-hover", "Preview on hover", "Show the nearest video thumbnail above the timeline while hovering over it.",
+                        vec![("Same as in a window".into(), None), ("On".into(), Some(true)), ("Off".into(), Some(false))],
+                        s.timeline_fullscreen_hover, video, |t, v, _| t.settings.timeline_fullscreen_hover = v, cx))
+                    .child(self.timeline_visualization_row(true, cx))
+                    .child(self.visualization_number_row(true, false, cx))
+                    .child(self.visualization_number_row(true, true, cx))
+                    .child(self.section("Playlist"))
+                    .child(self.option_choice("playlist-thumbnails", "Thumbnails", &playlist_desc,
+                        PlaylistThumbnails::ALL.into_iter().map(|mode| (mode.label().into(), mode)).collect(),
+                        s.playlist_thumbnails, true, |t, v, _| t.settings.playlist_thumbnails = v, cx))
+                    .child(self.option_toggle(
+                        "playlist-thumb-auto-video", "Create pictures automatically", representative_desc,
+                        s.playlist_thumbnail_auto_video || (inline && filmstrips_auto), inline && !filmstrips_auto, true,
+                        |t, _| t.settings.playlist_thumbnail_auto_video = !t.settings.playlist_thumbnail_auto_video, cx,
+                    ))
+                    .child(self.section("Thumbnail and waveform cache"))
+                    .child(self.row(
+                        "Cache directory",
+                        Some(&s.thumbnail_cache_dir().display().to_string()),
+                        div().flex().gap_2()
+                            .child(self.text_button("thumbdir-reset", "Restore default", false, |t, _, _, cx| {
+                                t.settings.thumbnail_cache_dir = None;
+                                t.apply_settings(cx);
+                            }, cx))
+                            .child(self.text_button("thumbdir", "Choose…", false, |_, _, w, cx| {
+                                let rx = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                    files: false,
+                                    directories: true,
+                                    multiple: false,
+                                    prompt: Some("Choose".into()),
+                                });
+                                cx.spawn_in(w, async move |this, cx| {
+                                    if let Ok(Ok(Some(p))) = rx.await
+                                        && let Some(p) = p.into_iter().next()
+                                    {
+                                        let _ = this.update(cx, |v, cx| {
+                                            v.settings.thumbnail_cache_dir = Some(p);
+                                            v.apply_settings(cx);
+                                        });
+                                    }
+                                }).detach();
+                            }, cx))
+                            .into_any_element(),
+                    ))
+                    .child(self.row(
+                        "Keep unused thumbnails for", None,
+                        self.choice("thumb-days", [("7 days", 7), ("14 days", 14), ("30 days", 30), ("90 days", 90),
+                            ("180 days", 180), ("1 year", 365), ("Forever", 0)].into_iter()
+                            .map(|(label, value)| (label.into(), value)).collect(), s.thumbnail_cache_days,
+                            |t, v, _| t.settings.thumbnail_cache_days = v, cx),
+                    ))
+                    .child(self.row(
+                        "Maximum cache size", None,
+                        self.choice("thumb-mb", [("256 MB", 256), ("512 MB", 512), ("1 GB", 1024), ("2 GB", 2048),
+                            ("5 GB", 5120), ("10 GB", 10240), ("Unlimited", 0)].into_iter()
+                            .map(|(label, value)| (label.into(), value)).collect(), s.thumbnail_cache_mb,
+                            |t, v, _| t.settings.thumbnail_cache_mb = v, cx),
+                    ))
+                    .child(self.row(
+                        "Current cache size", Some(&self.thumbnails.cache_label()),
+                        self.text_button("thumb-clear", "Clear cache", false, |t, _, _, cx| {
+                            t.playlist_previews.clear();
+                            t.thumbnails.clear_cache(&t.settings);
+                            cx.notify();
+                        }, cx).into_any_element(),
+                    ));
+            }
+            2 => {
                 c = c
                     .child(self.section("Playback"))
                     .child(self.toggle_row(
@@ -1711,7 +2193,7 @@ impl PlayerView {
                         ),
                     );
             }
-            2 => {
+            3 => {
                 c = c
                     .child(self.section("Decoding"))
                     .child(self.row("Hardware decoding", Some("Uses the GPU's video decoder (VA-API, NVDEC, D3D11, VideoToolbox); falls back to software automatically"), self.choice("hwdec", vec![("Automatic (above 1080p)".into(), HwDecode::Auto), ("Always".into(), HwDecode::Always), ("Off".into(), HwDecode::Off)], s.hwdec, |t, v, cx| {
@@ -1725,7 +2207,7 @@ impl PlayerView {
                     .child(self.row("Downscaling", Some("For pictures larger than the window"), self.choice("scale", vec![("Nearest neighbor".into(), ScaleQuality::Nearest), ("Linear".into(), ScaleQuality::Linear), ("Good (bicubic)".into(), ScaleQuality::Good), ("Best (Lanczos)".into(), ScaleQuality::Best)], s.scale_quality, |t, v, _| t.settings.scale_quality = v, cx)))
                     .children(self.upscaling_rows(cx));
             }
-            3 => {
+            4 => {
                 let mut devs: Vec<(String, Option<String>)> = vec![("System default".into(), None)];
                 devs.extend(self.audio_devices.iter().map(|d| (d.clone(), Some(d.clone()))));
                 c = c
@@ -1785,7 +2267,7 @@ impl PlayerView {
                         cx,
                     ));
             }
-            4 => {
+            5 => {
                 c = c
                     .child(self.section("Tracks"))
                     .child(self.row("Preferred subtitle languages", Some(&sub_langs_hint), self.input_box("sub_langs")))
@@ -1953,7 +2435,7 @@ impl PlayerView {
                         ),
                     ));
             }
-            6 => {
+            7 => {
                 c = c
                     .child(self.section("Network"))
                     .child(self.row(

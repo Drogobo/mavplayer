@@ -27,6 +27,9 @@ struct PqInner {
     bytes: usize,
     /// Sum of packet durations in stream time base units.
     duration: i64,
+    /// Where the furthest packet put since the last flush ends, in stream
+    /// time base units (`i64::MIN` when none had a timestamp).
+    end: i64,
 }
 
 pub struct PacketQueue {
@@ -41,7 +44,7 @@ pub struct PacketQueue {
 impl PacketQueue {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(PqInner { pkts: VecDeque::new(), bytes: 0, duration: 0 }),
+            inner: Mutex::new(PqInner { pkts: VecDeque::new(), bytes: 0, duration: 0, end: i64::MIN }),
             cv: Condvar::new(),
             serial: AtomicI32::new(0),
             abort: AtomicBool::new(false),
@@ -60,6 +63,10 @@ impl PacketQueue {
         let mut g = self.inner.lock();
         g.bytes += pkt.size() + std::mem::size_of::<QueuedPacket>();
         g.duration += pkt.duration().max(0);
+        let ts = if pkt.pts() != super::av::NOPTS { pkt.pts() } else { pkt.dts() };
+        if ts != super::av::NOPTS {
+            g.end = g.end.max(ts.saturating_add(pkt.duration().max(0)));
+        }
         g.pkts.push_back(QueuedPacket { pkt, serial: self.serial() });
         drop(g);
         self.cv.notify_one();
@@ -76,6 +83,7 @@ impl PacketQueue {
         g.pkts.clear();
         g.bytes = 0;
         g.duration = 0;
+        g.end = i64::MIN;
         self.serial.fetch_add(1, Ordering::AcqRel);
         drop(g);
         self.cv.notify_all();
@@ -127,6 +135,11 @@ impl PacketQueue {
 
     pub fn duration_ts(&self) -> i64 {
         self.inner.lock().duration
+    }
+
+    /// See `PqInner::end`.
+    pub fn end_ts(&self) -> Option<i64> {
+        Some(self.inner.lock().end).filter(|&e| e != i64::MIN)
     }
 }
 

@@ -95,6 +95,8 @@ struct WindowInvalidatorInner {
     pub dirty: bool,
     pub draw_phase: DrawPhase,
     pub dirty_views: FxHashSet<EntityId>,
+    /// MavPlayer patch: see `PlatformWindow::frame_waker`.
+    pub waker: Option<Rc<dyn Fn()>>,
 }
 
 #[derive(Clone)]
@@ -109,6 +111,7 @@ impl WindowInvalidator {
                 dirty: true,
                 draw_phase: DrawPhase::None,
                 dirty_views: FxHashSet::default(),
+                waker: None,
             })),
         }
     }
@@ -118,6 +121,11 @@ impl WindowInvalidator {
         inner.dirty_views.insert(entity);
         if inner.draw_phase == DrawPhase::None {
             inner.dirty = true;
+            let waker = inner.waker.clone();
+            drop(inner);
+            if let Some(wake) = waker {
+                wake();
+            }
             cx.push_effect(Effect::Notify { emitter: entity });
             true
         } else {
@@ -125,12 +133,27 @@ impl WindowInvalidator {
         }
     }
 
+    /// MavPlayer patch: starts the frame loop if it stopped (a frame is needed).
+    pub fn wake(&self) {
+        let waker = self.inner.borrow().waker.clone();
+        if let Some(wake) = waker {
+            wake();
+        }
+    }
+
+    pub fn set_waker(&self, waker: Option<Rc<dyn Fn()>>) {
+        self.inner.borrow_mut().waker = waker;
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.inner.borrow().dirty
     }
 
     pub fn set_dirty(&self, dirty: bool) {
-        self.inner.borrow_mut().dirty = dirty
+        self.inner.borrow_mut().dirty = dirty;
+        if dirty {
+            self.wake();
+        }
     }
 
     pub fn set_phase(&self, phase: DrawPhase) {
@@ -987,6 +1010,7 @@ impl Window {
         let appearance = platform_window.appearance();
         let text_system = Arc::new(WindowTextSystem::new(cx.text_system().clone()));
         let invalidator = WindowInvalidator::new();
+        invalidator.set_waker(platform_window.frame_waker());
         let active = Rc::new(Cell::new(platform_window.is_active()));
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
@@ -1643,6 +1667,7 @@ impl Window {
     /// Schedule the given closure to be run directly after the current frame is rendered.
     pub fn on_next_frame(&self, callback: impl FnOnce(&mut Window, &mut App) + 'static) {
         RefCell::borrow_mut(&self.next_frame_callbacks).push(Box::new(callback));
+        self.invalidator.wake();
     }
 
     /// Schedule a frame to be drawn on the next animation frame.

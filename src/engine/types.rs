@@ -331,6 +331,9 @@ pub struct PlaybackState {
     pub buffering: bool,
     /// Seconds of media buffered ahead of the play position.
     pub cache_secs: f64,
+    /// How far into the media (seconds, like the position) the demuxer has
+    /// read: the whole duration once it reached the end. NaN when unknown.
+    pub cache_end: f64,
     pub dropped_frames: u64,
     pub decoded_frames: u64,
     pub seeking: bool,
@@ -417,6 +420,7 @@ impl Default for PlaybackState {
             audio: None,
             buffering: false,
             cache_secs: 0.0,
+            cache_end: f64::NAN,
             dropped_frames: 0,
             decoded_frames: 0,
             seeking: false,

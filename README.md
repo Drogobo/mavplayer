@@ -44,6 +44,17 @@ one click away.
   the icon shows or hides the window. Media ▸ Hide to Tray (Ctrl+W) does the
   same.
 
+**Timeline and playlist**
+- The seek bar can show a filmstrip of thumbnails, the audio waveform, or a
+  colour barcode of the video (average colour, luma, saturation, dominant
+  colours and more), with a thumbnail preview above the cursor while hovering.
+  Set them apart for the window and fullscreen: right-click the seek bar.
+- Playlist entries can show thumbnails or waveforms, previewed by scrubbing
+  across them; the playlist can be filtered, and several items selected and
+  dragged together. Chapters can show thumbnails too.
+- Thumbnails and waveforms are kept in an on-disk cache, limited in size and
+  age (Preferences).
+
 **Video**: aspect ratio override, crop, zoom, rotate and flip, brightness /
 contrast / saturation / gamma / hue, sharpen, denoise, grayscale, invert.
 
