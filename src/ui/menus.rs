@@ -162,6 +162,7 @@ impl PlayerView {
             act("Open URL…", OpenUrl).icon(Icon::Url),
             M::submenu("Recent Media", recent).icon(Icon::Recent),
             M::Separator,
+            act("Open Playlist File…", OpenPlaylistFile).icon(Icon::PlaylistFile),
             act("Save Playlist…", SavePlaylist).icon(Icon::Save).enabled(!self.playlist.items.is_empty()),
             M::Separator,
         ];
@@ -460,7 +461,7 @@ impl PlayerView {
     /// Upscaler choices, with Anime4K's modes inline (as people switch
     /// between them while watching). Chroma and sharpening are in Preferences.
     fn upscaling_items(&self) -> Vec<M> {
-        let gpu = engine::gpu_upscaling_available();
+        let gpu = engine::gpu_upscaling_available() && self.settings.shader_upscalers;
         let (cur, mode) = (self.settings.upscaler, self.settings.anime4k_mode);
         let pick = |label: String, u: Upscaler, m: Option<Anime4KMode>, on: bool| {
             M::action(label.clone(), move |this, _, cx| {
@@ -493,7 +494,9 @@ impl PlayerView {
             }
         }
         items.push(M::Separator);
-        items.push(M::action("Upscaling Settings…", |this, w, cx| this.show_dialog(Dialog::Settings(3), w, cx)));
+        items.push(M::action("Upscaling Settings…", |this, w, cx| {
+            this.show_dialog(Dialog::Settings(super::dialogs::VIDEO_TAB), w, cx)
+        }));
         items
     }
 

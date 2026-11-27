@@ -321,18 +321,27 @@ pub struct Settings {
     pub playlist_thumbnails: PlaylistThumbnails,
     pub playlist_thumbnail_times: HashMap<String, f64>,
     pub chapter_thumbnails: bool,
+    /// Music rows in the playlist show their cover (in the file, or `cover.jpg`
+    /// and the like beside it) in place of their waveform.
+    pub album_art: bool,
     pub timeline_adaptive: bool,
     pub timeline_filmstrip_height: u32,
     pub timeline_filmstrip_min_height: u32,
     pub timeline_hover: bool,
-    pub thumbnail_cache_dir: Option<PathBuf>,
-    pub thumbnail_cache_days: u32,
-    pub thumbnail_cache_mb: u32,
+    /// How long unused entries of the cache (thumbnails, waveforms, timeline
+    /// pictures, album art) are kept, 0 = forever; and its size limit, 0 = none.
+    #[serde(alias = "thumbnail_cache_days")]
+    pub cache_days: u32,
+    #[serde(alias = "thumbnail_cache_mb")]
+    pub cache_mb: u32,
     // Video
     pub hwdec: HwDecode,
     pub deinterlace: Deinterlace,
     pub scale_quality: ScaleQuality,
     pub upscaler: Upscaler,
+    /// Offer the upscalers that run through libplacebo (Vulkan shaders) in
+    /// the Upscaling lists. Always on while one of them is chosen.
+    pub shader_upscalers: bool,
     pub anime4k_mode: Anime4KMode,
     pub anime4k_quality: Anime4KQuality,
     pub custom_shader: Option<PathBuf>,
@@ -380,7 +389,7 @@ pub struct Settings {
 
 /// Bumped when a changed default should also reach settings files that
 /// still hold the old default (see `Settings::from_value`).
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -434,17 +443,18 @@ impl Default for Settings {
             playlist_thumbnails: PlaylistThumbnails::InlineSide,
             playlist_thumbnail_times: HashMap::new(),
             chapter_thumbnails: true,
+            album_art: true,
             timeline_adaptive: true,
             timeline_filmstrip_height: 32,
             timeline_filmstrip_min_height: 16,
             timeline_hover: true,
-            thumbnail_cache_dir: None,
-            thumbnail_cache_days: 90,
-            thumbnail_cache_mb: 1024,
+            cache_days: 30,
+            cache_mb: 512,
             hwdec: HwDecode::Always,
             deinterlace: Deinterlace::Auto,
             scale_quality: ScaleQuality::Good,
             upscaler: Upscaler::Bilinear,
+            shader_upscalers: false,
             anime4k_mode: Anime4KMode::A,
             anime4k_quality: Anime4KQuality::High,
             custom_shader: None,
@@ -593,10 +603,9 @@ impl Settings {
         .clamp(50, 100)
     }
 
-    pub fn thumbnail_cache_dir(&self) -> PathBuf {
-        self.thumbnail_cache_dir.clone().unwrap_or_else(|| {
-            dirs::cache_dir().map(|p| p.join("mavplayer")).unwrap_or_else(config_dir).join("thumbnails")
-        })
+    /// The folder of the thumbnail, waveform and album art cache.
+    pub fn cache_dir(&self) -> PathBuf {
+        dirs::cache_dir().map(|p| p.join("mavplayer")).unwrap_or_else(config_dir).join("thumbnails")
     }
 
     pub fn screenshot_dir(&self) -> PathBuf {
@@ -631,16 +640,38 @@ pub(crate) fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Option<T> {
 /// their writes, and (on Unix) readable only by the user: these files hold
 /// what was watched, and stream URLs can carry credentials.
 pub(crate) fn write_json<T: Serialize>(p: &Path, v: &T) -> std::io::Result<()> {
+    write_atomic(p, &serde_json::to_vec_pretty(v)?, true)
+}
+
+/// Replaces `p` with `data` through a temporary file in the same folder and
+/// a rename, so readers never see half a file. `private` files are readable
+/// only by the user (Unix); otherwise an existing file keeps its permissions,
+/// and a read-only one is refused rather than replaced.
+pub(crate) fn write_atomic(p: &Path, data: &[u8], private: bool) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(d) = p.parent() {
         std::fs::create_dir_all(d)?;
     }
-    let tmp = p.with_extension(format!("json.{}.tmp", std::process::id()));
+    let existing = if private { None } else { std::fs::metadata(p).ok().map(|m| m.permissions()) };
+    if existing.as_ref().is_some_and(|perm| perm.readonly()) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the file is read-only"));
+    }
+    let mut name = p.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.tmp", std::process::id()));
+    let tmp = p.with_file_name(name);
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let written = opts.open(&tmp).and_then(|mut f| f.write_all(&serde_json::to_vec_pretty(v)?));
+    if private {
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    }
+    let written = opts.open(&tmp).and_then(|mut f| {
+        f.write_all(data)?;
+        if let Some(perm) = existing {
+            f.set_permissions(perm)?;
+        }
+        Ok(())
+    });
     if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, p)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -667,6 +698,20 @@ impl Settings {
         // the old default (Automatic) whether or not anyone chose it.
         if version < 1 && s.hwdec == HwDecode::Auto {
             s.hwdec = HwDecode::Always;
+        }
+        // Version 2: the cache keeps 30 days and 512 MB by default (it was
+        // 90 days and 1 GB, saved whether or not anyone chose them).
+        if version < 2 {
+            if s.cache_days == 90 {
+                s.cache_days = 30;
+            }
+            if s.cache_mb == 1024 {
+                s.cache_mb = 512;
+            }
+        }
+        // Someone already using a shader upscaler keeps seeing them.
+        if s.upscaler.needs_libplacebo() {
+            s.shader_upscalers = true;
         }
         s.config_version = CONFIG_VERSION;
         Ok(s)
@@ -841,6 +886,8 @@ mod tests {
         assert_eq!(load(r#"{"scale_quality":"Good"}"#).upscaler, Upscaler::Bilinear);
         assert_eq!(load(r#"{"scale_quality":"Nearest","upscaler":"Bilinear"}"#).upscaler, Upscaler::Bilinear);
         assert_eq!(load(r#"{"upscaler":"Anime4K"}"#).upscaler, Upscaler::Anime4K);
+        assert!(load(r#"{"upscaler":"Anime4K"}"#).shader_upscalers);
+        assert!(!load(r#"{"upscaler":"Bicubic"}"#).shader_upscalers);
     }
 
     #[test]
@@ -851,6 +898,18 @@ mod tests {
         assert_eq!(load(r#"{"hwdec":"Off"}"#).hwdec, HwDecode::Off);
         // Chosen after the change: kept.
         assert_eq!(load(r#"{"hwdec":"Auto","config_version":1}"#).hwdec, HwDecode::Auto);
+    }
+
+    #[test]
+    fn old_cache_defaults_become_the_new_ones() {
+        let load = |j: &str| Settings::from_value(serde_json::from_str(j).unwrap()).unwrap();
+        let old = load(r#"{"thumbnail_cache_days":90,"thumbnail_cache_mb":1024,"config_version":1}"#);
+        assert_eq!((old.cache_days, old.cache_mb), (30, 512));
+        let chosen = load(r#"{"thumbnail_cache_days":7,"thumbnail_cache_mb":2048,"config_version":1}"#);
+        assert_eq!((chosen.cache_days, chosen.cache_mb), (7, 2048));
+        let now = load(r#"{"cache_days":90,"cache_mb":1024,"config_version":2}"#);
+        assert_eq!((now.cache_days, now.cache_mb), (90, 1024));
+        assert_eq!((Settings::default().cache_days, Settings::default().cache_mb), (30, 512));
     }
 }
 

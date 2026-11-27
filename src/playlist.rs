@@ -456,24 +456,68 @@ impl Playlist {
     }
 
     pub fn save_m3u(&self, path: &Path) -> std::io::Result<()> {
-        // Titles come from file metadata: a line break in one would start
-        // a bogus entry when the playlist is read back.
-        let one_line = |t: &str| t.replace(['\r', '\n'], " ");
-        let mut s = String::from("#EXTM3U\n");
-        for it in &self.items {
-            let entry = match &it.source {
-                MediaSource::File(p) => p.display().to_string(),
-                MediaSource::Url(u) => u.clone(),
-                MediaSource::Dvd { path, title, .. } => format!("dvd://{title}/{path}"),
-                MediaSource::Cd { device, track } => format!("cdda://{track}/{device}"),
-            };
-            if entry.contains(['\r', '\n']) {
-                continue; // can't be represented in M3U
-            }
-            let dur = it.duration.map(|d| d.round() as i64).unwrap_or(-1);
-            s.push_str(&format!("#EXTINF:{dur},{}\n{entry}\n", one_line(&it.display_title())));
+        let entries: Vec<M3uEntry> = self
+            .items
+            .iter()
+            .map(|it| {
+                let dur = it.duration.map(|d| d.round() as i64).unwrap_or(-1);
+                M3uEntry { source: it.source.clone(), extinf: Some(format!("#EXTINF:{dur},{}", it.display_title())) }
+            })
+            .collect();
+        crate::settings::write_atomic(path, m3u_text(&entries, None).as_bytes(), false)
+    }
+}
+
+/// One entry of an M3U playlist, with the `#EXTINF` line that came with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct M3uEntry {
+    pub source: MediaSource,
+    pub extinf: Option<String>,
+}
+
+/// A playlist file as read from disk.
+pub struct PlaylistFile {
+    pub entries: Vec<M3uEntry>,
+    /// The file isn't UTF-8 and was decoded lossily: writing it back would
+    /// mangle its names, so it must stay read-only.
+    pub lossy: bool,
+}
+
+/// The text of an extended M3U. Files inside `base` (the playlist's own
+/// folder) are written relative to it, so the playlist keeps working when the
+/// folder moves; everything else is absolute.
+pub fn m3u_text(entries: &[M3uEntry], base: Option<&Path>) -> String {
+    // Titles come from file metadata: a line break in one would start
+    // a bogus entry when the playlist is read back.
+    let one_line = |t: &str| t.replace(['\r', '\n'], " ");
+    let mut s = String::from("#EXTM3U\n");
+    for e in entries {
+        let entry = m3u_entry(&e.source, base);
+        if entry.contains(['\r', '\n']) {
+            continue; // can't be represented in M3U
         }
-        std::fs::write(path, s)
+        if let Some(extinf) = &e.extinf {
+            s.push_str(&one_line(extinf));
+            s.push('\n');
+        }
+        s.push_str(&entry);
+        s.push('\n');
+    }
+    s
+}
+
+fn m3u_entry(source: &MediaSource, base: Option<&Path>) -> String {
+    match source {
+        MediaSource::File(p) => base
+            .and_then(|b| p.strip_prefix(b).ok())
+            .map(|r| r.display().to_string())
+            // A relative name starting with '#' would read back as a comment.
+            .filter(|r| !r.is_empty() && !r.starts_with('#'))
+            .unwrap_or_else(|| p.display().to_string()),
+        MediaSource::Url(u) => u.clone(),
+        MediaSource::Dvd { path, title, angle } if *angle > 1 => format!("dvd://{title}/{path}#angle={angle}"),
+        MediaSource::Dvd { path, title, .. } => format!("dvd://{title}/{path}"),
+        MediaSource::Cd { device, track } => format!("cdda://{track}/{device}"),
     }
 }
 
@@ -553,6 +597,13 @@ pub fn source_for_arg(arg: &str) -> MediaSource {
     let lower = arg.to_ascii_lowercase();
     if lower.starts_with("dvd://") {
         let rest = &arg[6..];
+        // Playlists write an angle other than the first as `#angle=N`.
+        let (rest, angle) = match rest.rsplit_once("#angle=") {
+            Some((r, a)) if !a.is_empty() && a.chars().all(|c| c.is_ascii_digit()) => {
+                (r, a.parse::<u32>().unwrap_or(1).max(1))
+            }
+            _ => (rest, 1),
+        };
         let (title, path) = match rest.split_once('/') {
             Some((t, p)) if t.chars().all(|c| c.is_ascii_digit()) => (t.parse().unwrap_or(0), p.to_string()),
             _ if rest.chars().all(|c| c.is_ascii_digit()) => (rest.parse().unwrap_or(0), default_dvd_device()),
@@ -565,7 +616,7 @@ pub fn source_for_arg(arg: &str) -> MediaSource {
         } else {
             path
         };
-        return MediaSource::Dvd { path, title, angle: 1 };
+        return MediaSource::Dvd { path, title, angle };
     }
     if lower.starts_with("cdda://") {
         return cdda_source(&arg[7..]);
@@ -635,12 +686,23 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-fn is_hls(path: &Path) -> bool {
+pub(crate) fn is_hls(path: &Path) -> bool {
     std::fs::read_to_string(path).map(|s| s.contains("#EXT-X-")).unwrap_or(false)
 }
 
 fn parse_playlist_file(path: &Path) -> Vec<MediaSource> {
-    let Ok(text) = std::fs::read_to_string(path) else { return vec![] };
+    read_playlist_file(path).map(|f| f.entries.into_iter().map(|e| e.source).collect()).unwrap_or_default()
+}
+
+/// Reads an M3U or PLS playlist. Text that isn't UTF-8 (old Latin-1 `.m3u`
+/// files) is decoded lossily and flagged, so its names still mostly play.
+pub fn read_playlist_file(path: &Path) -> std::io::Result<PlaylistFile> {
+    let data = std::fs::read(path)?;
+    let data = data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data);
+    let (text, lossy) = match std::str::from_utf8(data) {
+        Ok(t) => (std::borrow::Cow::Borrowed(t), false),
+        Err(_) => (String::from_utf8_lossy(data), true),
+    };
     let base = path.parent().unwrap_or(Path::new("."));
     let resolve = |entry: &str| -> MediaSource {
         let e = entry.trim();
@@ -652,15 +714,25 @@ fn parse_playlist_file(path: &Path) -> Vec<MediaSource> {
         }
     };
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    if ext == "pls" {
+    let entries = if ext == "pls" {
         text.lines()
             .filter_map(|l| l.trim().split_once('='))
             .filter(|(k, _)| k.to_ascii_lowercase().starts_with("file"))
-            .map(|(_, v)| resolve(v))
+            .map(|(_, v)| M3uEntry { source: resolve(v), extinf: None })
             .collect()
     } else {
-        text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(resolve).collect()
-    }
+        let mut entries = Vec::new();
+        let mut extinf = None;
+        for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if line.get(..8).is_some_and(|h| h.eq_ignore_ascii_case("#EXTINF:")) {
+                extinf = Some(line.to_string());
+            } else if !line.starts_with('#') {
+                entries.push(M3uEntry { source: resolve(line), extinf: extinf.take() });
+            }
+        }
+        entries
+    };
+    Ok(PlaylistFile { entries, lossy })
 }
 
 /// Expands files, folders and playlist files into playable sources.
@@ -896,6 +968,43 @@ mod tests {
         let back = parse_playlist_file(&f);
         let _ = std::fs::remove_file(&f);
         assert_eq!(back, vec![MediaSource::File("/m/a.mkv".into())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn m3u_round_trip_keeps_titles_relative_paths_and_dvd_angles() {
+        let d = std::env::temp_dir().join(format!("mavplayer-m3u-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("list.m3u");
+        let entries = vec![
+            M3uEntry {
+                source: MediaSource::File(d.join("sub/a.flac")),
+                extinf: Some("#EXTINF:240,Artist – Song".into()),
+            },
+            M3uEntry { source: MediaSource::File(d.join("#hash.mp3")), extinf: None },
+            M3uEntry { source: MediaSource::File("/elsewhere/b.mkv".into()), extinf: None },
+            M3uEntry { source: MediaSource::Dvd { path: "/dev/sr0".into(), title: 3, angle: 2 }, extinf: None },
+            M3uEntry { source: MediaSource::Dvd { path: "/dev/sr0".into(), title: 1, angle: 1 }, extinf: None },
+        ];
+        let text = m3u_text(&entries, Some(&d));
+        assert!(text.contains("\nsub/a.flac\n"), "{text}");
+        assert!(text.contains(&format!("\n{}\n", d.join("#hash.mp3").display())), "{text}");
+        std::fs::write(&f, &text).unwrap();
+        let back = read_playlist_file(&f).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(!back.lossy);
+        assert_eq!(back.entries, entries);
+    }
+
+    #[test]
+    fn non_utf8_playlists_are_read_lossily() {
+        let f = std::env::temp_dir().join(format!("mavplayer-latin1-{}.m3u", std::process::id()));
+        std::fs::write(&f, b"/m/caf\xe9.mp3\n/m/b.mp3\n").unwrap();
+        let back = read_playlist_file(&f).unwrap();
+        let _ = std::fs::remove_file(&f);
+        assert!(back.lossy);
+        assert_eq!(back.entries.len(), 2);
     }
 
     #[cfg(unix)]

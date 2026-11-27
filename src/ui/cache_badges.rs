@@ -36,13 +36,7 @@ impl Entry {
         if video.is_none() && item.audio_stream.is_none() {
             return None;
         }
-        Some(Self {
-            id: item.id,
-            path: path.clone(),
-            video,
-            audio: item.audio_stream,
-            directory: settings.thumbnail_cache_dir(),
-        })
+        Some(Self { id: item.id, path: path.clone(), video, audio: item.audio_stream, directory: settings.cache_dir() })
     }
 }
 

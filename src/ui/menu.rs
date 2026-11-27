@@ -366,6 +366,10 @@ impl PlayerView {
                         _ => div().size(px(14.)).into_any_element(),
                     };
                     let pp = path_prefix.clone();
+                    // Styled like the Preferences category list: the chosen item of a
+                    // list is tinted with orange text, and hovering any other row
+                    // only lightens it.
+                    let chosen = *radio && *checked == Some(true);
                     div()
                         .id(SharedString::from(format!("mi-{level}-{i}")))
                         .h(px(if thumbnail.is_some() { 56.0 } else { ITEM_H }))
@@ -377,7 +381,8 @@ impl PlayerView {
                         .items_center()
                         .rounded(px(5.))
                         .text_color(color)
-                        .when(enabled, |d| d.hover(|s| s.bg(theme.accent).text_color(theme.on_accent)))
+                        .when(chosen, |d| d.bg(theme.chosen).text_color(theme.accent))
+                        .when(enabled && !chosen, |d| d.hover(|s| s.bg(theme.hover)))
                         // Every lead (radio dot, check, icon or blank) takes the same
                         // fixed slot, so the labels line up.
                         .when(has_checks, |d| {

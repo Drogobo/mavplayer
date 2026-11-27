@@ -1352,6 +1352,24 @@ pub struct PathPromptOptions {
     pub multiple: bool,
     /// The prompt to show to a user when selecting a path
     pub prompt: Option<SharedString>,
+    /// MAVPLAYER-PATCH: the file types offered, the first one selected. Empty:
+    /// every file. Ignored when picking directories. macOS has no list to
+    /// choose from, so it only shows the first filter's files.
+    pub filters: Vec<PathFilter>,
+}
+
+/// MAVPLAYER-PATCH: one choice in an open dialog's list of file types.
+#[derive(Clone, Debug, Default)]
+pub struct PathFilter {
+    /// What the dialog calls it, such as "Video files".
+    pub name: SharedString,
+    /// Extensions without the dot (matched in any case where the dialog can).
+    /// Empty, with no MIME types either: every file.
+    pub extensions: Vec<SharedString>,
+    /// MIME types, wildcards allowed (`video/*`). Only the Linux portal uses
+    /// them, in addition to the extensions: GTK matches patterns case-sensitively
+    /// but guesses MIME types from names in any case.
+    pub mime_types: Vec<SharedString>,
 }
 
 /// What kind of prompt styling to show

@@ -496,6 +496,9 @@ pub enum Upscaler {
     /// The GPU's bilinear texture filtering when drawing (cheapest).
     #[default]
     Bilinear,
+    /// Bilinear, by swscale (or `scale_cuda`) in the presenter: the picture
+    /// reaches the GPU already at display size, like the other presenter filters.
+    Linear,
     /// Nearest neighbour on the CPU: hard pixel edges, for pixel art.
     Nearest,
     /// Bicubic, by swscale (or `scale_cuda` for pictures on the GPU) in the
@@ -526,7 +529,7 @@ pub enum Upscaler {
 impl Upscaler {
     /// Whether this runs on the GPU through FFmpeg's libplacebo filter.
     pub fn needs_libplacebo(self) -> bool {
-        !matches!(self, Upscaler::Bilinear | Upscaler::Nearest | Upscaler::Bicubic)
+        !matches!(self, Upscaler::Bilinear | Upscaler::Linear | Upscaler::Nearest | Upscaler::Bicubic)
     }
 
     /// The filter the presenter enlarges with for this upscaler, or `None`
@@ -534,6 +537,7 @@ impl Upscaler {
     pub fn presenter_filter(self) -> Option<ScaleQuality> {
         match self {
             Upscaler::Nearest => Some(ScaleQuality::Nearest),
+            Upscaler::Linear => Some(ScaleQuality::Linear),
             Upscaler::Bicubic => Some(ScaleQuality::Good),
             _ => None,
         }
@@ -542,6 +546,7 @@ impl Upscaler {
     pub fn label(self) -> &'static str {
         match self {
             Upscaler::Bilinear => "Bilinear (fastest)",
+            Upscaler::Linear => "Linear",
             Upscaler::Nearest => "Nearest neighbor (pixel art)",
             Upscaler::Bicubic => "Bicubic (sharper)",
             Upscaler::EwaLanczos => "EWA Lanczos (high quality)",
@@ -557,8 +562,9 @@ impl Upscaler {
         }
     }
 
-    pub const ALL: [Upscaler; 13] = [
+    pub const ALL: [Upscaler; 14] = [
         Upscaler::Bilinear,
+        Upscaler::Linear,
         Upscaler::Bicubic,
         Upscaler::Nearest,
         Upscaler::EwaLanczos,

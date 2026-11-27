@@ -92,6 +92,8 @@ pub struct Scrub {
 /// on, nothing can still be reading it. (Each extra one kept a whole frame,
 /// 8 MB at 1080p and 33 MB at 4K, in video memory.)
 const RETIRE_AFTER: u8 = 2;
+
+const LIBRARY_LOCKED: &str = "Playlists can't be changed: playlists.json is from a newer MavPlayer or damaged";
 /// Minimum time between seeks while the progress bar is dragged.
 const SCRUB_INTERVAL: Duration = Duration::from_millis(60);
 /// How long the pointer must rest on the bar before an exact seek there.
@@ -180,12 +182,15 @@ pub struct PlayerView {
     pub modal_drag_origin: Option<ModalDragOrigin>,
     /// Actual bounds of the modal, updated after layout.
     pub modal_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The window's size when dialogs were last laid out; large dialogs size themselves from it.
+    pub dialog_viewport: gpui::Size<Pixels>,
     pub drag: Option<Drag>,
     pub(super) timeline_edge_drag: bool,
     pub seek_hover: Option<f32>,
     pub(super) thumbnails: super::thumbnails::TimelineThumbnails,
     pub(super) playlist_previews: super::playlist_thumbnails::PlaylistPreviews,
     pub(super) cache_badges: super::cache_badges::CacheBadges,
+    pub(super) album_art: super::album_art::AlbumArt,
     pub scrub: Option<Scrub>,
     /// The playlist beside the video in a window (saved in settings).
     pub show_playlist: bool,
@@ -315,7 +320,10 @@ impl Boot {
         player.set_audio_fx(settings.audio_fx.clone());
         let resume = ResumeStore::load();
         let mut playlist_library = PlaylistLibrary::load(primary);
-        let (start_index, restored_position) = if sources.is_empty() {
+        let (start_index, restored_position) = if sources.is_empty() && !primary {
+            playlist_library.start_blank();
+            (None, None)
+        } else if sources.is_empty() {
             let snapshot = playlist_library.snapshot();
             sources = snapshot.sources.clone();
             (snapshot.current, Some(snapshot.position))
@@ -467,9 +475,11 @@ impl PlayerView {
             let ks = ev.keystroke.clone();
             me.update(cx, |v, cx| v.capture_keystroke(&ks, cx));
         }));
-        subs.push(cx.observe_window_activation(window, |v, window, _| {
+        subs.push(cx.observe_window_activation(window, |v, window, cx| {
             if !window.is_window_active() {
                 v.deactivated_at = Some(Instant::now());
+            } else {
+                v.refresh_playlist_library(cx);
             }
         }));
         subs.push(cx.observe_window_appearance(window, |v, window, cx| {
@@ -564,12 +574,14 @@ impl PlayerView {
             modal_offset: (0.0, 0.0),
             modal_drag_origin: None,
             modal_bounds: Rc::new(Cell::new(Bounds::default())),
+            dialog_viewport: gpui::Size::default(),
             drag: None,
             timeline_edge_drag: false,
             seek_hover: None,
             thumbnails: Default::default(),
             playlist_previews: super::playlist_thumbnails::PlaylistPreviews::with_wake(preview_tx),
             cache_badges: Default::default(),
+            album_art: Default::default(),
             scrub: None,
             playlist_selection: Default::default(),
             playlist_hovered: None,
@@ -884,6 +896,13 @@ impl PlayerView {
         let current = self.player.state();
         let playlist_shown = self.playlist_shown();
         changed |= self.cache_badges.update(playlist_shown);
+        changed |= self.album_art.update(
+            playlist_shown && self.settings.album_art && self.settings.playlist_thumbnails.inline(),
+            &self.settings.cache_dir(),
+        );
+        if self.album_art.take_finished() {
+            self.thumbnails.refresh_cache_stats();
+        }
         let (playlist_changed, retired) =
             self.playlist_previews.update(&self.settings, playlist_shown, &self.thumbnails, &current);
         self.retired.extend(retired.into_iter().map(|id| (id, RETIRE_AFTER)));
@@ -1367,6 +1386,11 @@ impl PlayerView {
     /// Frees the texture of a picture no longer shown, a few frames later.
     /// A picture that was never drawn has none: it is just dropped.
     /// (Retiring those would pile up while the window isn't drawn.)
+    /// Frees textures a few frames from now (see `retire_textures`).
+    pub(super) fn retire_images(&mut self, ids: impl IntoIterator<Item = ImageId>) {
+        self.retired.extend(ids.into_iter().map(|id| (id, RETIRE_AFTER)));
+    }
+
     fn retire_frame(&mut self, old: Option<Arc<RenderImage>>) {
         if let Some(old) = old
             && self.frame_painted
@@ -1525,14 +1549,19 @@ impl PlayerView {
 
     pub(super) fn save_playlist_workspace(&mut self, cx: &mut Context<Self>) {
         if !self.playlist_library.writable {
-            self.osd("Playlist state is not writable in this window", cx);
+            self.osd(LIBRARY_LOCKED, cx);
             return;
         }
         let snapshot = self.playlist_snapshot();
         self.playlist_library.capture(snapshot, true, true);
+        let slot = self.playlist_library.active_slot();
+        let read_only = slot.read_only.then(|| {
+            let why = if slot.missing { "is missing" } else { "can't be written" };
+            format!("‘{}’ {why}: only the position was saved", slot.name)
+        });
         match self.playlist_library.flush() {
-            Ok(()) => self.osd("Playlist state saved", cx),
             Err(err) => self.osd(format!("Could not save playlist state: {err}"), cx),
+            Ok(()) => self.osd(read_only.unwrap_or_else(|| "Playlist state saved".into()), cx),
         }
     }
 
@@ -1590,7 +1619,7 @@ impl PlayerView {
 
     pub(super) fn duplicate_playlist_workspace(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
         if !self.playlist_library.writable {
-            self.osd("Playlist state is not writable in this window", cx);
+            self.osd(LIBRARY_LOCKED, cx);
             return;
         }
         if !self.playlist_library.valid_name(&name, false) {
@@ -1626,6 +1655,72 @@ impl PlayerView {
             self.osd(format!("Could not save playlists: {err}"), cx);
         }
         cx.notify();
+    }
+
+    /// Takes in playlists other windows saved. Called when the window gains
+    /// focus. The playlist playing here keeps what it has until it stops.
+    pub(super) fn refresh_playlist_library(&mut self, cx: &mut Context<Self>) {
+        // Our own changes go first, so they're merged rather than lost.
+        self.save_playlist_session(false, false);
+        let busy = matches!(self.player.state().status, Status::Loading | Status::Playing | Status::Paused);
+        if self.playlist_library.refresh(busy) {
+            let snapshot = self.playlist_library.snapshot().clone();
+            self.playlist.clear();
+            self.playlist_selection.clear();
+            self.playlist_hovered = None;
+            self.playlist_previews.hover = None;
+            self.armed = None;
+            self.playlist.add(snapshot.sources);
+            self.probe_playlist(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn prompt_open_playlist_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Open playlist file".into()),
+            filters: super::file_types::playlists(),
+        });
+        cx.spawn_in(window, async move |this, cx| match rx.await {
+            Ok(Ok(Some(paths))) => {
+                let _ = this.update_in(cx, |v, window, cx| v.open_playlist_files(paths, window, cx));
+            }
+            Ok(Err(e)) => {
+                let _ = this.update(cx, |v, cx| v.osd(format!("File dialog failed: {e}"), cx));
+            }
+            _ => {}
+        })
+        .detach();
+    }
+
+    /// Adds `.m3u` files to the playlist list, linked to where they are, and
+    /// switches to the last one.
+    pub(super) fn open_playlist_files(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.playlist_library.writable {
+            self.osd(LIBRARY_LOCKED, cx);
+            return;
+        }
+        let mut last = None;
+        for path in paths {
+            match self.playlist_library.link(&path) {
+                Ok(index) => last = Some(index),
+                Err(e) => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    self.osd(format!("Could not open {name}: {e}"), cx);
+                }
+            }
+        }
+        let Some(index) = last else { return };
+        if index == self.playlist_library.active {
+            return;
+        }
+        self.switch_playlist_workspace(index, window, cx);
+        if self.playlist_library.active_slot().read_only {
+            self.osd(format!("Opened ‘{}’ read-only: it isn't UTF-8 text", self.playlist_library.name()), cx);
+        }
     }
 
     pub fn save_state(&mut self) {
@@ -1933,6 +2028,7 @@ impl PlayerView {
             directories: dirs_mode,
             multiple: true,
             prompt: Some(if dirs_mode { "Add folder" } else { "Add files" }.into()),
+            filters: super::file_types::media(),
         });
         cx.spawn_in(window, async move |this, cx| match rx.await {
             Ok(Ok(Some(paths))) => {
@@ -1953,6 +2049,7 @@ impl PlayerView {
             directories: dirs_mode,
             multiple: !subtitle,
             prompt: Some(if subtitle { "Load Subtitles" } else { "Open" }.into()),
+            filters: if subtitle { super::file_types::subtitles() } else { super::file_types::media() },
         });
         cx.spawn_in(window, async move |this, cx| match rx.await {
             Ok(Ok(Some(paths))) if !paths.is_empty() => {
@@ -3049,6 +3146,7 @@ impl PlayerView {
                 if this.player.is_active() { this.prompt_open(false, true, w, cx) } else { this.osd("Open a video first", cx) }
             },
             SavePlaylist => |this, w, cx| this.save_playlist(w, cx),
+            OpenPlaylistFile => |this, w, cx| this.prompt_open_playlist_file(w, cx),
             ShowPreferences => |this, w, cx| this.show_dialog(Dialog::Settings(0), w, cx),
             ShowEffects => |this, w, cx| this.show_dialog(Dialog::Effects(0), w, cx),
             TogglePlaylist => |this, w, cx| this.toggle_playlist(w, cx),
@@ -3166,7 +3264,7 @@ impl PlayerView {
 }
 
 fn engine_sub_ext(ext: &str) -> bool {
-    matches!(ext, "srt" | "ass" | "ssa" | "vtt" | "sub" | "idx" | "smi" | "sup" | "ttml" | "lrc")
+    engine::SUB_EXTS.contains(&ext)
 }
 
 /// Parses a typed volume percentage: "80", "80%", " 72.5 % ".

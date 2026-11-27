@@ -2,11 +2,13 @@
 
 pub mod actions;
 mod activity;
+mod album_art;
 mod background_priority;
 pub mod bar;
 mod barcode;
 mod cache_badges;
 pub mod dialogs;
+mod file_types;
 pub mod keymap;
 pub mod media_keys;
 pub mod menu;

@@ -53,3 +53,12 @@ times a second (or more on faster displays). Now (`platform/linux/wayland/window
 Besides that, two float literals in `src/taffy.rs` are typed `f32` (a
 future-incompatibility warning that path dependencies show). Nothing else is
 changed.
+
+`PathPromptOptions` has a `filters` list (`PathFilter`: a name, extensions and,
+for the Linux portal, MIME types), so open dialogs can show only the files
+MavPlayer can open. Upstream offers no filters at all. The first filter is
+selected. The Linux portal gets each as a `FileFilter` (MIME types plus
+`*.ext` globs; GTK matches globs case-sensitively but guesses MIME types from
+names in any case), Windows as `SetFileTypes`, and macOS, whose open panel has
+no list of types, shows only the first filter's extensions
+(`setAllowedFileTypes:`). Directory pickers ignore it.

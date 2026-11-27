@@ -23,6 +23,9 @@ pub struct Theme {
     /// The icon's lavender, where the brand gradient ends.
     pub accent_end: Hsla,
     pub accent_soft: Hsla,
+    /// A menu list's chosen item: `accent_soft` over `surface_alt`, as a solid
+    /// colour, so it matches the current Preferences category on menus' darker background.
+    pub chosen: Hsla,
     pub on_accent: Hsla,
     pub hover: Hsla,
     pub pressed: Hsla,
@@ -47,6 +50,7 @@ impl Theme {
             accent: rgb(0xf4682a).into(),
             accent_end: rgb(0xa08cff).into(),
             accent_soft: rgba(0xf4682a33).into(),
+            chosen: rgb(0x56382d).into(),
             on_accent: rgb(0xffffff).into(),
             hover: rgba(0xffffff14).into(),
             pressed: rgba(0xffffff22).into(),
@@ -71,6 +75,7 @@ impl Theme {
             accent: rgb(0xdf520e).into(),
             accent_end: rgb(0x8670ee).into(),
             accent_soft: rgba(0xdf520e24).into(),
+            chosen: rgb(0xefd8ce).into(),
             on_accent: rgb(0xffffff).into(),
             hover: rgba(0x0000000f).into(),
             pressed: rgba(0x0000001c).into(),

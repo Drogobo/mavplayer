@@ -722,6 +722,16 @@ impl Platform for MacPlatform {
 
                     panel.setCanCreateDirectories(true.to_objc());
                     panel.setResolvesAliases_(false.to_objc());
+                    // MAVPLAYER-PATCH: an open panel has no list of file types to
+                    // choose from: show the first filter's files.
+                    if !options.directories
+                        && let Some(filter) = options.filters.first()
+                        && !filter.extensions.is_empty()
+                    {
+                        let types: Vec<id> = filter.extensions.iter().map(|e| ns_string(e)).collect();
+                        let types = NSArray::arrayWithObjects(nil, &types);
+                        let _: () = msg_send![panel, setAllowedFileTypes: types];
+                    }
                     let done_tx = Cell::new(Some(done_tx));
                     let block = ConcreteBlock::new(move |response: NSModalResponse| {
                         let result = if response == NSModalResponse::NSModalResponseOk {

@@ -922,6 +922,31 @@ fn file_open_dialog(
             folder_dialog.SetOkButtonLabel(&HSTRING::from(prompt))?;
         }
 
+        // MAVPLAYER-PATCH: file type filters. The strings must outlive the call.
+        if !options.directories && !options.filters.is_empty() {
+            let strings: Vec<(HSTRING, HSTRING)> = options
+                .filters
+                .iter()
+                .map(|f| {
+                    let spec = if f.extensions.is_empty() {
+                        "*.*".to_string()
+                    } else {
+                        f.extensions.iter().map(|e| format!("*.{e}")).join(";")
+                    };
+                    (HSTRING::from(f.name.as_ref()), HSTRING::from(spec))
+                })
+                .collect();
+            let specs: Vec<Common::COMDLG_FILTERSPEC> = strings
+                .iter()
+                .map(|(name, spec)| Common::COMDLG_FILTERSPEC {
+                    pszName: PCWSTR(name.as_ptr()),
+                    pszSpec: PCWSTR(spec.as_ptr()),
+                })
+                .collect();
+            folder_dialog.SetFileTypes(&specs)?;
+            folder_dialog.SetFileTypeIndex(1)?;
+        }
+
         if folder_dialog.Show(window).is_err() {
             // User cancelled
             return Ok(None);

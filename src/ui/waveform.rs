@@ -33,7 +33,7 @@ impl Request {
         if !media.seekable || !media.duration.is_finite() || media.duration <= 0.0 {
             return None;
         }
-        Some(Self { path: path.clone(), stream: Some(stream), directory: settings.thumbnail_cache_dir() })
+        Some(Self { path: path.clone(), stream: Some(stream), directory: settings.cache_dir() })
     }
     fn wanted(st: &PlaybackState, settings: &Settings, fullscreen: bool) -> Option<Self> {
         let auto_audio = st
@@ -171,7 +171,7 @@ impl Waveform {
         if !settings.timeline_waveform {
             return;
         }
-        let request = Request { path, stream, directory: settings.thumbnail_cache_dir() };
+        let request = Request { path, stream, directory: settings.cache_dir() };
         if let Some(job) = self.queue.iter_mut().find(|j| j.request == request) {
             job.force |= force;
             return;
@@ -248,7 +248,7 @@ impl Waveform {
         })
     }
     pub(super) fn update(&mut self, player: &Player, settings: &Settings, fullscreen: bool) -> bool {
-        let directory = settings.thumbnail_cache_dir();
+        let directory = settings.cache_dir();
         if !settings.timeline_waveform || self.directory.as_ref().is_some_and(|d| d != &directory) {
             self.clear_pending();
             self.reset();

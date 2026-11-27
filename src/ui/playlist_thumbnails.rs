@@ -35,7 +35,7 @@ impl Key {
             path: path.clone(),
             stream: item.video_stream?,
             count: crate::engine::thumbnails::sample_count(duration),
-            directory: settings.thumbnail_cache_dir(),
+            directory: settings.cache_dir(),
         })
     }
     pub fn selection_key(&self) -> String {
@@ -496,7 +496,7 @@ impl PlaylistPreviews {
             .filter(|h| {
                 visible
                     && Self::mode(settings).scrubbing()
-                    && h.key.directory == settings.thumbnail_cache_dir()
+                    && h.key.directory == settings.cache_dir()
                     && timeline.for_playlist(&h.key.path, h.key.stream, h.key.count, 0.0).is_none()
                     && !timeline.busy_for(&h.key.path, Some(h.key.stream))
             })
@@ -597,7 +597,7 @@ impl PlaylistPreviews {
         current: &PlaybackState,
     ) -> (bool, Vec<ImageId>) {
         let mode = Self::mode(settings);
-        let directory = settings.thumbnail_cache_dir();
+        let directory = settings.cache_dir();
         let mut changed = false;
         if self.directory.as_ref() != Some(&directory) || self.mode != Some(mode) {
             let directory_changed = self.directory.as_ref().is_some_and(|d| d != &directory);
@@ -858,7 +858,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.playlist_thumbnails = PlaylistThumbnails::Inline;
         settings.timeline_thumbnails = true;
-        let key = Key { path: "movie.mp4".into(), stream: 0, count: 20, directory: settings.thumbnail_cache_dir() };
+        let key = Key { path: "movie.mp4".into(), stream: 0, count: 20, directory: settings.cache_dir() };
         let make = |time| Preview::from_bgra(Thumbnail { time, image: image::RgbaImage::new(2, 2) });
         let default = make(5.0);
         let chosen = make(35.0);

@@ -119,24 +119,30 @@ pub struct PlaylistDrag {
 struct PlaylistDragPreview {
     title: SharedString,
     theme: Theme,
+    /// Where the row was grabbed, relative to its top-left corner. GPUI draws
+    /// the preview at `pointer - grab`, so the tag is pushed out by this much
+    /// to sit just below and to the right of the pointer.
+    grab: Point<Pixels>,
 }
 
 impl Render for PlaylistDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme;
-        div()
-            .max_w(px(280.))
-            .px_3()
-            .py_1()
-            .rounded(px(6.))
-            .bg(t.surface)
-            .border_1()
-            .border_color(t.accent)
-            .shadow_md()
-            .text_size(px(13.))
-            .text_color(t.text)
-            .truncate()
-            .child(self.title.clone())
+        div().pl(self.grab.x + px(14.)).pt(self.grab.y + px(12.)).child(
+            div()
+                .max_w(px(280.))
+                .px_3()
+                .py_1()
+                .rounded(px(6.))
+                .bg(t.surface)
+                .border_1()
+                .border_color(t.accent)
+                .shadow_md()
+                .text_size(px(13.))
+                .text_color(t.text)
+                .truncate()
+                .child(self.title.clone()),
+        )
     }
 }
 
@@ -345,7 +351,7 @@ impl PlayerView {
                 r(self, d.last, window, cx);
             }
             if self.menu.as_ref().is_some_and(|m| m.timeline_settings)
-                || matches!(self.dialog, Some(super::dialogs::Dialog::Settings(1)))
+                || matches!(self.dialog, Some(super::dialogs::Dialog::Settings(super::dialogs::THUMBNAILS_TAB)))
             {
                 self.settings.save();
             }
@@ -1296,7 +1302,7 @@ impl PlayerView {
         let extra = if filmstrip { height + 2.0 } else { 0.0 };
         let resizing = self.drag.is_some()
             && (self.timeline_edge_drag
-                || matches!(self.dialog, Some(super::dialogs::Dialog::Settings(1)))
+                || matches!(self.dialog, Some(super::dialogs::Dialog::Settings(super::dialogs::THUMBNAILS_TAB)))
                 || self.menu.as_ref().is_some_and(|m| m.timeline_settings));
         div()
             .id("seek")
@@ -1946,6 +1952,14 @@ impl PlayerView {
                     })),
             )
             .child(self.icon_button(
+                "pl-open",
+                Icon::PlaylistFile,
+                "Open playlist file",
+                t,
+                |this, _, w, cx| this.prompt_open_playlist_file(w, cx),
+                cx,
+            ))
+            .child(self.icon_button(
                 "pl-search",
                 Icon::Search,
                 "Filter playlist",
@@ -2038,6 +2052,20 @@ impl PlayerView {
                         })
                         .collect();
                     this.playlist_previews.retain_visible(&visible);
+                    if this.settings.album_art {
+                        let music = range
+                            .clone()
+                            .filter_map(|i| {
+                                filtered
+                                    .get(i)
+                                    .and_then(|&j| this.playlist.items.get(j))
+                                    .and_then(super::album_art::AlbumArt::path)
+                                    .map(std::path::Path::to_path_buf)
+                            })
+                            .collect();
+                        let retired = this.album_art.note_visible(music);
+                        this.retire_images(retired);
+                    }
                 }
                 range
                     .map(|display_index| {
@@ -2083,7 +2111,11 @@ impl PlayerView {
                         let key = super::playlist_thumbnails::Key::new(it, &this.settings);
                         let entry = super::cache_badges::Entry::new(it, &this.settings);
                         let cached = entry.as_ref().map(|entry| this.cache_badges.get(entry)).unwrap_or_default();
-                        let audio_preview = if it.video_stream.is_none() && mode.inline() {
+                        let cover = super::album_art::AlbumArt::path(it)
+                            .filter(|_| mode.inline() && this.settings.album_art)
+                            .and_then(|path| this.album_art.get(path))
+                            .cloned();
+                        let audio_preview = if it.video_stream.is_none() && mode.inline() && cover.is_none() {
                             entry.as_ref().and_then(|entry| this.cache_badges.waveform(entry))
                         } else {
                             None
@@ -2098,7 +2130,9 @@ impl PlayerView {
                             });
                         let bounds = Rc::new(Cell::new(Bounds::default()));
                         let measured = bounds.clone();
-                        let image = if mode.inline() {
+                        let image = if cover.is_some() {
+                            cover
+                        } else if mode.inline() {
                             key.as_ref().and_then(|key| {
                                 let representative = key.representative_time(&this.settings, duration);
                                 let scrub = mode == PlaylistThumbnails::Inline
@@ -2222,9 +2256,13 @@ impl PlayerView {
                             .cursor_pointer()
                             .when(is_cur, |d| d.bg(t.accent_soft))
                             .when(selected && !is_cur, |d| d.bg(t.pressed))
-                            .when(selected && is_cur, |d| d.bg(t.accent_soft).border_1().border_color(t.accent))
                             .hover(|s| s.bg(t.hover))
                             .child(hover_sync)
+                            // Drawn over the row rather than as its own border, which
+                            // would push the icon and title over by a pixel.
+                            .when(selected && is_cur, |d| {
+                                d.child(div().absolute().inset_0().rounded(px(6.)).border_1().border_color(t.accent))
+                            })
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                 if *hovered {
                                     if this.playlist_hovered != Some(item_id) {
@@ -2438,9 +2476,9 @@ impl PlayerView {
                             .when(dragging && drop_at == Some(i), |d| d.child(marker(true)))
                             .when(dragging && i + 1 == count && drop_at == Some(count), |d| d.child(marker(false)))
                             .when(!filter_active, |d| {
-                                d.on_drag(drag_value, move |d, _, _, cx| {
+                                d.on_drag(drag_value, move |d, grab, _, cx| {
                                     let title = d.title.clone();
-                                    cx.new(|_| PlaylistDragPreview { title, theme: t })
+                                    cx.new(|_| PlaylistDragPreview { title, theme: t, grab })
                                 })
                             })
                             .on_click(cx.listener(move |this, ev: &ClickEvent, w, cx| {
@@ -2701,7 +2739,7 @@ impl PlayerView {
             .enumerate()
             .filter(|(_, slot)| slot.open)
             .map(|(index, slot)| {
-                M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx))
+                M::action(slot.label(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx))
                     .selected(index == self.playlist_library.active)
             })
             .collect()
@@ -2752,9 +2790,10 @@ impl PlayerView {
             .enumerate()
             .filter(|(_, slot)| !slot.open)
             .map(|(index, slot)| {
-                M::action(slot.name.clone(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx))
+                M::action(slot.label(), move |this, w, cx| this.switch_playlist_workspace(index, w, cx))
             })
             .collect();
+        let linked = self.playlist_library.active_slot().link.is_some();
         vec![
             M::submenu("Switch playlist", playlists),
             M::submenu("Open saved playlist", closed),
@@ -2763,6 +2802,9 @@ impl PlayerView {
             M::action("New playlist…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::NamePlaylist(false), w, cx)
             }),
+            M::action("Open playlist file…", |this, w, cx| this.prompt_open_playlist_file(w, cx))
+                .icon(Icon::PlaylistFile)
+                .enabled(self.playlist_library.writable),
             M::action("Duplicate playlist as…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::DuplicatePlaylist, w, cx)
             })
@@ -2770,7 +2812,7 @@ impl PlayerView {
             M::action("Rename playlist…", |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::NamePlaylist(true), w, cx)
             }),
-            M::action("Delete playlist…", |this, w, cx| {
+            M::action(if linked { "Remove from list…" } else { "Delete playlist…" }, |this, w, cx| {
                 this.show_dialog(super::dialogs::Dialog::DeletePlaylist, w, cx)
             })
             .icon(Icon::Delete)

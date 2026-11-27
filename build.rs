@@ -37,6 +37,7 @@ const ICONS: &[&str] = &[
     "window-maximize",
     "window-restore",
     "document-open",
+    "playlist",
     "folder-open",
     "list-add",
     "list-remove",

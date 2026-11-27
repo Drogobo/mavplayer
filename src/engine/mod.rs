@@ -20,6 +20,7 @@
 mod audio;
 pub mod av;
 pub mod cdda;
+pub mod cover;
 mod decoder;
 mod demux;
 pub mod disc;
@@ -38,6 +39,7 @@ mod upscale;
 mod video;
 pub mod waveform;
 
+pub use subs::SUB_EXTS;
 pub use types::*;
 
 /// Whether DVDs can be played with their menus (this build has libdvdnav).

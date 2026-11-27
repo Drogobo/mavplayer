@@ -309,6 +309,29 @@ impl<P: LinuxClient + 'static> Platform for P {
                     "Open File"
                 };
 
+                // MAVPLAYER-PATCH: file type filters.
+                let filters: Vec<_> = if options.directories {
+                    Vec::new()
+                } else {
+                    options
+                        .filters
+                        .iter()
+                        .map(|f| {
+                            let mut filter = ashpd::desktop::file_chooser::FileFilter::new(&f.name);
+                            for mime in &f.mime_types {
+                                filter = filter.mimetype(mime);
+                            }
+                            for ext in &f.extensions {
+                                filter = filter.glob(&format!("*.{ext}"));
+                            }
+                            if f.mime_types.is_empty() && f.extensions.is_empty() {
+                                filter = filter.glob("*");
+                            }
+                            filter
+                        })
+                        .collect()
+                };
+                let current = filters.first().cloned();
                 let request = match ashpd::desktop::file_chooser::OpenFileRequest::default()
                     .identifier(identifier.await)
                     .modal(true)
@@ -316,6 +339,8 @@ impl<P: LinuxClient + 'static> Platform for P {
                     .accept_label(options.prompt.as_ref().map(crate::SharedString::as_str))
                     .multiple(options.multiple)
                     .directory(options.directories)
+                    .filters(filters)
+                    .current_filter(current)
                     .send()
                     .await
                 {

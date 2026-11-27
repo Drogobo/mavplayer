@@ -59,7 +59,7 @@ impl Request {
         Some(Self {
             path: path.clone(),
             stream,
-            directory: settings.thumbnail_cache_dir(),
+            directory: settings.cache_dir(),
             count: crate::engine::thumbnails::sample_count(media.duration),
         })
     }
@@ -383,7 +383,7 @@ impl TimelineThumbnails {
         {
             let previews = self.previews.clone();
             let fingerprint = self.barcode_fingerprint.clone();
-            let directory = settings.thumbnail_cache_dir();
+            let directory = settings.cache_dir();
             let stop = Arc::new(AtomicBool::new(false));
             let worker_stop = stop.clone();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -421,11 +421,7 @@ impl TimelineThumbnails {
     }
 
     fn update_cache(&mut self, settings: &Settings) -> bool {
-        let policy = Policy {
-            directory: settings.thumbnail_cache_dir(),
-            days: settings.thumbnail_cache_days,
-            mb: settings.thumbnail_cache_mb,
-        };
+        let policy = Policy { directory: settings.cache_dir(), days: settings.cache_days, mb: settings.cache_mb };
         let mut changed = false;
         if self.policy.as_ref() != Some(&policy) {
             self.policy = Some(policy.clone());
@@ -494,11 +490,8 @@ impl TimelineThumbnails {
         if let Some((_, stop, _)) = &self.barcode_worker {
             stop.store(true, Ordering::Relaxed);
         }
-        self.clear_pending = Some(Policy {
-            directory: settings.thumbnail_cache_dir(),
-            days: settings.thumbnail_cache_days,
-            mb: settings.thumbnail_cache_mb,
-        });
+        self.clear_pending =
+            Some(Policy { directory: settings.cache_dir(), days: settings.cache_days, mb: settings.cache_mb });
         // Keep already loaded images; prevent an in-flight extraction from
         // writing the entry back after the user clears the cache.
         if let Some(worker) = &self.worker {
